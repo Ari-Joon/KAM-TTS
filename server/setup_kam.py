@@ -9,7 +9,9 @@ Steps (idempotent, safe to re-run):
   1. Install dependencies from requirements.txt into this Python.
   2. Verify torch sees a CUDA GPU (warns and continues on CPU-only).
   3. Register the Chrome native-messaging host so the extension's power
-     button can launch the server (runs register_host.py).
+     button can launch the server (runs register_host.py). This one asks for
+     your extension id, because Chrome only assigns that once the extension is
+     loaded, so it cannot be known ahead of time. Skippable.
   4. Optionally run hardware_profile.py so you know synthesis speed is healthy
      before first use (RTF well under 1.0 expected on a modern GPU).
 
@@ -143,6 +145,48 @@ def _check_voice_clips():
         print("  Then run:  python check_voice_clips.py")
 
 
+def _register_host():
+    """Register the native-messaging host, which is what lets the dashboard
+    power button start the server.
+
+    This needs the extension id, and there is a chicken-and-egg problem there:
+    Chrome derives the id from the folder it loaded the extension from, so it
+    does not exist until the extension has been loaded. That means we have to
+    stop and ask rather than doing it silently as part of the install.
+
+    Skipping is fine, since everything except the power button works without
+    it and the server still runs with `python server.py`."""
+    print("\n=== Registering Chrome native-messaging host ===")
+    print("This step needs your extension id, which Chrome only assigns once")
+    print("the extension is loaded. So if you have not already:")
+    print("  1. Open chrome://extensions and turn on Developer mode")
+    print("  2. Load unpacked -> select the 'extension' folder")
+    print("  3. Copy the id shown under KAM TTS")
+    try:
+        raw = input("\nExtension id (or press Enter to skip): ").strip()
+    except EOFError:
+        raw = ""
+    if not raw:
+        print("Skipped. The power button will not work until you run:")
+        print("  python register_host.py <EXTENSION_ID>")
+        print("Everything else, including 'python server.py', works now.")
+        return
+    # Deliberately not _run: a bad id should send us round the loop again
+    # rather than abort the whole setup this late in the process.
+    while True:
+        r = subprocess.run([sys.executable, "register_host.py", raw], cwd=HERE)
+        if r.returncode == 0:
+            return
+        try:
+            raw = input("\nTry again (or press Enter to skip): ").strip()
+        except EOFError:
+            raw = ""
+        if not raw:
+            print("Skipped. Run this yourself later:")
+            print("  python register_host.py <EXTENSION_ID>")
+            return
+
+
 def main():
     print(f"KAM TTS setup using: {sys.executable}")
 
@@ -177,8 +221,7 @@ def main():
               "for Apple Silicon, XPU for Intel Arc)")
 
     # 3. Native messaging host (power button)
-    _run([sys.executable, "register_host.py"],
-         "Registering Chrome native-messaging host")
+    _register_host()
 
     # 4. Voice reference audio — required before the server can clone a voice.
     _check_voice_clips()

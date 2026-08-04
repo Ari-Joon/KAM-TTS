@@ -17,6 +17,15 @@ import shutil
 import subprocess
 import sys
 
+# The suites print stars, arrows and box characters, and we relay their output
+# verbatim on failure. Without this the runner itself dies with a
+# UnicodeEncodeError while reporting a failure, which hides the actual result.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 HERE = pathlib.Path(__file__).resolve().parent
 
 SUITES = [

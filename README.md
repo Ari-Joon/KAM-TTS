@@ -116,6 +116,11 @@ fetches the spaCy model, registers the Chrome native-messaging host, checks for
 voice reference audio, and offers to profile synthesis speed. It is idempotent —
 safe to re-run.
 
+It will pause and ask for your **extension id**. Chrome only assigns that once
+the extension has been loaded, so load it first (`chrome://extensions` →
+Developer mode → Load unpacked → the `extension/` folder) and paste the id when
+asked. You can press Enter to skip and do it later with `register_host.py`.
+
 You must still **install PyTorch for your hardware first** — it is the one
 dependency that must match your machine. Get the correct command from
 [pytorch.org](https://pytorch.org): the CUDA build for NVIDIA, the ROCm build
@@ -141,15 +146,27 @@ leaves torch unpinned for this reason. KAM adapts to whichever you installed.
    ```
    python check_voice_clips.py
    ```
-5. **Register the native-messaging host**:
+5. **Load the extension** (this has to come before the next step):
+   `chrome://extensions` → Developer mode → Load unpacked → select the
+   `extension/` folder. Copy the id shown under KAM TTS.
+6. **Register the native-messaging host**, passing that id:
    ```
-   python register_host.py
+   python register_host.py <EXTENSION_ID>
    ```
+   This is only needed for the dashboard power button. Without it everything
+   still works, you just start the server yourself with `python server.py`.
 </details>
 
-Then **load the extension**: `chrome://extensions` → Developer mode → Load
-unpacked → select the `extension/` folder. Start the server from the dashboard
-power button, or `python server.py`.
+Then **load the extension** if you have not already: `chrome://extensions` →
+Developer mode → Load unpacked → select the `extension/` folder. Start the
+server from the dashboard power button, or `python server.py`.
+
+> **Why the extension id matters.** Chrome derives it from the folder it loaded
+> the extension from, so yours will differ from mine and the server has no way
+> to guess it. The server trusts whichever id is in the native-host manifest
+> that `register_host.py` writes, so registering is also what tells the server
+> to accept requests from your copy of the extension. If you skip it, set
+> `KAM_EXTENSION_ID` instead, or requests will be refused by CORS.
 
 ---
 

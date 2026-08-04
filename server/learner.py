@@ -17,9 +17,22 @@ can look at and delete.
 
 import os
 import re
+import sys
 import hashlib
 import json
 import time
+
+# Normally server.py has already done this before importing us, so this is
+# belt and braces. It matters because the progress lines below use stars and
+# arrows, and on a Windows console still set to a legacy codepage printing one
+# of those raises UnicodeEncodeError, which would take down the analysis thread
+# rather than just garbling a line. Anything that imports learner directly, the
+# tests included, gets the same protection.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import queue
 import sqlite3
 import threading

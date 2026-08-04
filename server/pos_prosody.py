@@ -32,9 +32,19 @@ Design notes:
 """
 from __future__ import annotations
 
+import sys
 import importlib.util as _ilu
 from dataclasses import dataclass, field
 from typing import List
+
+# The warnings below name the spaCy model with an arrow in it, and a legacy
+# Windows codepage cannot encode that, so printing one would raise rather than
+# warn. server.py already does this, but this module is importable on its own.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # Availability is probed without importing the heavy package at module load.
 _SPACY_OK = _ilu.find_spec("spacy") is not None

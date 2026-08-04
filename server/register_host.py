@@ -24,9 +24,25 @@ To unregister, pass --remove:
 import sys
 import os
 import json
+import re
 import stat
 
+# Same guard as the other entry points: a legacy Windows codepage turns any
+# non-ASCII character into a UnicodeEncodeError, and the help text below has
+# em-dashes in it, so this has to run before the first print.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 HOST_NAME = "com.kam.tts"
+
+# Chrome derives the id from the extension folder, and it is always 32 letters
+# in a-p. Worth checking, since a typo here registers a host that nothing can
+# talk to and the failure only shows up much later as the power button doing
+# nothing.
+_EXT_ID_RE = re.compile(r"^[a-p]{32}$")
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST_SCRIPT = os.path.join(HERE, "kam_host.py")
 MANIFEST_PATH = os.path.join(HERE, f"{HOST_NAME}.json")
@@ -56,7 +72,7 @@ def _write_launcher_windows(python_exe=None):
 def _write_manifest(ext_id, exec_path):
     """Write the Chrome native-messaging manifest for this machine.
     Regenerated per install (absolute paths + extension ID), which is why
-    com_kam_tts.json is gitignored rather than committed."""
+    com.kam.tts.json is gitignored rather than committed."""
     manifest = {
         "name": HOST_NAME,
         "description": "KAM TTS server launcher",
@@ -126,16 +142,40 @@ def remove(ext_id):
         os.remove(MANIFEST_PATH)
 
 
+def _parse_ext_id(raw):
+    """Pull the extension id out of whatever the user pasted. Accepts the bare
+    id, or the dashboard URL, since copying that out of the address bar is the
+    easier thing to do. Returns None if there's no valid id in there."""
+    for part in re.split(r"[/\s]+", raw.strip()):
+        # Chrome displays the id in lower case, but folding it means a paste
+        # from somewhere that upper-cased it still works.
+        part = part.strip().lower()
+        if _EXT_ID_RE.match(part):
+            return part
+    return None
+
+
 def main():
-    """CLI entry point: `register_host.py` installs, `--remove` uninstalls."""
+    """CLI entry point: `register_host.py <id>` installs, `--remove` uninstalls.
+    Exits non-zero on a missing or malformed id, so that setup_kam.py cannot
+    carry on believing the host was registered when it wasn't."""
     args = [a for a in sys.argv[1:]]
-    if not args or args[0] in ("-h", "--help"):
+    if args and args[0] in ("-h", "--help"):
         print(__doc__)
-        return
-    ext_id = args[0].strip().strip("/").split("/")[-1]
+        return 0
+    if not args:
+        print(__doc__)
+        print("ERROR: no extension id given, so nothing was registered.")
+        return 2
+    ext_id = _parse_ext_id(args[0])
+    if not ext_id:
+        print(f"ERROR: '{args[0]}' is not a Chrome extension id.")
+        print("Expected 32 letters in the range a-p, which you can copy from")
+        print("chrome://extensions with Developer mode turned on.")
+        return 2
     if "--remove" in args:
         remove(ext_id)
-        return
+        return 0
     # Optional explicit Python path: --python "C:\path\to\python.exe"
     python_exe = None
     if "--python" in args:
@@ -143,7 +183,8 @@ def main():
         if i + 1 < len(args):
             python_exe = args[i + 1]
     register(ext_id, python_exe)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
