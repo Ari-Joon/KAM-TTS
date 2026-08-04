@@ -1,0 +1,1618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>KAM TTS — Monitor</title>
+  <style>
+    /* Three-theme system selectable via the settings cog in the topbar.
+       Body data-theme picks the palette. Semantic status colours
+       (green/red/yellow/cyan/purple) stay constant across themes -
+       only chrome and accent shift. */
+    :root, [data-theme="arian"] {
+      --bg:      #0a0a0a;
+      --bg2:     #111;
+      --bg3:     #1a1a1a;
+      --border:  #222;
+      --indigo:  #f5c518;
+      --green:   #22c55e;
+      --red:     #ef4444;
+      --yellow:  #f59e0b;
+      --cyan:    #06b6d4;
+      --purple:  #a855f7;
+      --dim:     #777;
+      --text:    #e2e8f0;
+      --subtext: #b0bec5;
+      --font:    'Cascadia Code', 'Consolas', 'Courier New', monospace;
+      /* Chunk interaction states. Hover is a subtle cue and selected is a firm
+         pin marker. I gave them deliberately different hues so they never read
+         as the same thing when a hovered chunk sits next to the pinned one. */
+      --chunk-hover-bg:   rgba(6,182,212,0.10);
+      --chunk-hover-line: #06b6d4;
+      --chunk-sel-bg:     rgba(245,197,24,0.14);
+      --chunk-sel-line:   #f5c518;
+    }
+    /* Light theme, verified against WCAG AA, so 4.5:1 or better for body text
+       and 3:1 or better for large UI. The palette mirrors GitHub Primer light
+       since that's proven readable over long sessions, and I tested every
+       text and background pair at 4.93:1 or better. */
+    [data-theme="light"] {
+      --bg:      #ffffff;
+      --bg2:     #f6f8fa;            /* card surface */
+      --bg3:     #eaeef2;            /* inset / button surface */
+      --border:  #d0d7de;
+      --indigo:  #0969da;            /* accent, 5.19:1 against #fff */
+      --dim:     #656d76;            /* tertiary, 5.25:1, which was 3.36:1 and failing */
+      --text:    #1f2328;            /* body, 15.8:1 */
+      --subtext: #424a53;            /* secondary, 8.99:1 */
+      /* Status colours retuned for white background readability */
+      --green:   #1a7f37;
+      --red:     #cf222e;
+      --yellow:  #9a6700;
+      --cyan:    #0550ae;
+      --purple:  #8250df;
+      /* Chunk interaction states (see Arian block for rationale). */
+      --chunk-hover-bg:   rgba(9,105,218,0.08);
+      --chunk-hover-line: #0969da;
+      --chunk-sel-bg:     rgba(191,135,0,0.16);
+      --chunk-sel-line:   #bf8700;
+    }
+    /* Dark theme, also verified against WCAG AA. GitHub Primer dark, which
+       is #0d1117, is easier on the eyes over a long session than pure black,
+       and I verified every foreground at 4.63:1 or better. */
+    [data-theme="dark"] {
+      --bg:      #0d1117;
+      --bg2:     #161b22;
+      --bg3:     #21262d;
+      --border:  #30363d;
+      --indigo:  #58a6ff;            /* accent, 8.06:1, and UI text uses #000 on accent buttons */
+      --dim:     #8d96a0;            /* tertiary, 6.31:1, improved from 4.92:1 */
+      --text:    #e6edf3;            /* body, 16.02:1 */
+      --subtext: #c9d1d9;            /* secondary, 12.26:1 */
+      /* Status colours brightened to retain meaning at distance */
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+      --cyan:    #79c0ff;
+      --purple:  #d2a8ff;
+      /* Chunk interaction states (see Arian block for rationale). */
+      --chunk-hover-bg:   rgba(88,166,255,0.10);
+      --chunk-hover-line: #58a6ff;
+      --chunk-sel-bg:     rgba(210,153,34,0.16);
+      --chunk-sel-line:   #d29922;
+    }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 12px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* --- Top bar --- */
+    #topbar {
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+    #topbar h1 { font-size: 13px; color: var(--indigo); font-weight: 600; letter-spacing: 1px; }
+    .pill {
+      font-size: 10px; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid var(--border); color: var(--subtext);
+    }
+    .pill.online  { border-color: var(--green);  color: var(--green); }
+    #power-btn {
+      position: relative;
+      width: 26px; height: 26px; border-radius: 50%; cursor: pointer;
+      border: 1px solid var(--border); background: var(--bg3); color: var(--dim);
+      font-size: 14px; line-height: 1; display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; transition: color .15s, background .15s, border-color .15s; font-family: var(--font);
+    }
+    #power-btn:hover { color: var(--text); border-color: var(--indigo); }
+    /* Off, meaning the server isn't running: red, no animation */
+    #power-btn.off { color: var(--red); border-color: color-mix(in srgb, var(--red) 50%, var(--border)); }
+    /* On, so the model is ready and serving: solid green, no animation */
+    #power-btn.on {
+      background: var(--green); color: #000; border-color: var(--green);
+      box-shadow: 0 0 8px color-mix(in srgb, var(--green) 55%, transparent);
+    }
+    /* Loading, so booting or loading the model: the ring sweeps until it's ready */
+    #power-btn.loading {
+      color: var(--yellow); border-color: transparent;
+      background: var(--bg3);
+    }
+    #power-btn.loading::before {
+      content: ""; position: absolute; inset: -3px; border-radius: 50%; z-index: 1;
+      /* A conic sweep forms the moving arc; a steady track sits underneath. */
+      background: conic-gradient(var(--yellow) 0deg 90deg, transparent 90deg 360deg);
+      -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+              mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+      animation: power-spin 0.9s linear infinite;
+    }
+    #power-btn.loading::after {
+      content: ""; position: absolute; inset: -3px; border-radius: 50%; z-index: 0;
+      border: 3px solid color-mix(in srgb, var(--yellow) 18%, transparent);
+    }
+    @keyframes power-spin { to { transform: rotate(360deg); } }
+    /* The green progress arc, which sits just inside the yellow ring and fills
+       up a stage at a time. */
+    .power-arc-svg { position: absolute; inset: -3px; width: calc(100% + 6px); height: calc(100% + 6px); pointer-events: none; opacity: 0; transition: opacity .2s; z-index: 2; }
+    #power-arc { transition: stroke-dashoffset .5s ease; filter: drop-shadow(0 0 2px color-mix(in srgb, var(--green) 70%, transparent)); }
+    #power-btn.loading .power-arc-svg { opacity: 1; }       /* arc visible while loading */
+    #power-btn .power-glyph { position: relative; z-index: 3; }
+    /* Completion: quick pop as the arc closes into a full green circle. */
+    #power-btn.complete { animation: power-pop .45s ease; }
+    #power-btn.complete .power-arc-svg { opacity: 1; }
+    @keyframes power-pop { 0% { transform: scale(1); } 45% { transform: scale(1.18); } 100% { transform: scale(1); } }
+    .pill.offline { border-color: var(--red);    color: var(--red); }
+    #topbar-right { margin-left: auto; display:flex; gap:4px; align-items:center; flex-shrink:0; }
+    .tab-btn {
+      background: var(--bg3); border: 1px solid var(--border);
+      color: var(--subtext); padding: 4px 8px; border-radius: 6px;
+      cursor: pointer; font-family: var(--font); font-size: 11px;
+      white-space: nowrap; flex-shrink: 0;
+    }
+    .tab-btn.active { background: var(--indigo); border-color: var(--indigo); color: #000; font-weight: 700; }
+    /* Settings cog and theme picker dropdown.
+       Cog sits to the LEFT of the tab buttons inside #topbar-right.
+       The dropdown anchors to the cog's right edge so it never
+       overflows the viewport on the small player window. */
+    .settings-cog {
+      background: var(--bg3); border: 1px solid var(--border);
+      color: var(--subtext); padding: 4px 8px; border-radius: 6px;
+      cursor: pointer; font-family: var(--font); font-size: 13px;
+      flex-shrink: 0; line-height: 1;
+    }
+    .settings-cog:hover { color: var(--indigo); border-color: var(--indigo); }
+    .settings-cog.active { background: var(--indigo); border-color: var(--indigo); color: #000; }
+    #settings-panel {
+      position: fixed; z-index: 9999;
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 12px; min-width: 220px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+      display: none;
+    }
+    #settings-panel.open { display: block; }
+    /* --- Speech Tuning dropdown, a richer surface than the theme panel --- */
+    #tts-tune-panel {
+      position: fixed; z-index: 9999;
+      width: 340px; max-height: 78vh; overflow-y: auto;
+      border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+      display: none;
+      background:
+        radial-gradient(120% 80% at 0% 0%, color-mix(in srgb, var(--indigo) 14%, transparent), transparent 60%),
+        radial-gradient(120% 80% at 100% 100%, color-mix(in srgb, var(--purple) 12%, transparent), transparent 55%),
+        var(--bg2);
+      box-shadow: 0 10px 40px rgba(0,0,0,0.55);
+    }
+    #tts-tune-panel.open { display: block; }
+
+    /* --- UI Fonts dropdown --- */
+    #ui-font-panel {
+      position: fixed; z-index: 9999; width: 300px; max-height: 78vh; overflow-y: auto;
+      border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+      display: none; background: var(--bg2); box-shadow: 0 10px 40px rgba(0,0,0,0.55);
+    }
+    #ui-font-panel.open { display: block; }
+    #ui-font-panel h3 { font-size: 13px; color: var(--text); font-weight: 700; letter-spacing: 0.5px; margin-bottom: 4px; }
+    #ui-font-panel .uf-sub { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+    .uf-row { margin-bottom: 12px; }
+    .uf-row label { display: block; font-size: 11px; color: var(--text); font-weight: 600; margin-bottom: 4px; }
+    .uf-row select, .uf-row input[type=range] { width: 100%; }
+    .uf-row select { background: var(--bg3); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 6px; font-family: var(--font); font-size: 11px; }
+    .uf-val { float: right; color: var(--indigo); font-weight: 700; font-size: 11px; }
+    #uf-reset { width: 100%; padding: 7px; border-radius: 7px; cursor: pointer; font-family: var(--font); font-size: 10px; background: transparent; border: 1px solid var(--border); color: var(--dim); margin-top: 4px; }
+    #uf-reset:hover { color: var(--text); border-color: var(--indigo); }
+    .tune-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+    .tune-head h3 { font-size: 13px; color: var(--text); font-weight: 700; letter-spacing: 0.5px; }
+    .tune-sub { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+    .tune-param { margin-bottom: 14px; padding: 10px; border-radius: 8px; background: color-mix(in srgb, var(--bg) 55%, transparent); border: 1px solid var(--border); }
+    .tune-row { display: flex; align-items: center; gap: 10px; }
+    .tune-name { font-size: 11px; font-weight: 600; color: var(--text);
+                 width: 86px; flex: 0 0 86px; line-height: 1.3;
+                 overflow-wrap: break-word; }
+    .tune-row input[type=range] { flex: 1; accent-color: var(--indigo); margin: 0; }
+    .tune-val { font-family: var(--font); font-size: 12px; font-weight: 700;
+                color: var(--indigo); min-width: 42px; text-align: right;
+                flex: 0 0 auto; padding-right: 2px; }
+    .tune-desc { font-family: var(--ui-small-font, var(--font)); font-size: 9.5px; color: var(--subtext); line-height: 1.55; margin-top: 7px; }
+    .tune-desc strong { color: var(--text); }
+    .tune-actions { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+    .tune-actions .tune-btn {
+      font-family: var(--font); font-size: 11px; font-weight: 600;
+      padding: 7px 10px; border-radius: 6px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--bg3); color: var(--subtext);
+      text-align: center; transition: background .12s, border-color .12s, color .12s;
+    }
+    .tune-btn:hover { border-color: var(--indigo); color: var(--text); }
+    /* Run a test, kept distinct from the settings actions below it. */
+    .tune-btn.action  { background: transparent; border-color: var(--cyan); color: var(--cyan); }
+    .tune-btn.action:hover { background: rgba(6,182,212,0.12); }
+    /* Commit, the only filled button since it's the affirmative action. */
+    .tune-btn.primary { background: var(--indigo); border-color: var(--indigo);
+                        color: #000; font-weight: 700; }
+    .tune-btn.primary:hover { filter: brightness(1.1); color: #000; }
+    /* Undo back to your saved default, so kept neutral. */
+    .tune-btn.ghost:hover { background: var(--bg3); }
+    /* Discard everything including your saved default, so flagged as destructive. */
+    .tune-btn.danger { color: #b45454; border-color: #3a1a1a; }
+    .tune-btn.danger:hover { background: #1a0a0a; border-color: var(--red); color: var(--red); }
+    .tune-actions-sep { display:flex; align-items:center; gap:6px; margin: 2px 0 0;
+      font-size: 8px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+    .tune-actions-sep::before, .tune-actions-sep::after {
+      content:""; flex:1; height:1px; background: var(--border); }
+    #tp-benchmark, #tp-default { width: 100%; padding: 8px; border-radius: 8px; cursor: pointer; font-family: var(--font); font-size: 11px; font-weight: 600; }
+    #tp-benchmark { background: var(--indigo); border: 1px solid var(--indigo); color: #000; }
+    #tp-benchmark:hover { filter: brightness(1.08); }
+    #tp-default { background: transparent; border: 1px solid var(--border); color: var(--dim); }
+    #tp-default:hover { color: var(--text); border-color: var(--indigo); }
+    .tune-status { font-size: 10px; color: var(--green); min-height: 14px; margin-top: 8px; text-align: center; }
+    .tune-status.warn { color: var(--red); }   /* offline or failed, so never green */
+    .tune-foot { font-family: var(--ui-small-font, var(--font)); font-size: 9px; color: var(--dim); line-height: 1.5; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+    #settings-panel h3 {
+      font-size: 10px; color: var(--dim); font-weight: 600;
+      letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px;
+    }
+    .theme-picker { display: flex; gap: 6px; }
+    .theme-btn {
+      flex: 1; background: var(--bg3); border: 1px solid var(--border);
+      color: var(--subtext); padding: 6px 8px; border-radius: 6px;
+      cursor: pointer; font-family: var(--font); font-size: 11px;
+    }
+    .theme-btn:hover { color: var(--text); }
+    .theme-btn.active {
+      background: var(--indigo); border-color: var(--indigo);
+      color: #000; font-weight: 700;
+    }
+    .cust-colours { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+    .cust-row { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--subtext); cursor: pointer; }
+    .cust-row input[type=color] { width: 34px; height: 22px; padding: 0; border: 1px solid var(--border); border-radius: 4px; background: transparent; cursor: pointer; }
+    #cust-reset { width: 100%; padding: 6px; border-radius: 6px; cursor: pointer; font-family: var(--font); font-size: 10px; background: transparent; border: 1px solid var(--border); color: var(--dim); }
+    #cust-reset:hover { color: var(--text); border-color: var(--indigo); }
+
+    /* --- Layout --- */
+    #main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Swap-rules: which left panel shows.
+       Default (any tab except AI): #console-panel visible, #ai-feed-panel hidden.
+       On AI tab: #ai-feed-panel takes the slot, #console-panel hidden.
+       The right panel keeps its width and tabbed sub-panels untouched, so the
+       user can move between Chunks/Reports/Rules/Stats while the AI feed
+       stays open on the left. */
+    #ai-feed-panel { display: none; }
+    body[data-active-tab="ai"] #console-panel { display: none; }
+    body[data-active-tab="ai"] #ai-feed-panel {
+      display: flex; flex-direction: column;
+      flex: 1; min-width: 0; border-right: 1px solid var(--border);
+    }
+    /* AI feed header mirrors console header for visual consistency. */
+    #ai-feed-header {
+      padding: 6px 12px;
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      font-size: 10px;
+      color: var(--dim);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      display: flex; align-items: center; gap: 8px;
+      flex-shrink: 0;
+    }
+    #ai-feed-header .dot { width:6px; height:6px; border-radius:50%; background: var(--green); }
+    #ai-feed-header .dot.ai { background: var(--indigo); }
+    #ai-feed-header #ai-feed-count {
+      margin-left: 6px; color: var(--subtext);
+      font-size: 10px; text-transform: none; letter-spacing: 0;
+    }
+    #ai-feed-header #ai-feed-refresh {
+      margin-left: auto;
+      background: var(--bg3); border: 1px solid var(--border);
+      color: var(--subtext); padding: 2px 8px; border-radius: 4px;
+      cursor: pointer; font-family: var(--font); font-size: 12px; line-height: 1;
+    }
+    #ai-feed-header #ai-feed-refresh:hover { color: var(--indigo); border-color: var(--indigo); }
+    #ai-feed-body {
+      flex: 1; overflow-y: auto; padding: 10px 14px;
+    }
+    #ai-feed-body::-webkit-scrollbar { width: 6px; }
+    #ai-feed-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    #console-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+      min-width: 0;
+    }
+    #console-header {
+      padding: 6px 12px;
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      color: var(--dim);
+      font-size: 10px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #console-header .dot { width:6px; height:6px; border-radius:50%; background: var(--green); }
+    #clear-btn {
+      margin-left: auto; background: none; border: none;
+      color: var(--dim); cursor: pointer; font-size: 10px; font-family: var(--font);
+    }
+    #clear-btn:hover { color: var(--red); }
+    #console-log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+    #console-log::-webkit-scrollbar { width: 4px; }
+    #console-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .log-line {
+      display: flex;
+      gap: 8px;
+      padding: 1px 0;
+      line-height: 1.6;
+      font-size: 11px;
+      border-left: 2px solid transparent;
+      padding-left: 4px;
+    }
+    .log-time { color: var(--dim); flex-shrink: 0; font-size: 10px; }
+    .log-tag  { flex-shrink: 0; font-weight: 600; min-width: 80px; }
+    .log-msg  { color: var(--subtext); word-break: break-word; }
+
+    /* Tag colours */
+    .tag-tts      { color: var(--cyan); }
+    .tag-prosody  { color: #a78bfa; }
+    .tag-skip     { color: var(--dim); }
+    .tag-error    { color: var(--red); }
+    .tag-retry    { color: var(--yellow); }
+    .tag-pronounce{ color: var(--purple); }
+    .tag-learner  { color: var(--green); }
+    .tag-dedup    { color: var(--dim); }
+    .tag-code     { color: var(--yellow); }
+    .tag-audio    { color: #34d399; }
+    .tag-info     { color: var(--subtext); }
+    .line-error   { border-left-color: var(--red) !important; background: #1a0808; }
+    .line-skip    { opacity: 0.5; }
+    .line-sep     { border-top: 1px solid var(--border); margin: 3px 0; padding: 0; height: 0; border-left: none; }
+
+    /* --- Right: panels --- */
+    #right-panel {
+      width: 320px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    /* --- Drag divider --- */
+    #drag-divider {
+      width: 5px;
+      cursor: col-resize;
+      background: var(--border);
+      flex-shrink: 0;
+      transition: background 0.15s;
+    }
+    #drag-divider:hover { background: var(--indigo); }
+
+    .rpanel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
+    .rpanel.active { display: flex; }
+    .rpanel-header {
+      padding: 6px 12px;
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      color: var(--dim);
+      font-size: 10px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+    .rpanel-body { flex: 1; overflow-y: auto; padding: 12px; }
+    .rpanel-body::-webkit-scrollbar { width: 4px; }
+    .rpanel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* --- Stats grid --- */
+    .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+    .stat-card {
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 10px;
+    }
+    .stat-label { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+    .stat-value { font-size: 18px; font-weight: 600; margin-top: 2px; }
+    .stat-value.green  { color: var(--green); }
+    .stat-value.red    { color: var(--red); }
+    .stat-value.indigo { color: var(--indigo); }
+    .stat-value.yellow { color: var(--yellow); }
+
+    .section-title {
+      font-size: 9px; color: var(--dim); text-transform: uppercase;
+      letter-spacing: 1px; margin: 12px 0 6px;
+      padding-bottom: 4px; border-bottom: 1px solid var(--border);
+    }
+    .status-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 4px 0; border-bottom: 1px solid #1a1a1a; font-size: 11px;
+    }
+    .status-row .key { color: var(--dim); }
+    .status-row .val { color: var(--text); }
+    .val.ok   { color: var(--green); }
+    .val.warn { color: var(--yellow); }
+    .val.err  { color: var(--red); }
+
+    /* --- Chunk feed --- */
+    .chunk-card {
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 10px; margin-bottom: 6px;
+      transition: background 0.12s, box-shadow 0.12s;
+    }
+    /* Hover, a transient "you're pointing at this" cue. */
+    .chunk-card:hover {
+      background: var(--chunk-hover-bg, var(--bg3));
+      box-shadow: inset 3px 0 0 var(--chunk-hover-line, var(--cyan));
+      cursor: pointer;
+    }
+    /* Pinned, meaning the chunk picked out for a report. It's a different hue
+       from hover so a hovered card next to the pinned one is never mistaken
+       for it. */
+    .chunk-card.pinned {
+      background: var(--chunk-sel-bg, var(--bg3));
+      box-shadow: inset 3px 0 0 var(--chunk-sel-line, var(--indigo));
+      border-color: var(--chunk-sel-line, var(--indigo));
+    }
+    .chunk-card.pinned:hover {
+      background: var(--chunk-sel-bg, var(--bg3));
+      box-shadow: inset 3px 0 0 var(--chunk-sel-line, var(--indigo));
+    }
+    .chunk-card { border-left: 3px solid var(--border); }  /* unrated, matching the AI tab's quality-none */
+    .chunk-card.quality-high { border-left: 3px solid var(--green); }
+    .chunk-card.quality-mid  { border-left: 3px solid var(--yellow); }
+    .chunk-card.quality-low  { border-left: 3px solid var(--red); }
+    .chunk-meta { display:flex; gap:8px; margin-bottom:4px; flex-wrap:wrap; align-items:center; }
+    /* Thumbs-up button on each live chunk card.
+       margin-left:auto pushes it to the right edge of the meta row.
+       The 'confirmed' state turns it solid green so the user can see at a
+       glance which chunks they have already approved. */
+    .chunk-thumb {
+      background: var(--bg2); border: 1px solid var(--border);
+      color: var(--dim); padding: 2px 8px; border-radius: 4px;
+      cursor: pointer; font-size: 11px; line-height: 1; flex-shrink: 0;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .chunk-thumb[data-action="positive"] { margin-left: auto; }
+    .chunk-thumb[data-action="negative"] { margin-left: 4px; }
+    .chunk-thumb:hover { color: var(--green); border-color: var(--green); }
+    .chunk-thumb-down:hover { color: var(--red); border-color: var(--red); }
+    .chunk-thumb.confirmed {
+      background: var(--green); color: #000; border-color: var(--green);
+      cursor: default;
+    }
+    .chunk-thumb.rejected {
+      background: var(--red); color: #fff; border-color: var(--red);
+      cursor: default;
+    }
+    .chunk-badge {
+      font-size: 9px; padding: 1px 6px; border-radius: 3px;
+      background: var(--bg2); border: 1px solid var(--border); color: var(--dim);
+    }
+    .chunk-badge.chunk-num { color: var(--accent, #f5c518); border-color: var(--accent, #f5c518); font-weight: 700; }
+    .chunk-badge.type-sentence  { color: var(--cyan); border-color: var(--cyan); }
+    .chunk-badge.type-heading   { color: var(--purple); border-color: var(--purple); }
+    .chunk-badge.type-mid_clause{ color: var(--subtext); border-color: var(--border); }
+    .chunk-badge.type-list_item { color: var(--yellow); border-color: var(--yellow); }
+    .chunk-text { font-size: 11px; color: var(--subtext); line-height: 1.5; }
+    /* The chunk reading font and size. The selectors in the feed header set
+       these as CSS variables on <body> and persist them in localStorage, and
+       this one rule covers every surface that shows chunk text. */
+    .chunk-text, .ai-text-preview, #report-preview {
+      font-family: var(--chunkfont, var(--font));
+      font-size: var(--chunkfont-size, 11px);
+    }
+    .chunk-quality { font-size: 10px; color: var(--dim); margin-top: 4px; }
+    .chunk-analysis { font-size: 10px; color: var(--text); line-height: 1.8; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+    .an-tag { font-size: 9px; font-weight: 700; letter-spacing: 0.5px; padding: 1px 6px; border-radius: 3px; text-transform: uppercase; background: #333; color: #fff; }
+    .an-note { font-size: 9.5px; color: var(--dim); margin-right: 8px; }
+    .an-clean  { background: #14532d; color: #4ade80; }
+    .an-skip   { background: #3a2e00; color: #fbbf24; }
+    .an-halluc { background: #3b1d5e; color: #c084fc; }
+    .an-cutoff { background: #4a1d1d; color: #f87171; }
+    .an-drift  { background: #1e3a5f; color: #60a5fa; }
+    .an-error  { background: #4a1d1d; color: #f87171; }
+    .resize-handle { height: 10px; background: var(--bg2); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); cursor: row-resize; display: flex; align-items: center; justify-content: center; user-select: none; margin: 4px 0; border-radius: 3px; }
+    .resize-handle:hover { background: var(--bg3); }
+    .resize-grip { width: 40px; height: 2px; background: var(--dim); border-radius: 2px; pointer-events: none; }
+
+    /* --- Report form --- */
+    .form-group { margin-bottom: 8px; }
+    .form-group label { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; display:block; margin-bottom:3px; }
+    .form-group select,
+    .form-group input {
+      width: 100%; background: var(--bg3); color: var(--text);
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 6px 8px; font-family: var(--font); font-size: 11px;
+      outline: none;
+    }
+    .form-group select:focus,
+    .form-group input:focus  { border-color: var(--indigo); }
+    .btn-row { display: flex; gap: 6px; margin-top: 8px; }
+    .btn {
+      flex: 1; padding: 7px; border: none; border-radius: 6px;
+      font-family: var(--font); font-size: 11px; cursor: pointer;
+    }
+    .btn-primary { background: var(--indigo); color: #000; font-weight: 700; }
+    .btn-primary:hover { background: #4f52d4; }
+    .btn-secondary { background: var(--bg3); border: 1px solid var(--border); color: var(--subtext); }
+    .btn-secondary:hover { border-color: var(--red); color: var(--red); }
+    .submit-result {
+      margin-top: 8px; padding: 6px 8px; border-radius: 4px;
+      font-size: 11px; display: none;
+      background: #0a1a0a; border: 1px solid var(--green); color: var(--green);
+    }
+
+    /* --- Rules table --- */
+    .rules-table { width: 100%; border-collapse: collapse; font-size: 10px; }
+    .rules-table th {
+      text-align: left; padding: 4px 6px;
+      color: var(--dim); font-weight: 400; border-bottom: 1px solid var(--border);
+      font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+    }
+    .rules-table td { padding: 5px 6px; border-bottom: 1px solid #1a1a1a; color: var(--subtext); }
+    .rules-table td:first-child { color: var(--text); }
+    .rule-sort { cursor: pointer; user-select: none; }
+    .rule-sort:hover { color: var(--indigo); }
+    .del-rule { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 11px; }
+    .del-rule:hover { color: var(--red); }
+
+    /* --- Filter buttons --- */
+    .filter-btn { flex:none; background:var(--bg3); border:1px solid var(--border); color:var(--subtext); padding:3px 8px; border-radius:4px; cursor:pointer; font-family:var(--font); font-size:9px; }
+    .filter-btn.active { background:var(--indigo); border-color:var(--indigo); color:#000; font-weight:700; }
+    .val.ok   { color:var(--green); }
+    .val.err  { color:var(--red); }
+    .val.warn { color:var(--yellow); }
+
+    /* --- AI Insights --- */
+    .ai-section {
+      margin-bottom: 4px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .ai-section-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 7px 10px; cursor: pointer; user-select: none;
+      background: var(--bg2);
+    }
+    .ai-section-header:hover { background: var(--bg3); }
+    .ai-section-body {
+      overflow-y: auto;
+      padding: 8px 10px;
+      border-top: 1px solid var(--border);
+    }
+    .ai-section-body.collapsed { display: none; }
+    .ai-collapse-arrow { font-size: 9px; color: var(--dim); transition: transform 0.15s; }
+    .ai-collapse-arrow.open { transform: rotate(90deg); }
+    .ai-section-title { font-size: 10px; color: var(--indigo); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+    .ai-guide { font-size: 10px; color: var(--subtext); line-height: 1.6; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 11px 12px; margin-bottom: 12px; }
+    .ai-guide ul { margin: 6px 0 6px 0; padding-left: 16px; }
+    .ai-guide li { margin-bottom: 3px; }
+    .ai-guide strong { color: var(--text); }
+    .stats-guide { font-size: 10px; color: var(--subtext); line-height: 1.55; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 4px; height: 240px; min-height: 120px; max-height: 70vh; overflow-y: auto; resize: vertical; }
+    .sg-row { display: flex; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--border); }
+    .sg-row:last-child { border-bottom: none; }
+    .sg-term { color: var(--text); font-weight: 600; min-width: 120px; flex-shrink: 0; }
+    .sg-def { color: var(--dim); }
+    .hist-summary { display: flex; gap: 8px; margin: 4px 0 8px; }
+    .hist-stat { flex: 1; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 8px; text-align: center; }
+    .hist-num { display: block; font-size: 18px; font-weight: 700; color: var(--text); }
+    .hist-lbl { font-size: 8px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--dim); }
+    .hist-list { height: 200px; min-height: 120px; max-height: 70vh; overflow-y: auto; resize: vertical; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+    .hist-row { display: flex; align-items: center; gap: 7px; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 10px; }
+    .hist-row:last-child { border-bottom: none; }
+    .hist-when { color: var(--dim); font-size: 9px; min-width: 80px; flex-shrink: 0; font-family: monospace; }
+    .hist-ic { flex-shrink: 0; }
+    .hist-detail { color: var(--subtext); flex: 1; line-height: 1.4; }
+    .hist-src { font-size: 8px; text-transform: uppercase; letter-spacing: 0.5px; padding: 1px 5px; border-radius: 3px; flex-shrink: 0; }
+    .hist-src.user { background: #14532d; color: #4ade80; }
+    .hist-src.auto { background: #3a2e00; color: #fbbf24; }
+    /* Rule-type colours match the Rules table so a type looks the same wherever
+       you see it. FLAG is amber, since it only means noticed with no change
+       made, and never green, which would imply success. */
+    .ai-empty { color:#999; font-size:10px; padding:6px 0; font-style:italic; }
+    .ai-stat-row { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid #1a1a1a; font-size:10px; }
+    .ai-stat-row .ok   { color:var(--green); }
+    .ai-stat-row .err  { color:var(--red); }
+    .ai-stat-row .warn { color:var(--yellow); }
+    .chunk-badge.warn { color:var(--yellow); border-color:var(--yellow); }
+
+    /* --- Chunk drag resize --- */
+    #chunk-drag-handle:hover > div { background: var(--indigo); }
+    /* --- AI Chunk Analysis Cards --- */
+    .ai-chunk-analysis {
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 10px; margin-bottom: 8px;
+    }
+    .ai-ins-title { font-size:9px; color:var(--dim); text-transform:uppercase;
+      letter-spacing:1px; font-weight:700; margin:10px 0 3px; padding-top:6px;
+      border-top:1px solid var(--border); }
+    .ai-ins-title:first-child { border-top:none; margin-top:0; padding-top:0; }
+    .ai-chunk-analysis.quality-low  { border-left: 3px solid var(--red); }
+    .ai-chunk-analysis.quality-mid  { border-left: 3px solid var(--yellow); }
+    .ai-chunk-analysis.quality-good { border-left: 3px solid var(--green); }
+    .ai-chunk-analysis.quality-none { border-left: 3px solid var(--border); }
+    .ai-chunk-head { margin-bottom: 4px; }
+    .ai-chunk-num {
+      display: inline-block; font-size: 10px; font-weight: 700;
+      color: var(--accent, #f5c518); border: 1px solid var(--accent, #f5c518);
+      border-radius: 4px; padding: 1px 8px; letter-spacing: 0.5px;
+    }
+    .ai-explanation {
+      font-size: 11px; color: var(--text); line-height: 1.6;
+      margin-bottom: 6px;
+    }
+    .ai-improvement {
+      font-size: 10px; color: var(--green); line-height: 1.5;
+    }
+    .ai-metrics {
+      display: flex; gap: 8px; flex-wrap: wrap; margin: 5px 0;
+    }
+    .ai-metric {
+      font-size: 9px; padding: 1px 6px; border-radius: 3px;
+      background: var(--bg2); border: 1px solid var(--border);
+    }
+    .ai-metric.bad  { color: var(--red);    border-color: var(--red); }
+    .ai-metric.warn { color: var(--yellow); border-color: var(--yellow); }
+    .ai-metric.ok   { color: var(--green);  border-color: var(--green); }
+    .ai-metric.good { color: var(--green);  border-color: var(--green); }
+
+    /* Content-facet badges. A chunk can be several things at once, so the badge
+       shows the dominant facet plus how many others were detected. */
+    .chunk-badge.math, .chunk-badge.facet-math { color:#67e8f9; border:1px solid #06b6d4; background:#082f3a; }
+    .chunk-badge.facet-list       { color:#fde68a; border:1px solid #ca8a04; background:#1a1200; }
+    .chunk-badge.facet-definition { color:#c4b5fd; border:1px solid #7c3aed; background:#1a0a2e; }
+    .chunk-badge.facet-code       { color:#93c5fd; border:1px solid #2563eb; background:#0a1a2e; }
+    .chunk-badge.facet-quote      { color:#f9a8d4; border:1px solid #db2777; background:#2a0a1a; }
+    .chunk-badge.facet-citation   { color:#a7f3d0; border:1px solid #059669; background:#052e22; }
+    .tag-math { color: var(--lg-math, #06b6d4); }
+
+    /* --- Toggle switch --- */
+    .kam-switch-input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .kam-switch {
+      position: absolute; inset: 0; cursor: pointer; border-radius: 20px;
+      background: var(--bg3); border: 1px solid var(--border);
+      transition: background .2s, border-color .2s;
+    }
+    /* The knob. Its absence was why the control looked like an empty box. */
+    .kam-switch::before {
+      content: ""; position: absolute; height: 14px; width: 14px;
+      left: 3px; top: 50%; transform: translateY(-50%);
+      background: var(--dim); border-radius: 50%;
+      transition: transform .2s, background .2s;
+    }
+    .kam-switch-input:checked + .kam-switch {
+      background: rgba(34,197,94,0.20); border-color: var(--green);
+    }
+    .kam-switch-input:checked + .kam-switch::before {
+      transform: translateY(-50%) translateX(18px); background: var(--green);
+    }
+    .kam-switch-input:focus-visible + .kam-switch { outline: 2px solid var(--indigo); }
+
+    /* --- Console Legend --- */
+    .lg-sec-title {
+      font-size: 9px; color: var(--dim); text-transform: uppercase;
+      letter-spacing: 1px; margin: 12px 0 4px; padding-top: 8px;
+      border-top: 1px solid var(--border); font-weight: 700;
+    }
+    .lg-sec-title:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+    .lg-def { color: var(--subtext); font-size: 10px; }
+    /* Tag colours are variables so the colour customiser can override each one
+       independently and persist the user's choice. */
+    .lg-tag { font-weight: 700; }
+    .lg-tag[data-tag="TTS"]       { color: var(--lg-tts, var(--cyan)); }
+    .lg-tag[data-tag="PROSODY"]   { color: var(--lg-prosody, #a78bfa); }
+    .lg-tag[data-tag="SKIP"] { color: var(--lg-skip, #9a5b4c); }
+    .lg-tag[data-tag="CODE"]      { color: var(--lg-code, var(--yellow)); }
+    .lg-tag[data-tag="PUNCT"]     { color: var(--lg-punct, var(--purple)); }
+    .lg-tag[data-tag="PRONOUNCE"] { color: var(--lg-pronounce, var(--purple)); }
+    .lg-tag[data-tag="LEARNER"]   { color: var(--lg-learner, var(--green)); }
+    .lg-tag[data-tag="RETRY"]     { color: var(--lg-retry, var(--yellow)); }
+    .lg-tag[data-tag="ERROR"]     { color: var(--lg-error, var(--red)); }
+    .lg-tag[data-tag="FATAL"]     { color: var(--lg-fatal, var(--red)); }
+    .lg-tag[data-tag="WARN"] { color: var(--lg-warn, #f59e0b); }
+    .lg-tag[data-tag="BOOT"] { color: var(--lg-boot, #2563eb); }
+    .lg-tag[data-tag="STARTUP"] { color: var(--lg-startup, #86efac); }
+    .lg-tag[data-tag="STANDBY"]   { color: var(--lg-standby, var(--yellow)); }
+    .lg-tag[data-tag="HOST"] { color: var(--lg-host, #15803d); }
+    .lg-tag[data-tag="MATH"]      { color: var(--lg-math, #06b6d4); }
+    /* Rule badges, using the same semantic colours as the Rules page. */
+    .lg-rule {
+      display: inline-block; padding: 1px 6px; border-radius: 4px;
+      font-size: 9px; font-weight: 600; letter-spacing: 0.3px;
+    }
+    .lg-rule[data-rule="PRONUNCIATION"] { color:#c4b5fd; border:1px solid #7c3aed; background:#1a0a2e; }
+    .lg-rule[data-rule="PUNCT"]         { color:#fde68a; border:1px solid #ca8a04; background:#1a1200; }
+    .lg-rule[data-rule="SPLIT"],
+    .lg-rule[data-rule="BOUNDARY"]      { color:#93c5fd; border:1px solid #2563eb; background:#0a1a2e; }
+    .lg-rule[data-rule="BLACKLIST"],
+    .lg-rule[data-rule="SUPPRESS"]      { color:#fca5a5; border:1px solid #dc2626; background:#1a0a0a; }
+    .lg-rule[data-rule="FLAG"]          { color:#fcd34d; border:1px solid #d97706; background:#1a1400; }
+    .lg-rule[data-rule="MATH"]          { color:#67e8f9; border:1px solid #06b6d4; background:#082f3a; }
+    .lg-colour-row { display:flex; align-items:center; gap:6px; font-size:9px; }
+    .lg-colour-row input[type=color] {
+      width: 26px; height: 18px; padding: 0; border: 1px solid var(--border);
+      border-radius: 3px; background: transparent; cursor: pointer;
+    }
+
+    /* --- Scrollbar global --- */
+    * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+    /* --- Refresh indicator --- */
+    #refresh-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--dim); display: inline-block; margin-left: 6px;
+      transition: background 0.2s;
+    }
+    #refresh-dot.active { background: var(--green); }
+  </style>
+</head>
+<body>
+  <!-- Theme bootstrap must run before paint to avoid flash.
+       MV3 CSP forbids inline <script>, so the body opens with -->
+       <!-- an external file loaded synchronously. -->
+  <script src="theme-bootstrap.js"></script>
+
+<!-- Top bar -->
+<div id="topbar">
+  <h1>⬡ KAM TTS</h1>
+  <button id="power-btn" type="button" title="Start / stop the local server">
+    <svg class="power-arc-svg" viewBox="0 0 24 24" aria-hidden="true">
+      <circle id="power-arc" cx="12" cy="12" r="9" fill="none"
+              stroke="var(--green)" stroke-width="2.1" stroke-linecap="round"
+              transform="rotate(-90 12 12)"></circle>
+    </svg>
+    <span class="power-glyph">⏻</span>
+  </button>
+  <span class="pill offline" id="server-status">connecting…</span>
+  <span style="color:var(--dim);font-size:10px" id="chunk-counter">0 chunks</span>
+  <!-- Voice profile selector -->
+  <div id="voice-wrap" style="position:relative;display:inline-block;margin-left:10px">
+    <button id="voice-pill" title="Voice profiles"
+      style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;color:var(--subtext);cursor:pointer;font-family:var(--font);font-size:10px;padding:3px 10px">🎤 <span id="voice-pill-name">default</span> ▾</button>
+    <div id="voice-menu" style="display:none;position:absolute;top:26px;left:0;z-index:50;min-width:290px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.5);padding:8px">
+      <div style="font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Voice profiles</div>
+      <div id="voice-list" style="display:flex;flex-direction:column;gap:4px"></div>
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <button id="voice-new" style="flex:1;background:var(--indigo);border:1px solid var(--indigo);color:#000;font-weight:600;border-radius:5px;padding:5px;cursor:pointer;font-family:var(--font);font-size:10px">＋ New voice</button>
+        <button id="voice-passages-btn" style="flex:1;background:transparent;border:1px solid var(--border);color:var(--subtext);border-radius:5px;padding:5px;cursor:pointer;font-family:var(--font);font-size:10px">📜 Recording passages</button>
+      </div>
+      <div id="voice-passages" style="display:none;margin-top:8px;max-height:300px;overflow-y:auto;border-top:1px solid var(--border);padding-top:6px"></div>
+      <div id="voice-status" style="font-size:9px;color:var(--dim);margin-top:6px"></div>
+    </div>
+  </div>
+  <span id="refresh-dot"></span>
+  <div id="topbar-right">
+    <button id="ui-font-cog" class="tab-btn" type="button" data-menu="uifont">Fonts</button>
+    <button id="tts-tune-cog" class="tab-btn" type="button" data-menu="tune">Speech Tuning</button>
+    <button id="settings-cog" class="tab-btn" type="button" data-menu="themes">Themes</button>
+    <button class="tab-btn active" data-tab="console">Console Legend</button>
+    <button class="tab-btn" data-tab="chunks">Live Feed</button>
+    <button class="tab-btn" data-tab="report">Report</button>
+    <button class="tab-btn" data-tab="rules">Rules</button>
+    <button class="tab-btn" data-tab="stats">Stats</button>
+    <button class="tab-btn" data-tab="ai">AI</button>
+  </div>
+  <!-- Settings dropdown - anchored to topbar so it overlays the panels below -->
+  <!-- UI Fonts dropdown -->
+  <div id="ui-font-panel" role="dialog" aria-label="UI Fonts">
+    <h3>Interface Font</h3>
+    <div class="uf-sub">Console, panels &amp; dashboard text</div>
+    <div class="uf-row">
+      <label>Main interface font</label>
+      <select id="ui-font-select">
+        <option value="default" style="font-family:inherit">System default</option>
+        <option value="arial" style="font-family:Arial, sans-serif">Arial</option>
+        <option value="arialblack" style="font-family:'Arial Black', Gadget, sans-serif">Arial Black</option>
+        <option value="arialnarrow" style="font-family:'Arial Narrow', Arial, sans-serif">Arial Narrow</option>
+        <option value="avenir" style="font-family:Avenir, 'Avenir Next', sans-serif">Avenir</option>
+        <option value="avenirnext" style="font-family:'Avenir Next', Avenir, sans-serif">Avenir Next</option>
+        <option value="bahnschrift" style="font-family:Bahnschrift, 'Segoe UI', sans-serif">Bahnschrift</option>
+        <option value="baskerville" style="font-family:Baskerville, 'Baskerville Old Face', Georgia, serif">Baskerville</option>
+        <option value="bigcaslon" style="font-family:'Big Caslon', 'Book Antiqua', serif">Big Caslon</option>
+        <option value="bodoni" style="font-family:'Bodoni MT', Didot, serif">Bodoni</option>
+        <option value="bookantiqua" style="font-family:'Book Antiqua', Palatino, serif">Book Antiqua</option>
+        <option value="bookman" style="font-family:'Bookman Old Style', serif">Bookman</option>
+        <option value="brushscript" style="font-family:'Brush Script MT', cursive">Brush Script</option>
+        <option value="calibri" style="font-family:Calibri, 'Segoe UI', sans-serif">Calibri</option>
+        <option value="californian" style="font-family:'Californian FB', Georgia, serif">Californian FB</option>
+        <option value="cambria" style="font-family:Cambria, Georgia, serif">Cambria</option>
+        <option value="candara" style="font-family:Candara, 'Segoe UI', sans-serif">Candara</option>
+        <option value="centaur" style="font-family:Centaur, 'Times New Roman', serif">Centaur</option>
+        <option value="century" style="font-family:'Century Gothic', 'Apple Gothic', sans-serif">Century Gothic</option>
+        <option value="centuryschool" style="font-family:'Century Schoolbook', Georgia, serif">Century Schoolbook</option>
+        <option value="comic" style="font-family:'Comic Sans MS', 'Comic Sans', cursive">Comic Sans MS</option>
+        <option value="consolas" style="font-family:Consolas, 'Courier New', monospace">Consolas</option>
+        <option value="constantia" style="font-family:Constantia, Cambria, serif">Constantia</option>
+        <option value="copperplate" style="font-family:Copperplate, 'Copperplate Gothic Light', serif">Copperplate</option>
+        <option value="corbel" style="font-family:Corbel, 'Segoe UI', sans-serif">Corbel</option>
+        <option value="courier" style="font-family:'Courier New', Courier, monospace">Courier New</option>
+        <option value="didot" style="font-family:Didot, 'Bodoni MT', serif">Didot</option>
+        <option value="ebrima" style="font-family:Ebrima, 'Segoe UI', sans-serif">Ebrima</option>
+        <option value="franklin" style="font-family:'Franklin Gothic Medium', 'Arial Narrow', sans-serif">Franklin Gothic</option>
+        <option value="futura" style="font-family:Futura, 'Century Gothic', sans-serif">Futura</option>
+        <option value="gabriola" style="font-family:Gabriola, Georgia, serif">Gabriola</option>
+        <option value="gadugi" style="font-family:Gadugi, 'Segoe UI', sans-serif">Gadugi</option>
+        <option value="garamond" style="font-family:Garamond, 'Times New Roman', serif">Garamond</option>
+        <option value="geneva" style="font-family:Geneva, Tahoma, sans-serif">Geneva</option>
+        <option value="georgia" style="font-family:Georgia, serif">Georgia</option>
+        <option value="gillsans" style="font-family:'Gill Sans', 'Gill Sans MT', sans-serif">Gill Sans</option>
+        <option value="goudy" style="font-family:'Goudy Old Style', Garamond, serif">Goudy Old Style</option>
+        <option value="helvetica" style="font-family:Helvetica, Arial, sans-serif">Helvetica</option>
+        <option value="hoefler" style="font-family:'Hoefler Text', Georgia, serif">Hoefler Text</option>
+        <option value="impact" style="font-family:Impact, Charcoal, sans-serif">Impact</option>
+        <option value="inktrap" style="font-family:'Ink Free', cursive">Ink Free</option>
+        <option value="lato" style="font-family:Lato, 'Segoe UI', sans-serif">Lato</option>
+        <option value="lucidabright" style="font-family:'Lucida Bright', Georgia, serif">Lucida Bright</option>
+        <option value="lucidacon" style="font-family:'Lucida Console', Monaco, monospace">Lucida Console</option>
+        <option value="lucidasans" style="font-family:'Lucida Sans Unicode', 'Lucida Grande', sans-serif">Lucida Sans</option>
+        <option value="malgun" style="font-family:'Malgun Gothic', 'Segoe UI', sans-serif">Malgun Gothic</option>
+        <option value="menlo" style="font-family:Menlo, Monaco, monospace">Menlo</option>
+        <option value="monaco" style="font-family:Monaco, 'Lucida Console', monospace">Monaco</option>
+        <option value="optima" style="font-family:Optima, Candara, sans-serif">Optima</option>
+        <option value="palatino" style="font-family:'Palatino Linotype', Palatino, serif">Palatino</option>
+        <option value="papyrus" style="font-family:Papyrus, fantasy">Papyrus</option>
+        <option value="perpetua" style="font-family:Perpetua, Georgia, serif">Perpetua</option>
+        <option value="rockwell" style="font-family:Rockwell, 'Courier New', serif">Rockwell</option>
+        <option value="segoe" style="font-family:'Segoe UI', system-ui, sans-serif">Segoe UI</option>
+        <option value="segoeprint" style="font-family:'Segoe Print', cursive">Segoe Print</option>
+        <option value="segoescript" style="font-family:'Segoe Script', cursive">Segoe Script</option>
+        <option value="sitka" style="font-family:'Sitka Text', Cambria, serif">Sitka Text</option>
+        <option value="sylfaen" style="font-family:Sylfaen, 'Times New Roman', serif">Sylfaen</option>
+        <option value="tahoma" style="font-family:Tahoma, Geneva, sans-serif">Tahoma</option>
+        <option value="times" style="font-family:'Times New Roman', Times, serif">Times New Roman</option>
+        <option value="trebuchet" style="font-family:'Trebuchet MS', sans-serif">Trebuchet MS</option>
+        <option value="twcen" style="font-family:'Tw Cen MT', 'Century Gothic', sans-serif">Tw Cen MT</option>
+        <option value="verdana" style="font-family:Verdana, Geneva, sans-serif">Verdana</option>
+      </select>
+    </div>
+    <div class="uf-row">
+      <label>Small / helper text font</label>
+      <select id="ui-small-font-select">
+        <option value="default" style="font-family:inherit">System default</option>
+        <option value="arial" style="font-family:Arial, sans-serif">Arial</option>
+        <option value="arialblack" style="font-family:'Arial Black', Gadget, sans-serif">Arial Black</option>
+        <option value="arialnarrow" style="font-family:'Arial Narrow', Arial, sans-serif">Arial Narrow</option>
+        <option value="avenir" style="font-family:Avenir, 'Avenir Next', sans-serif">Avenir</option>
+        <option value="avenirnext" style="font-family:'Avenir Next', Avenir, sans-serif">Avenir Next</option>
+        <option value="bahnschrift" style="font-family:Bahnschrift, 'Segoe UI', sans-serif">Bahnschrift</option>
+        <option value="baskerville" style="font-family:Baskerville, 'Baskerville Old Face', Georgia, serif">Baskerville</option>
+        <option value="bigcaslon" style="font-family:'Big Caslon', 'Book Antiqua', serif">Big Caslon</option>
+        <option value="bodoni" style="font-family:'Bodoni MT', Didot, serif">Bodoni</option>
+        <option value="bookantiqua" style="font-family:'Book Antiqua', Palatino, serif">Book Antiqua</option>
+        <option value="bookman" style="font-family:'Bookman Old Style', serif">Bookman</option>
+        <option value="brushscript" style="font-family:'Brush Script MT', cursive">Brush Script</option>
+        <option value="calibri" style="font-family:Calibri, 'Segoe UI', sans-serif">Calibri</option>
+        <option value="californian" style="font-family:'Californian FB', Georgia, serif">Californian FB</option>
+        <option value="cambria" style="font-family:Cambria, Georgia, serif">Cambria</option>
+        <option value="candara" style="font-family:Candara, 'Segoe UI', sans-serif">Candara</option>
+        <option value="centaur" style="font-family:Centaur, 'Times New Roman', serif">Centaur</option>
+        <option value="century" style="font-family:'Century Gothic', 'Apple Gothic', sans-serif">Century Gothic</option>
+        <option value="centuryschool" style="font-family:'Century Schoolbook', Georgia, serif">Century Schoolbook</option>
+        <option value="comic" style="font-family:'Comic Sans MS', 'Comic Sans', cursive">Comic Sans MS</option>
+        <option value="consolas" style="font-family:Consolas, 'Courier New', monospace">Consolas</option>
+        <option value="constantia" style="font-family:Constantia, Cambria, serif">Constantia</option>
+        <option value="copperplate" style="font-family:Copperplate, 'Copperplate Gothic Light', serif">Copperplate</option>
+        <option value="corbel" style="font-family:Corbel, 'Segoe UI', sans-serif">Corbel</option>
+        <option value="courier" style="font-family:'Courier New', Courier, monospace">Courier New</option>
+        <option value="didot" style="font-family:Didot, 'Bodoni MT', serif">Didot</option>
+        <option value="ebrima" style="font-family:Ebrima, 'Segoe UI', sans-serif">Ebrima</option>
+        <option value="franklin" style="font-family:'Franklin Gothic Medium', 'Arial Narrow', sans-serif">Franklin Gothic</option>
+        <option value="futura" style="font-family:Futura, 'Century Gothic', sans-serif">Futura</option>
+        <option value="gabriola" style="font-family:Gabriola, Georgia, serif">Gabriola</option>
+        <option value="gadugi" style="font-family:Gadugi, 'Segoe UI', sans-serif">Gadugi</option>
+        <option value="garamond" style="font-family:Garamond, 'Times New Roman', serif">Garamond</option>
+        <option value="geneva" style="font-family:Geneva, Tahoma, sans-serif">Geneva</option>
+        <option value="georgia" style="font-family:Georgia, serif">Georgia</option>
+        <option value="gillsans" style="font-family:'Gill Sans', 'Gill Sans MT', sans-serif">Gill Sans</option>
+        <option value="goudy" style="font-family:'Goudy Old Style', Garamond, serif">Goudy Old Style</option>
+        <option value="helvetica" style="font-family:Helvetica, Arial, sans-serif">Helvetica</option>
+        <option value="hoefler" style="font-family:'Hoefler Text', Georgia, serif">Hoefler Text</option>
+        <option value="impact" style="font-family:Impact, Charcoal, sans-serif">Impact</option>
+        <option value="inktrap" style="font-family:'Ink Free', cursive">Ink Free</option>
+        <option value="lato" style="font-family:Lato, 'Segoe UI', sans-serif">Lato</option>
+        <option value="lucidabright" style="font-family:'Lucida Bright', Georgia, serif">Lucida Bright</option>
+        <option value="lucidacon" style="font-family:'Lucida Console', Monaco, monospace">Lucida Console</option>
+        <option value="lucidasans" style="font-family:'Lucida Sans Unicode', 'Lucida Grande', sans-serif">Lucida Sans</option>
+        <option value="malgun" style="font-family:'Malgun Gothic', 'Segoe UI', sans-serif">Malgun Gothic</option>
+        <option value="menlo" style="font-family:Menlo, Monaco, monospace">Menlo</option>
+        <option value="monaco" style="font-family:Monaco, 'Lucida Console', monospace">Monaco</option>
+        <option value="optima" style="font-family:Optima, Candara, sans-serif">Optima</option>
+        <option value="palatino" style="font-family:'Palatino Linotype', Palatino, serif">Palatino</option>
+        <option value="papyrus" style="font-family:Papyrus, fantasy">Papyrus</option>
+        <option value="perpetua" style="font-family:Perpetua, Georgia, serif">Perpetua</option>
+        <option value="rockwell" style="font-family:Rockwell, 'Courier New', serif">Rockwell</option>
+        <option value="segoe" style="font-family:'Segoe UI', system-ui, sans-serif">Segoe UI</option>
+        <option value="segoeprint" style="font-family:'Segoe Print', cursive">Segoe Print</option>
+        <option value="segoescript" style="font-family:'Segoe Script', cursive">Segoe Script</option>
+        <option value="sitka" style="font-family:'Sitka Text', Cambria, serif">Sitka Text</option>
+        <option value="sylfaen" style="font-family:Sylfaen, 'Times New Roman', serif">Sylfaen</option>
+        <option value="tahoma" style="font-family:Tahoma, Geneva, sans-serif">Tahoma</option>
+        <option value="times" style="font-family:'Times New Roman', Times, serif">Times New Roman</option>
+        <option value="trebuchet" style="font-family:'Trebuchet MS', sans-serif">Trebuchet MS</option>
+        <option value="twcen" style="font-family:'Tw Cen MT', 'Century Gothic', sans-serif">Tw Cen MT</option>
+        <option value="verdana" style="font-family:Verdana, Geneva, sans-serif">Verdana</option>
+      </select>
+    </div>
+    <div class="uf-row">
+      <label>Interface zoom <span class="uf-val" id="ui-zoom-v">100%</span></label>
+      <input id="ui-zoom" type="range" min="70" max="250" step="5" value="100">
+    </div>
+    <div style="border-top:1px solid var(--border);margin-top:10px;padding-top:10px">
+      <div style="font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Customization defaults</div>
+      <button id="kam-save-default" type="button" style="width:100%;padding:7px;border-radius:7px;cursor:pointer;font-family:var(--font);font-size:10px;background:var(--indigo);border:1px solid var(--indigo);color:#000;margin-bottom:5px;font-weight:600">★ Save current as my default</button>
+      <button id="kam-reset-default" type="button" style="width:100%;padding:7px;border-radius:7px;cursor:pointer;font-family:var(--font);font-size:10px;background:transparent;border:1px solid var(--border);color:var(--dim);margin-bottom:5px">↺ Reset to my default</button>
+      <button id="kam-reset-factory" type="button" style="width:100%;padding:7px;border-radius:7px;cursor:pointer;font-family:var(--font);font-size:10px;background:transparent;border:1px solid var(--border);color:var(--dim)">⟲ Restore original factory</button>
+      <div style="font-size:9px;color:var(--dim);line-height:1.5;margin-top:6px">Covers fonts, interface zoom, chunk font/size and volume. Factory originals are always kept, so you can fully reset anytime.</div>
+    </div>
+  </div>
+
+  <div id="settings-panel" role="dialog" aria-label="Settings">
+    <h3>Theme</h3>
+    <div class="theme-picker" role="tablist">
+      <button class="theme-btn" data-theme="arian" type="button">Arian</button>
+      <button class="theme-btn" data-theme="light" type="button">Light</button>
+      <button class="theme-btn" data-theme="dark"  type="button">Dark</button>
+    </div>
+
+    <h3 style="margin-top:14px">Customise <span id="cust-theme-label" style="color:var(--dim);font-weight:400;text-transform:none">arian</span></h3>
+    <div id="cust-colours" class="cust-colours">
+      <label class="cust-row"><span>Background</span><input type="color" data-var="--bg"></label>
+      <label class="cust-row"><span>Panel surface</span><input type="color" data-var="--bg2"></label>
+      <label class="cust-row"><span>Inset / buttons</span><input type="color" data-var="--bg3"></label>
+      <label class="cust-row"><span>Borders</span><input type="color" data-var="--border"></label>
+      <label class="cust-row"><span>Body text</span><input type="color" data-var="--text"></label>
+      <label class="cust-row"><span>Secondary text</span><input type="color" data-var="--subtext"></label>
+      <label class="cust-row"><span>Muted text</span><input type="color" data-var="--dim"></label>
+      <label class="cust-row"><span>Accent</span><input type="color" data-var="--indigo"></label>
+    </div>
+    <button id="cust-reset" type="button">↺ Reset this theme</button>
+  </div>
+
+  <!-- The TTS Tuning dropdown, holding the live XTTS inference parameters with an
+     explanation of each one -->
+  <div id="tts-tune-panel" role="dialog" aria-label="TTS Tuning">
+    <div class="tune-head">
+      <h3>Model Tuning</h3>
+      <span class="tune-sub">Live · applies to the next chunk</span>
+    </div>
+
+    <div class="tune-param">
+      <div class="tune-row">
+        <span class="tune-name">Temperature</span>
+        <input id="tp-temp" type="range" min="0.05" max="0.95" step="0.01">
+        <span class="tune-val" id="tp-temp-v">—</span>
+      </div>
+      <div class="tune-desc">How adventurous the voice is. <strong>Low</strong> (~0.2) = precise, steady, can sound flat. <strong>High</strong> (~0.7) = expressive and varied, but risks slips or drift. Sweet spot for reading: 0.30–0.45.</div>
+    </div>
+
+    <div class="tune-param">
+      <div class="tune-row">
+        <span class="tune-name">Top-K</span>
+        <input id="tp-topk" type="range" min="1" max="100" step="1">
+        <span class="tune-val" id="tp-topk-v">—</span>
+      </div>
+      <div class="tune-desc">How many candidate sounds the model may choose from at each step. <strong>Lower</strong> = safer, more repetitive. <strong>Higher</strong> = more natural variety. Typical: 30–60.</div>
+    </div>
+
+    <div class="tune-param">
+      <div class="tune-row">
+        <span class="tune-name">Top-P</span>
+        <input id="tp-topp" type="range" min="0.1" max="1.0" step="0.01">
+        <span class="tune-val" id="tp-topp-v">—</span>
+      </div>
+      <div class="tune-desc">Keeps only the most likely options that together cover this probability mass. <strong>0.9</strong> trims unlikely, odd sounds while keeping natural range. Lower = tighter/safer, higher = looser.</div>
+    </div>
+
+    <div class="tune-param">
+      <div class="tune-row">
+        <span class="tune-name">Repetition penalty</span>
+        <input id="tp-rep" type="range" min="1.0" max="10.0" step="0.1">
+        <span class="tune-val" id="tp-rep-v">—</span>
+      </div>
+      <div class="tune-desc">Discourages the voice from looping or stuttering on the same sound. <strong>Higher</strong> = fewer repeats but can clip pacing; <strong>too low</strong> = stutters. Typical: 3–5.</div>
+    </div>
+
+    <div class="tune-param">
+      <div class="tune-row">
+        <span class="tune-name">Volume</span>
+        <input id="tp-vol" type="range" min="0" max="600" step="5">
+        <span class="tune-val" id="tp-vol-v">—</span>
+      </div>
+      <div class="tune-desc">Playback loudness of the spoken audio. Local playback only — doesn't change the model. 0% mutes, 100% is unaltered, above 100% boosts (up to 600%) with soft-clip + limiter so louder never distorts.</div>
+    </div>
+
+    <div class="tune-param">
+      <div class="tune-row" style="justify-content:space-between">
+        <label for="tp-standby">Idle standby <span id="tp-standby-state" style="color:var(--dim);font-weight:400"></span></label>
+        <select id="tp-standby" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-family:var(--font);font-size:11px">
+          <option value="0">Always on</option>
+          <option value="300">5 minutes</option>
+          <option value="600">10 minutes</option>
+          <option value="900">15 minutes</option>
+          <option value="1800">30 minutes</option>
+          <option value="3600">60 minutes</option>
+          <option value="7200">2 hours</option>
+        </select>
+      </div>
+      <div class="tune-desc">Frees GPU memory after this long with no speech, then wakes automatically on your next play (a brief warm-up the first time). <strong>Always on</strong> keeps the model loaded for instant response. Saves memory during long pauses — best set to how long you typically step away.</div>
+    </div>
+
+    <div class="tune-param">
+      <div class="tune-row" style="justify-content:space-between">
+        <span class="tune-name">Learned adjustments</span>
+        <button id="tp-reset-rates" type="button" style="font-size:9px;padding:2px 8px">↺ Reset learned rates</button>
+      </div>
+      <div id="tp-learned" style="font-size:10px;color:var(--dim);line-height:1.7;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-top:4px">Loading…</div>
+      <div class="tune-desc">What your reports have taught the model. Rate modifiers shade your chosen speed by chunk complexity, so dense technical text can play slower than simple text. Temperatures apply per sentence type. Reset clears rate learning only.</div>
+    </div>
+
+    <div class="tune-card">
+      <div class="tune-row">
+        <span class="tune-name">Quality analysis</span>
+        <select id="tp-analysis" style="flex:1;background:var(--bg3);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 6px;font-family:var(--font);font-size:10px">
+          <option value="1">Every chunk — best learning</option>
+          <option value="3">Every 3rd chunk — balanced</option>
+          <option value="5">Every 5th chunk — faster</option>
+          <option value="0">Off — fastest</option>
+        </select>
+      </div>
+      <div class="tune-desc">After each chunk a local Whisper model listens back and scores it. That runs on the <strong>same GPU as synthesis</strong>, so analysing every chunk roughly doubles GPU work. Sampling keeps learning going for a fraction of the cost; <strong>Off</strong> is fastest but KAM stops learning from what it hears.</div>
+    </div>
+
+    <div class="tune-actions">
+      <button id="tp-benchmark" type="button" class="tune-btn action"
+        title="Speaks two fixed sentences so you can A/B your changes on the same material">🔊 Test these settings</button>
+      <button id="tp-save-default" type="button" class="tune-btn primary"
+        title="Makes the current sliders your starting point every time">★ Save as my default</button>
+      <div class="tune-actions-sep">undo</div>
+      <button id="tp-default" type="button" class="tune-btn ghost"
+        title="Return the sliders to the values you last saved">↺ Back to my default</button>
+      <button id="tp-factory" type="button" class="tune-btn danger"
+        title="Discard your saved default and restore the original KAM values">⟲ Discard mine, use KAM's original</button>
+    </div>
+    <div id="tp-status" class="tune-status"></div>
+    <div class="tune-foot">Benchmark speaks two fixed number- and word-heavy sentences so you can A/B your changes on the same material. <strong>Save these as my default</strong> makes the current sliders your new starting point; the original factory values are always kept so you can fully reset.</div>
+  </div>
+</div>
+
+<!-- Main -->
+<div id="main">
+
+  <!-- Console (left, default) and AI Analysis Feed (left, when AI tab active).
+       Both occupy the same left flex slot; CSS swaps visibility based on
+       body[data-active-tab]. The right panel keeps its tabbed sub-panels
+       (Autonomous / User-Confirmed / Manual / Whisper / etc.) untouched. -->
+  <div id="console-panel">
+    <div id="console-header">
+      <span class="dot"></span>
+      Live Server Console
+      <button id="clear-btn">⌫ clear</button>
+    </div>
+    <div id="console-log"></div>
+  </div>
+  <div id="ai-feed-panel">
+    <div id="ai-feed-header">
+      <span class="dot ai"></span>
+      AI Analysis Feed
+      <span id="ai-feed-count"></span>
+      <button id="ai-feed-refresh" title="Refresh now">↻</button>
+    </div>
+    <div id="ai-feed-body">
+      <div class="ai-empty">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Drag divider -->
+  <div id="drag-divider"></div>
+
+  <!-- Right panels -->
+  <div id="right-panel">
+
+    <!-- Stats -->
+    <div class="rpanel active" id="panel-stats">
+      <div class="rpanel-header">Quality Stats</div>
+      <div class="rpanel-body" id="stats-body">
+        <div class="stat-grid">
+          <div class="stat-card"><div class="stat-label">Total Chunks</div><div class="stat-value indigo" id="s-total">—</div></div>
+          <div class="stat-card"><div class="stat-label">Avg Quality</div><div class="stat-value yellow" id="s-quality">—</div></div>
+          <div class="stat-card"><div class="stat-label">High Quality</div><div class="stat-value green" id="s-high">—</div></div>
+          <div class="stat-card"><div class="stat-label">Low Quality</div><div class="stat-value red" id="s-low">—</div></div>
+        </div>
+        <div class="section-title">Chunk Breakdown</div>
+        <div class="status-row"><span class="key">Success</span><span class="val ok" id="s-success">—</span></div>
+        <div class="status-row"><span class="key">Errors</span><span class="val err" id="s-errors">—</span></div>
+        <div class="status-row"><span class="key">Skipped</span><span class="val" id="s-skipped">—</span></div>
+        <div class="status-row"><span class="key">Analysed by Whisper</span><span class="val" id="s-analysed">—</span></div>
+        <div class="status-row"><span class="key">Flagged</span><span class="val warn" id="s-flagged">—</span></div>
+        <div class="section-title">System</div>
+        <div class="status-row"><span class="key">Reports filed</span><span class="val" id="s-reports">—</span></div>
+        <div class="status-row"><span class="key">Active rules</span><span class="val" id="s-rules">—</span></div>
+        <div class="status-row"><span class="key">Blacklisted tokens</span><span class="val" id="s-blacklist">—</span></div>
+        <div class="section-title">Analysis Engines</div>
+        <div class="status-row"><span class="key">Whisper (accuracy)</span><span class="val" id="s-whisper">—</span></div>
+        <div class="status-row"><span class="key">librosa (prosody)</span><span class="val" id="s-librosa">—</span></div>
+        <div class="section-title">Voice Baseline</div>
+        <div class="status-row"><span class="key">Pitch mean</span><span class="val" id="s-pitch">—</span></div>
+        <div class="status-row"><span class="key">Energy mean</span><span class="val" id="s-energy">—</span></div>
+        <div class="status-row"><span class="key">Speaking rate</span><span class="val" id="s-rate">—</span></div>
+        <div class="status-row"><span class="key">Baseline samples</span><span class="val" id="s-samples">—</span></div>
+
+        <div class="section-title" style="margin-top:16px">🧠 Model Learning History <span style="color:var(--dim);font-size:8px;font-weight:400;text-transform:none;letter-spacing:0">permanent · survives clear</span></div>
+        <div class="hist-summary">
+          <div class="hist-stat"><span class="hist-num" id="hist-total">0</span><span class="hist-lbl">total changes</span></div>
+          <div class="hist-stat"><span class="hist-num" id="hist-user">0</span><span class="hist-lbl">from you</span></div>
+          <div class="hist-stat"><span class="hist-num" id="hist-solid">0</span><span class="hist-lbl">solid chunks</span></div>
+          <div class="hist-stat"><span class="hist-num" id="hist-auto">0</span><span class="hist-lbl">automatic</span></div>
+        </div>
+        <button id="btn-clear-chunks" type="button" style="width:100%;padding:6px;margin-bottom:8px;border-radius:6px;cursor:pointer;font-family:var(--font);font-size:10px;background:transparent;border:1px solid var(--border);color:var(--dim)">↺ Clear chunk history (resets the count — keeps rules &amp; learning)</button>
+        <div class="hist-list" id="hist-body"><div class="ai-empty">Loading…</div></div>
+        <div id="hist-handle" class="resize-handle" title="Drag to resize"><div class="resize-grip"></div></div>
+
+        <div class="section-title" style="margin-top:16px">📖 What these stats mean</div>
+        <div class="stats-guide" id="stats-guide-body">
+          <div class="sg-row"><span class="sg-term">Total Chunks</span><span class="sg-def">Distinct sentences synthesised and stored. One reading adds its sentences once (re-reads don't double-count).</span></div>
+          <div class="sg-row"><span class="sg-term">Avg Quality</span><span class="sg-def">Mean quality score across analysed chunks. Combines Whisper word-accuracy, pitch variation, energy and voice consistency. Higher is better.</span></div>
+          <div class="sg-row"><span class="sg-term">High / Low Quality</span><span class="sg-def">Chunks scoring ≥85% (High) or &lt;60% (Low). A few Lows are normal — usually short headings or numbers Whisper struggles to transcribe, not actual bad audio.</span></div>
+          <div class="sg-row"><span class="sg-term">Success / Errors</span><span class="sg-def">Chunks that synthesised cleanly vs. ones that threw an error. Errors should be rare.</span></div>
+          <div class="sg-row"><span class="sg-term">Skipped</span><span class="sg-def">Chunks suppressed on purpose (a SUPPRESS rule) — emitted as silence rather than spoken.</span></div>
+          <div class="sg-row"><span class="sg-term">Analysed by Whisper</span><span class="sg-def">How many chunks the local Whisper model has listened back to. Analysis runs in the background after each chunk.</span></div>
+          <div class="sg-row"><span class="sg-term">Flagged</span><span class="sg-def">Chunks where analysis found something worth noting (skip, hallucination, cut-off, drift). These populate the Whisper Analysis view.</span></div>
+          <div class="sg-row"><span class="sg-term">Reports / Active rules / Blacklisted</span><span class="sg-def">Reports you've filed, rules currently shaping audio, and tokens stripped before synthesis.</span></div>
+          <div class="sg-row"><span class="sg-term">Whisper · librosa</span><span class="sg-def">The two local analysis engines: Whisper checks <em>what words</em> were heard; librosa measures <em>how it sounded</em> (pitch, energy, rhythm).</span></div>
+          <div class="sg-row"><span class="sg-term">Pitch mean</span><span class="sg-def">Average fundamental frequency of your cloned voice, in Hz. Part of the baseline used to detect voice drift.</span></div>
+          <div class="sg-row"><span class="sg-term">Energy mean</span><span class="sg-def">Average loudness/intensity of the baseline voice. Sharp drops mid-chunk signal a cut-off.</span></div>
+          <div class="sg-row"><span class="sg-term">Speaking rate</span><span class="sg-def">Syllable onsets per second — how fast the baseline voice speaks. Used to spot chunks that rushed or dragged.</span></div>
+          <div class="sg-row"><span class="sg-term">Baseline samples</span><span class="sg-def">How many confirmed-good chunks the voice baseline is built from. It firms up after ~10 high-quality chunks, making drift detection more reliable.</span></div>
+        </div>
+        <div id="stats-guide-handle" class="resize-handle" title="Drag to resize"><div class="resize-grip"></div></div>
+      </div>
+    </div>
+
+    <!-- Chunk feed -->
+    <div class="rpanel" id="panel-chunks">
+      <div class="rpanel-header" style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+        <span>Live Feed</span>
+        <span style="display:flex;gap:4px">
+          <select id="chunk-font-select" title="Reading font for chunk text"
+            style="font-size:9px;background:var(--bg3);color:var(--subtext);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-family:var(--font);max-width:110px">
+            <option value="mono" style="font-family:'Cascadia Code',Consolas,monospace">Mono</option>
+            <option value="arial" style="font-family:Arial, sans-serif">Arial</option>
+            <option value="arialblack" style="font-family:'Arial Black', Gadget, sans-serif">Arial Black</option>
+            <option value="arialnarrow" style="font-family:'Arial Narrow', Arial, sans-serif">Arial Narrow</option>
+            <option value="avenir" style="font-family:Avenir, 'Avenir Next', sans-serif">Avenir</option>
+            <option value="avenirnext" style="font-family:'Avenir Next', Avenir, sans-serif">Avenir Next</option>
+            <option value="bahnschrift" style="font-family:Bahnschrift, 'Segoe UI', sans-serif">Bahnschrift</option>
+            <option value="baskerville" style="font-family:Baskerville, 'Baskerville Old Face', Georgia, serif">Baskerville</option>
+            <option value="bigcaslon" style="font-family:'Big Caslon', 'Book Antiqua', serif">Big Caslon</option>
+            <option value="bodoni" style="font-family:'Bodoni MT', Didot, serif">Bodoni</option>
+            <option value="bookantiqua" style="font-family:'Book Antiqua', Palatino, serif">Book Antiqua</option>
+            <option value="bookman" style="font-family:'Bookman Old Style', serif">Bookman</option>
+            <option value="brushscript" style="font-family:'Brush Script MT', cursive">Brush Script</option>
+            <option value="calibri" style="font-family:Calibri, 'Segoe UI', sans-serif">Calibri</option>
+            <option value="californian" style="font-family:'Californian FB', Georgia, serif">Californian FB</option>
+            <option value="cambria" style="font-family:Cambria, Georgia, serif">Cambria</option>
+            <option value="candara" style="font-family:Candara, 'Segoe UI', sans-serif">Candara</option>
+            <option value="centaur" style="font-family:Centaur, 'Times New Roman', serif">Centaur</option>
+            <option value="century" style="font-family:'Century Gothic', 'Apple Gothic', sans-serif">Century Gothic</option>
+            <option value="centuryschool" style="font-family:'Century Schoolbook', Georgia, serif">Century Schoolbook</option>
+            <option value="comic" style="font-family:'Comic Sans MS', 'Comic Sans', cursive">Comic Sans MS</option>
+            <option value="consolas" style="font-family:Consolas, 'Courier New', monospace">Consolas</option>
+            <option value="constantia" style="font-family:Constantia, Cambria, serif">Constantia</option>
+            <option value="copperplate" style="font-family:Copperplate, 'Copperplate Gothic Light', serif">Copperplate</option>
+            <option value="corbel" style="font-family:Corbel, 'Segoe UI', sans-serif">Corbel</option>
+            <option value="courier" style="font-family:'Courier New', Courier, monospace">Courier New</option>
+            <option value="didot" style="font-family:Didot, 'Bodoni MT', serif">Didot</option>
+            <option value="ebrima" style="font-family:Ebrima, 'Segoe UI', sans-serif">Ebrima</option>
+            <option value="franklin" style="font-family:'Franklin Gothic Medium', 'Arial Narrow', sans-serif">Franklin Gothic</option>
+            <option value="futura" style="font-family:Futura, 'Century Gothic', sans-serif">Futura</option>
+            <option value="gabriola" style="font-family:Gabriola, Georgia, serif">Gabriola</option>
+            <option value="gadugi" style="font-family:Gadugi, 'Segoe UI', sans-serif">Gadugi</option>
+            <option value="garamond" style="font-family:Garamond, 'Times New Roman', serif">Garamond</option>
+            <option value="geneva" style="font-family:Geneva, Tahoma, sans-serif">Geneva</option>
+            <option value="georgia" style="font-family:Georgia, serif">Georgia</option>
+            <option value="gillsans" style="font-family:'Gill Sans', 'Gill Sans MT', sans-serif">Gill Sans</option>
+            <option value="goudy" style="font-family:'Goudy Old Style', Garamond, serif">Goudy Old Style</option>
+            <option value="helvetica" style="font-family:Helvetica, Arial, sans-serif">Helvetica</option>
+            <option value="hoefler" style="font-family:'Hoefler Text', Georgia, serif">Hoefler Text</option>
+            <option value="impact" style="font-family:Impact, Charcoal, sans-serif">Impact</option>
+            <option value="inktrap" style="font-family:'Ink Free', cursive">Ink Free</option>
+            <option value="lato" style="font-family:Lato, 'Segoe UI', sans-serif">Lato</option>
+            <option value="lucidabright" style="font-family:'Lucida Bright', Georgia, serif">Lucida Bright</option>
+            <option value="lucidacon" style="font-family:'Lucida Console', Monaco, monospace">Lucida Console</option>
+            <option value="lucidasans" style="font-family:'Lucida Sans Unicode', 'Lucida Grande', sans-serif">Lucida Sans</option>
+            <option value="malgun" style="font-family:'Malgun Gothic', 'Segoe UI', sans-serif">Malgun Gothic</option>
+            <option value="menlo" style="font-family:Menlo, Monaco, monospace">Menlo</option>
+            <option value="monaco" style="font-family:Monaco, 'Lucida Console', monospace">Monaco</option>
+            <option value="optima" style="font-family:Optima, Candara, sans-serif">Optima</option>
+            <option value="palatino" style="font-family:'Palatino Linotype', Palatino, serif">Palatino</option>
+            <option value="papyrus" style="font-family:Papyrus, fantasy">Papyrus</option>
+            <option value="perpetua" style="font-family:Perpetua, Georgia, serif">Perpetua</option>
+            <option value="rockwell" style="font-family:Rockwell, 'Courier New', serif">Rockwell</option>
+            <option value="segoe" style="font-family:'Segoe UI', system-ui, sans-serif">Segoe UI</option>
+            <option value="segoeprint" style="font-family:'Segoe Print', cursive">Segoe Print</option>
+            <option value="segoescript" style="font-family:'Segoe Script', cursive">Segoe Script</option>
+            <option value="sitka" style="font-family:'Sitka Text', Cambria, serif">Sitka Text</option>
+            <option value="sylfaen" style="font-family:Sylfaen, 'Times New Roman', serif">Sylfaen</option>
+            <option value="tahoma" style="font-family:Tahoma, Geneva, sans-serif">Tahoma</option>
+            <option value="times" style="font-family:'Times New Roman', Times, serif">Times New Roman</option>
+            <option value="trebuchet" style="font-family:'Trebuchet MS', sans-serif">Trebuchet MS</option>
+            <option value="twcen" style="font-family:'Tw Cen MT', 'Century Gothic', sans-serif">Tw Cen MT</option>
+            <option value="verdana" style="font-family:Verdana, Geneva, sans-serif">Verdana</option>
+          </select>
+          <select id="chunk-size-select" title="Font size for chunk text"
+            style="font-size:9px;background:var(--bg3);color:var(--subtext);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-family:var(--font)">
+            <option value="10">10px</option>
+            <option value="11" selected>11px</option>
+            <option value="12">12px</option>
+            <option value="13">13px</option>
+            <option value="14">14px</option>
+            <option value="15">15px</option>
+            <option value="16">16px</option>
+            <option value="18">18px</option>
+            <option value="20">20px</option>
+            <option value="22">22px</option>
+            <option value="24">24px</option>
+            <option value="26">26px</option>
+            <option value="28">28px</option>
+            <option value="30">30px</option>
+          </select>
+        </span>
+      </div>
+      <div class="rpanel-body" style="padding:0;display:flex;flex-direction:column;gap:0">
+      <!-- Bottom pane, the live feed, which stays visible -->
+      <div style="display:flex;align-items:center;gap:6px;padding:4px 8px;flex-shrink:0;background:var(--bg2);border-bottom:1px solid var(--border)">
+        <button id="feed-select-toggle" title="Select chunks to mass-rate" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--subtext);cursor:pointer;font-size:11px;line-height:1;padding:2px 5px">☑</button>
+        <span style="font-size:9px;color:var(--subtext);font-weight:600;letter-spacing:1px;text-transform:uppercase">Live feed — click to report</span>
+      </div>
+      <!-- Mass-action toolbar: only visible in select mode -->
+      <div id="feed-mass-bar" style="display:none;align-items:center;gap:6px;padding:4px 8px;flex-shrink:0;background:var(--bg3);border-bottom:1px solid var(--border)">
+        <span id="feed-sel-count" style="font-size:9px;color:var(--subtext)">0 selected</span>
+        <button id="feed-mass-perfect" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:#4ade80;cursor:pointer;font-size:10px;padding:2px 6px">👍 Perfect</button>
+        <button id="feed-mass-halluc" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:#fca5a5;cursor:pointer;font-size:10px;padding:2px 6px">👎 Hallucination</button>
+        <button id="feed-sel-all" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--dim);cursor:pointer;font-size:10px;padding:2px 6px">All</button>
+        <button id="feed-sel-cancel" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--dim);cursor:pointer;font-size:10px;padding:2px 6px">✕</button>
+      </div>
+      <div id="chunks-body" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:4px 8px;min-height:80px"></div>
+    </div>
+
+    </div>
+    <!-- Report -->
+    <div class="rpanel" id="panel-report">
+      <div class="rpanel-header">File Quality Report</div>
+      <div class="rpanel-body">
+        <!-- The chunk preview, set either by the popup's ⚑ button or by clicking the
+     live feed -->
+        <div style="margin-bottom:18px">
+          <div style="font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:6px">
+            Reporting chunk
+          </div>
+          <div id="report-preview"
+            style="color:var(--text);background:var(--bg3);
+                   border-left:3px solid var(--indigo);border-radius:0 4px 4px 0;
+                   padding:10px 12px;line-height:1.7;min-height:44px">
+            Click ⚑ on any chunk in the extension popup to report it here.
+          </div>
+          <div style="font-size:9px;color:var(--dim);margin-top:5px;padding-left:2px">
+            Tip: use the <strong style="color:var(--subtext)">⚑</strong> flag button next to each chunk in the KAM TTS popup.
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top:4px">
+          <label>Issue type</label>
+          <select id="r-issue">
+            <option value="PRONUNCIATION">🗣  Mispronounced a word / acronym</option>
+            <option value="HALLUCINATION">💭  Hallucinations (said words that weren't there)</option>
+            <option value="SKIP">⏭  Dropped / skipped a word</option>
+            <option value="TOO_FAST">🐇  Spoke too FAST (rushed)</option>
+            <option value="TOO_SLOW">🐢  Spoke too SLOW (dragging)</option>
+            <option value="ROBOTIC">🤖  Robotic / monotone</option>
+            <option value="VOICE">🎤  Unstable / drifting voice</option>
+            <option value="EQUATION">∑  Equation / symbol read wrongly</option>
+            <option value="PUNCT">❚  Wrong pause / run-on</option>
+            <option value="CUTOFF">✂️   Cut off early</option>
+            <option value="SUPPRESS">🔇  Should be skipped entirely</option>
+            <option value="OTHER">❓  Other</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Problem token (word / abbreviation)</label>
+          <input id="r-token" placeholder="e.g.  API" />
+        </div>
+        <div class="form-group">
+          <label>Should sound like</label>
+          <input id="r-expected" placeholder="e.g.  A.P.I.  or  application programming interface" />
+        </div>
+        <div class="form-group">
+          <label>Actually sounded like</label>
+          <input id="r-heard" placeholder="e.g.  what you actually heard (wrong pronunciation)" />
+        </div>
+        <div class="form-group">
+          <label>Action</label>
+          <select id="r-action">
+            <option value="AUTO">✨  Auto (recommended). Picks the fix for you</option>
+            <option value="ADD_TO_STORE">📖  Add to pronunciation store</option>
+            <option value="BLACKLIST">🚫  Blacklist this token</option>
+            <option value="ADJUST_CHUNK">✂️   Adjust chunk splitting</option>
+            <option value="FLAG_PATTERN">🚩  Flag pattern for review</option>
+            <option value="IGNORE">👁   Log only. No action</option>
+          </select>
+          <div id="r-action-preview" style="font-size:10px;color:var(--dim);line-height:1.5;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-top:6px"></div>
+        </div>
+        <div class="form-group">
+          <label>Confidence</label>
+          <select id="r-confidence">
+            <option value="HIGH">🟢  High. Apply this fix immediately</option>
+            <option value="MEDIUM">🟡  Medium. Apply once 2 matching reports agree</option>
+            <option value="LOW">🔴  Low. Apply once 3 matching reports agree</option>
+          </select>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary"   id="btn-submit">Submit Report</button>
+          <button class="btn btn-secondary" id="btn-clear-report">Clear</button>
+        </div>
+        <div class="submit-result" id="submit-result"></div>
+
+        <div class="section-title" style="margin-top:16px">Recent Reports</div>
+        <div id="report-recent-body"
+          style="font-size:10px;color:var(--dim);height:200px;overflow-y:auto;
+                 padding-right:4px;margin-top:4px">
+          <div id="reports-list">Loading…</div>
+        </div>
+        <div id="report-recent-handle" class="resize-handle" title="Drag to resize"><div class="resize-grip"></div></div>
+
+        <div class="section-title" style="margin-top:16px">📖 Report Guide</div>
+        <div id="report-guide-body" style="font-size:10px;color:var(--dim);line-height:1.6;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px;margin-top:4px;height:220px;overflow-y:auto">
+          <div style="color:var(--text);margin-bottom:10px;padding:8px 10px;background:var(--bg2);border-radius:4px;font-size:10px;line-height:1.6">
+            <strong>How reporting works:</strong> pick the issue type, fill the fields the way the examples below show, and submit. High-confidence reports apply to your audio immediately and become permanent <em>user-confirmed rules</em> (see the AI tab). You usually don't need to report — KAM auto-fixes most issues. Report when something is <em>persistently</em> wrong.
+          </div>
+          <div style="color:#f5c518;margin-bottom:10px;padding:6px 8px;background:#1a1400;border-radius:4px;font-size:10px;line-height:1.5">⚠ The model reads AI, API, SDK, GPU naturally. Only report if it <em>genuinely</em> sounded wrong.</div>
+          <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">🗣 PRONUNCIATION WRONG</div>
+          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">A specific word or abbreviation was mispronounced. The fix is written to the pronunciation store and applied on every future chunk.</div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">🗣 Pronunciation wrong</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Problem token:</span><span style="color:#fff">SQL</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Should sound like:</span><span style="color:#4ade80">sequel</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">ess cue ell</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">📖 Add to pronunciation store</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🟢 High — applies immediately</span></div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">Token = exact word as it appeared in text. Should sound like = the natural spoken words you want.</div>
+          <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">⏭ CHUNK SKIPPED / SILENT</div>
+          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">An entire chunk produced silence or was skipped. The model adjusts its split pattern for this text.</div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">⏭ Chunk skipped / silent</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Problem token:</span><span style="color:#666">(leave blank)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Should sound like:</span><span style="color:#666">(leave blank)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">silence / nothing was played</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">✂️ Adjust chunk splitting</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🟢 High</span></div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">No token needed. The chunk preview above shows which chunk was silent.</div>
+          <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">💭 HALLUCINATION — words added that were not in text</div>
+          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">The model spoke words that were never in the source text. This flags the pattern and tightens temperature.</div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">💭 Hallucination</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Problem token:</span><span style="color:#fff">the the (the repeated word)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Should sound like:</span><span style="color:#4ade80">the (spoken once)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">the the (it repeated)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">🚩 Flag pattern for review</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🟡 Medium</span></div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">Fill in the repeated or added word. The model flags this pattern and reduces temperature.</div>
+          <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">🎵 UNNATURAL RHYTHM / PACING</div>
+          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">Speech sounded robotic, rushed, or had unnatural pauses. Flags the pattern — no pronunciation fix applied.</div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">🎵 Unnatural rhythm / pacing</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Problem token:</span><span style="color:#666">(leave blank)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Should sound like:</span><span style="color:#666">(leave blank)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">describe e.g. too flat / rushed</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">🚩 Flag pattern for review</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🟡 Medium</span></div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">Use the Temperature slider in the popup to adjust expressiveness live. Report is for persistent patterns.</div>
+          <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">⚡ TOO FAST / TOO SLOW</div>
+          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">Speech rate was consistently wrong on a specific chunk. For general speed use the popup Speed slider first.</div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">⚡ Too fast / too slow</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Problem token:</span><span style="color:#666">(leave blank)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Should sound like:</span><span style="color:#666">(leave blank)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">too fast / too slow</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">🚩 Flag pattern for review</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🔴 Low — use speed slider for general adjustment</span></div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">Only report if a specific chunk type is always wrong. Otherwise adjust Speed slider in the popup.</div>
+          <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">🎤 VOICE DRIFTED / SOUNDS WRONG</div>
+          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">The cloned voice sounded noticeably different mid-session — drifted from your baseline voice profile.</div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">🎤 Voice sounds wrong / drifted</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Problem token:</span><span style="color:#666">(leave blank)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Should sound like:</span><span style="color:#666">(leave blank)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">different accent / voice changed</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">🚩 Flag pattern for review</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🟡 Medium</span></div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">If voice drift is frequent, restart the server to reload voice latents. Report flags it for monitoring.</div>
+          <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">❓ OTHER</div>
+          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">Anything that does not fit the above. Logged for review — no automatic fix applied.</div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">❓ Other</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Problem token:</span><span style="color:#888">(optional)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Should sound like:</span><span style="color:#888">(optional)</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">describe the issue clearly</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">👁 Log only — no action</span></div>
+          <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🔴 Low</span></div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">No automatic fix. Useful for noting patterns you want to review manually later.</div>
+          <div style="margin-top:12px;padding:8px;background:#111;border-radius:4px;border:1px solid #333;font-size:9px;color:#bbb;line-height:1.8"><span style="color:#fff;font-weight:600">Should sound like</span> = the exact natural words you want spoken.<br><span style="color:#fff;font-weight:600">Actually sounded like</span> = what you heard that was wrong — be specific.<br><span style="color:#fff;font-weight:600">🟢 High</span> = fix applied immediately to pronunciation store.<br><span style="color:#fff;font-weight:600">🟡 Medium</span> = applied once Whisper confirms the pattern.<br><span style="color:#fff;font-weight:600">🔴 Low</span> = logged only, no automatic action.</div>
+        </div>
+        <div id="report-guide-handle" class="resize-handle" title="Drag to resize"><div class="resize-grip"></div></div>
+      </div>
+    </div>
+
+    <!-- Rules -->
+    <div class="rpanel" id="panel-rules">
+      <div class="rpanel-header" style="display:flex;align-items:center;justify-content:space-between">
+        <span>Learned Rules <span id="rules-count" style="color:var(--dim);font-size:9px;margin-left:6px"></span></span>
+        <button id="btn-cleanup-flags"
+          style="display:none;font-size:9px;padding:2px 8px;background:#1a0808;border:1px solid #dc2626;
+                 color:#fca5a5;border-radius:3px;cursor:pointer;font-family:var(--font)"
+          title="Remove noisy AUTO FLAG rules for common English words">
+          🧹 Clean up noisy flags
+        </button>
+      </div>
+      <div class="rpanel-body" style="display:flex;flex-direction:column;gap:10px">
+        <!-- Add rule form -->
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px">
+          <div class="section-title" style="margin-top:0">Add Rule Manually</div>
+          <div style="display:grid;gap:5px">
+            <select id="new-rule-type" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px;font-family:var(--font);font-size:10px">
+              <option value="PRONUNCIATION">PRONUNCIATION — say differently</option>
+              <option value="BLACKLIST">BLACKLIST — strip from text</option>
+              <option value="FLAG">FLAG — mark for review</option>
+              <option value="SPLIT">SPLIT — force chunk break</option>
+            </select>
+            <input id="new-rule-pattern" placeholder="Pattern / token (e.g. SDK)" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px;font-family:var(--font);font-size:10px" />
+            <input id="new-rule-value"   placeholder="Value (e.g. ess-dee-kay — leave blank for blacklist/flag)" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px;font-family:var(--font);font-size:10px" />
+            <input id="new-rule-action"  placeholder="Action label (optional)" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px;font-family:var(--font);font-size:10px" />
+            <button id="btn-add-rule" style="background:var(--indigo);color:#000;font-weight:700;border:none;border-radius:4px;padding:5px;cursor:pointer;font-family:var(--font);font-size:10px">Add Rule</button>
+          </div>
+        </div>
+        <!-- Rule origins. I moved these off the AI tab, where they didn't belong, and
+             made them collapsible so the table stays the focus. -->
+        <div id="rules-origins" style="display:flex;flex-direction:column;gap:6px"></div>
+        <!-- Rules table -->
+        <div style="font-size:10px;color:var(--dim)">Colour: <span style="color:var(--yellow)">AUTO</span> = model decision · <span style="color:var(--green)">REPORT</span> = your report · <span style="color:var(--cyan)">MANUAL</span> = you added it</div>
+        <div style="overflow-x:auto">
+          <table class="rules-table">
+            <thead><tr>
+              <th class="rule-sort" data-sort="ts">Date ▾</th>
+              <th class="rule-sort" data-sort="pattern">Pattern</th>
+              <th class="rule-sort" data-sort="rule_type">Type</th>
+              <th>Value</th>
+              <th class="rule-sort" data-sort="source">Src</th>
+              <th class="rule-sort" data-sort="hits">Hits</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="rules-tbody"><tr><td colspan="7" style="color:var(--dim)">Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- The console legend on the right, which is the one reference for
+     everything in KAM -->
+    <div class="rpanel" id="panel-console">
+      <div class="rpanel-header" style="display:flex;align-items:center;justify-content:space-between">
+        <span>Console Legend</span>
+        <button id="legend-colours-toggle" title="Customise legend colours"
+          style="font-size:9px;padding:2px 8px;background:var(--bg3);border:1px solid var(--border);color:var(--subtext);border-radius:4px;cursor:pointer;font-family:var(--font)">🎨 Colours</button>
+      </div>
+      <div class="rpanel-body" style="font-size:11px;line-height:1.9">
+
+        <!-- Colour customiser (hidden until toggled) -->
+        <div id="legend-colours" style="display:none;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:10px">
+          <div style="font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Console tag colours</div>
+          <div id="legend-colour-rows" style="display:grid;gap:4px"></div>
+          <div style="display:flex;flex-direction:column;gap:4px;margin-top:8px">
+            <button id="legend-save-default" style="padding:5px;border-radius:5px;cursor:pointer;font-family:var(--font);font-size:9px;background:var(--indigo);border:1px solid var(--indigo);color:#000;font-weight:600">★ Save as my default</button>
+            <button id="legend-reset-default" style="padding:5px;border-radius:5px;cursor:pointer;font-family:var(--font);font-size:9px;background:transparent;border:1px solid var(--border);color:var(--dim)">↺ Reset to my default</button>
+            <button id="legend-reset-factory" style="padding:5px;border-radius:5px;cursor:pointer;font-family:var(--font);font-size:9px;background:transparent;border:1px solid var(--border);color:var(--dim)">⟲ Restore factory colours</button>
+          </div>
+        </div>
+
+        <div class="lg-sec-title">Console tags</div>
+        <div id="legend-tags">
+          <div><span class="lg-tag" data-tag="TTS">[TTS]</span> <span class="lg-def">chunk sent to XTTS for synthesis</span></div>
+          <div><span class="lg-tag" data-tag="PROSODY">[PROSODY]</span> <span class="lg-def">sentence type and pause length chosen</span></div>
+          <div><span class="lg-tag" data-tag="SKIP">[SKIP]</span> <span class="lg-def">chunk skipped — too short or code-only</span></div>
+          <div><span class="lg-tag" data-tag="CODE">[CODE]</span> <span class="lg-def">code or symbol token converted to speech</span></div>
+          <div><span class="lg-tag" data-tag="PUNCT">[PUNCT]</span> <span class="lg-def">punctuation/phrasing correction applied</span></div>
+          <div><span class="lg-tag" data-tag="PRONOUNCE">[PRONOUNCE]</span> <span class="lg-def">pronunciation rule applied or store reloaded</span></div>
+          <div><span class="lg-tag" data-tag="LEARNER">[LEARNER]</span> <span class="lg-def">quality analysis or learning event</span></div>
+          <div><span class="lg-tag" data-tag="RETRY">[RETRY]</span> <span class="lg-def">retrying after a recoverable error</span></div>
+          <div><span class="lg-tag" data-tag="ERROR">[ERROR]</span> <span class="lg-def">synthesis failed — will retry</span></div>
+          <div><span class="lg-tag" data-tag="FATAL">[FATAL]</span> <span class="lg-def">unrecoverable, e.g. a CUDA crash</span></div>
+          <div><span class="lg-tag" data-tag="WARN">[WARN]</span> <span class="lg-def">non-fatal warning, e.g. text truncated</span></div>
+          <div><span class="lg-tag" data-tag="BOOT">[BOOT]</span> <span class="lg-def">server importing libraries at launch</span></div>
+          <div><span class="lg-tag" data-tag="STARTUP">[STARTUP]</span> <span class="lg-def">model loading, latents and warmup</span></div>
+          <div><span class="lg-tag" data-tag="STANDBY">[STANDBY]</span> <span class="lg-def">model evicted to save VRAM, or waking</span></div>
+          <div><span class="lg-tag" data-tag="MATH">[MATH]</span> <span class="lg-def">chunk contains an equation or specialised characters</span></div>
+          <div><span class="lg-tag" data-tag="HOST">[HOST]</span> <span class="lg-def">power-button launcher messages</span></div>
+        </div>
+
+        <div class="lg-sec-title">Rule types</div>
+        <div><span class="lg-rule" data-rule="PRONUNCIATION">PRONUNCIATION</span> <span class="lg-def">say a word differently</span></div>
+        <div><span class="lg-rule" data-rule="PUNCT">PUNCT</span> <span class="lg-def">correct punctuation or phrasing</span></div>
+        <div><span class="lg-rule" data-rule="SPLIT">SPLIT</span> <span class="lg-def">force a chunk break at this point</span></div>
+        <div><span class="lg-rule" data-rule="BOUNDARY">BOUNDARY</span> <span class="lg-def">adjust where chunks start and end</span></div>
+        <div><span class="lg-rule" data-rule="BLACKLIST">BLACKLIST</span> <span class="lg-def">strip this from the text entirely</span></div>
+        <div><span class="lg-rule" data-rule="SUPPRESS">SUPPRESS</span> <span class="lg-def">never speak this chunk</span></div>
+        <div><span class="lg-rule" data-rule="FLAG">FLAG</span> <span class="lg-def">watch only — noticed, no change made</span></div>
+        <div><span class="lg-rule" data-rule="MATH">MATH</span> <span class="lg-def">a taught equation reading, applied before the symbol expander</span></div>
+
+        <div class="lg-sec-title">Quality flags</div>
+        <div><span class="lg-def"><strong style="color:var(--text)">WHISPER_SKIP</strong> — Whisper heard fewer words than the text had</span></div>
+        <div><span class="lg-def"><strong style="color:var(--text)">LOWCONF</strong> — transcription confidence was low</span></div>
+        <div><span class="lg-def"><strong style="color:var(--text)">RUSHED</strong> — spoken faster than your baseline pace</span></div>
+        <div><span class="lg-def"><strong style="color:var(--text)">VOICE_DRIFT</strong> — voice characteristics moved away from your clone</span></div>
+        <div><span class="lg-def"><strong style="color:var(--text)">CUTOFF</strong> — audio ended before the text did</span></div>
+
+        <div class="lg-sec-title">Content facets</div>
+        <div><span class="lg-def">A chunk is often several things at once — a definition containing an equation, a list item with a citation. Facets are detected independently and shown on each chunk in the Live Feed.</span></div>
+        <div><span class="chunk-badge facet-math">∑ math</span> <span class="lg-def">equations or specialised symbols</span></div>
+        <div><span class="chunk-badge facet-list">• list</span> <span class="lg-def">bulleted or numbered items</span></div>
+        <div><span class="chunk-badge facet-definition">≡ definition</span> <span class="lg-def">a term being defined</span></div>
+        <div><span class="chunk-badge facet-code">⌘ code</span> <span class="lg-def">code or API references</span></div>
+        <div><span class="chunk-badge facet-quote">❝ quote</span> <span class="lg-def">quoted or reported speech</span></div>
+        <div><span class="chunk-badge facet-citation">¶ citation</span> <span class="lg-def">academic references</span></div>
+        <div><span class="lg-def" style="margin-top:3px;display:block">A trailing <strong style="color:var(--text)">+2</strong> means two further facets were detected. Only <strong style="color:var(--text)">math</strong> gets its own learned settings — the others are recorded for analysis, because every extra learning bucket thins the evidence in it.</span></div>
+
+        <div class="lg-sec-title">Chunk fingerprint terms</div>
+        <div><span class="lg-def"><strong style="color:var(--text)">simple / typical / dense</strong> — overall complexity band</span></div>
+        <div><span class="lg-def"><strong style="color:var(--text)">short / medium / long</strong> — chunk length in words</span></div>
+        <div><span class="lg-def"><strong style="color:var(--text)">clean / comma-heavy / complex</strong> — punctuation shape, which drives pausing</span></div>
+        <div><span class="lg-def"><strong style="color:var(--text)">plain / technical / symbolic</strong> — wording difficulty, which drives pronunciation care</span></div>
+        <div><span class="lg-def" style="margin-top:3px;display:block">KAM learns voice settings <em>per fingerprint</em>, so a fix for dense comma-heavy sentences doesn't disturb short plain ones.</span></div>
+
+        <div class="lg-sec-title">Hardware</div>
+        <div id="legend-hardware"><span class="lg-def">Checking…</span></div>
+      </div>
+    </div>
+
+    <!-- AI Insights panel -->
+    
+    <div class="rpanel" id="panel-ai">
+      <div class="rpanel-header">AI Thought Process</div>
+      <div style="padding:8px 12px;border-bottom:1px solid var(--border);background:var(--bg2)">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <span style="font-size:11px;color:var(--text);font-weight:600">🤖 Autonomous self-tuning</span>
+          <label style="position:relative;display:inline-block;width:38px;height:20px">
+            <input type="checkbox" id="autotune-toggle" class="kam-switch-input">
+            <span id="autotune-slider" class="kam-switch"></span>
+          </label>
+        </div>
+        <div id="autotune-status" style="font-size:9px;color:var(--dim);margin-top:4px;line-height:1.5">
+          Off. Uses Whisper quality to gently self-adjust per chunk profile, with a rollback tripwire. Collecting data…
+        </div>
+        <div id="autotune-report" style="margin-top:8px"></div>
+      </div>
+      <div class="rpanel-body" id="ai-body">
+        <div style="color:var(--dim);font-size:11px">Loading AI insights…</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script src="player.js"></script>
+
+<script src="dashboard.js"></script>
+
+</body>
+</html>

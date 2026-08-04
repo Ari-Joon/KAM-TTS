@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>KAM TTS</title>
+  <style>
+    /* --- Theme engine, three themes switchable live from the popup ---
+       The body gets a data-theme attribute of arian, light or dark, and that
+       selects the palette. Every UI element below goes through these variables
+       rather than a raw hex value. */
+    :root, [data-theme="arian"] {
+      --pop-bg:         #0f0f0f;
+      --pop-bg-soft:    #1a1a1a;
+      --pop-bg-softer:  #2a2a2a;
+      --pop-border:     #2a2a2a;
+      --pop-text:       #f0f0f0;
+      --pop-text-dim:   #aaa;
+      --pop-text-muted: #666;
+      --pop-subtitle:   #f5c518;
+      --pop-accent:     #f5c518;     /* brand yellow */
+      --pop-accent-hi:  #e0b015;
+      --pop-on-accent:  #000;         /* text colour on top of accent */
+      --pop-danger:     #ef4444;
+      --pop-danger-bg:  #1a0a0a;
+      --pop-danger-br:  #3a1a1a;
+      --pop-danger-t:   #f87171;
+      --pop-ok:         #22c55e;
+      --pop-ph:         #555;
+      --pop-chunk-on:   #2a1f00;      /* active chunk bg */
+    }
+
+    /* Microsoft Fluent-style light theme */
+    [data-theme="light"] {
+      --pop-bg:         #faf9f8;
+      --pop-bg-soft:    #ffffff;
+      --pop-bg-softer:  #f3f2f1;
+      --pop-border:     #d2d0ce;
+      --pop-text:       #201f1e;
+      --pop-text-dim:   #605e5c;
+      --pop-text-muted: #8a8886;
+      --pop-subtitle:   #0078d4;
+      --pop-accent:     #0078d4;      /* Fluent primary */
+      --pop-accent-hi:  #106ebe;
+      --pop-on-accent:  #ffffff;
+      --pop-danger:     #d13438;
+      --pop-danger-bg:  #fde7e9;
+      --pop-danger-br:  #f1707b;
+      --pop-danger-t:   #a4262c;
+      --pop-ok:         #107c10;
+      --pop-ph:         #a19f9d;
+      --pop-chunk-on:   #deecf9;
+    }
+
+    /* Microsoft Fluent-style dark theme */
+    [data-theme="dark"] {
+      --pop-bg:         #1b1a19;
+      --pop-bg-soft:    #252423;
+      --pop-bg-softer:  #323130;
+      --pop-border:     #484644;
+      --pop-text:       #f3f2f1;
+      --pop-text-dim:   #c8c6c4;
+      --pop-text-muted: #8a8886;
+      --pop-subtitle:   #4cc2ff;
+      --pop-accent:     #4cc2ff;      /* Fluent dark primary */
+      --pop-accent-hi:  #2ea6e2;
+      --pop-on-accent:  #1b1a19;
+      --pop-danger:     #f1707b;
+      --pop-danger-bg:  #442726;
+      --pop-danger-br:  #76373a;
+      --pop-danger-t:   #f1707b;
+      --pop-ok:         #6bb700;
+      --pop-ph:         #605e5c;
+      --pop-chunk-on:   #2b4968;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { width: 340px; background: var(--pop-bg); color: var(--pop-text); font-family: 'Segoe UI', sans-serif; padding: 16px; }
+    h1 { font-size: 16px; font-weight: 700; margin-bottom: 4px; color: var(--pop-on-accent); -webkit-text-stroke: 1px var(--pop-accent); paint-order: stroke fill; letter-spacing: 1px; }
+    .subtitle { font-size: 10px; color: var(--pop-subtitle); margin-bottom: 14px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; }
+    .status-bar { display: flex; align-items: center; gap: 8px; background: var(--pop-bg-soft); border-radius: 8px; padding: 8px 12px; margin-bottom: 14px; font-size: 12px; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--pop-text-muted); flex-shrink: 0; }
+    .status-dot.online { background: var(--pop-ok); }
+    .status-dot.offline { background: var(--pop-danger); }
+    #status-text { color: var(--pop-text-dim); }
+    .mode-tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+    .tab { flex: 1; padding: 7px; background: var(--pop-bg-soft); border: 1px solid var(--pop-border); border-radius: 6px; color: var(--pop-text-muted); font-size: 11px; cursor: pointer; text-align: center; transition: all 0.2s; }
+    .tab.active { background: var(--pop-accent); border-color: var(--pop-accent); color: var(--pop-on-accent); font-weight: 700; }
+    #custom-text-area { display: none; margin-bottom: 12px; }
+    textarea { width: 100%; height: 80px; background: var(--pop-bg-soft); border: 1px solid var(--pop-border); border-radius: 8px; color: var(--pop-text); font-size: 12px; padding: 10px; resize: none; outline: none; font-family: 'Segoe UI', sans-serif; }
+    textarea:focus { border-color: var(--pop-accent); }
+    textarea::placeholder { color: var(--pop-ph); }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; }
+    button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-size: 13px; cursor: pointer; font-weight: 500; transition: all 0.2s; }
+    #speak-btn { background: var(--pop-accent); color: var(--pop-on-accent); font-weight: 700; }
+    #speak-btn:hover { background: var(--pop-accent-hi); }
+    #speak-btn:disabled { background: var(--pop-bg-softer); color: var(--pop-text-muted); cursor: not-allowed; }
+    #stop-btn { background: var(--pop-bg-soft); color: var(--pop-text-dim); border: 1px solid var(--pop-border); flex: 0 0 44px; }
+    #stop-btn:hover { background: var(--pop-danger); color: white; border-color: var(--pop-danger); }
+    .player-bar { display: none; background: var(--pop-bg-soft); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+    .player-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .player-label { font-size: 11px; color: var(--pop-text); font-weight: 600; }
+    .player-controls { display: flex; gap: 6px; }
+    .player-controls button { flex: none; width: 36px; height: 30px; padding: 0; background: var(--pop-bg-softer); border: 1px solid var(--pop-border); border-radius: 6px; color: var(--pop-text-dim); font-size: 14px; cursor: pointer; font-weight: normal; display: flex; align-items: center; justify-content: center; }
+    .player-controls button:hover { background: var(--pop-accent); color: var(--pop-on-accent); border-color: var(--pop-accent); }
+    #btn-pause.paused { background: var(--pop-accent); color: var(--pop-on-accent); border-color: var(--pop-accent); }
+    .progress-bar { height: 3px; background: var(--pop-bg-softer); border-radius: 2px; overflow: hidden; }
+    .progress-fill { height: 100%; background: var(--pop-accent); border-radius: 2px; transition: width 0.3s; }
+    .text-view { display: none; max-height: 300px; overflow-y: auto; background: var(--pop-bg); border-radius: 8px; margin-bottom: 12px; padding: 8px; }
+    .text-view::-webkit-scrollbar { width: 4px; }
+    .text-view::-webkit-scrollbar-track { background: var(--pop-bg-soft); }
+    .text-view::-webkit-scrollbar-thumb { background: var(--pop-accent); border-radius: 2px; }
+    .chunk-item { padding: 6px 10px; border-radius: 6px; font-size: 12px; color: var(--pop-text-muted); cursor: pointer; margin-bottom: 2px; line-height: 1.6; transition: all 0.15s; border: 1px solid transparent; }
+    .chunk-item:hover { background: var(--pop-bg-soft); color: var(--pop-text-dim); border-color: var(--pop-border); }
+    .chunk-item.active { background: var(--pop-chunk-on); color: var(--pop-accent); border-color: var(--pop-accent); font-weight: 600; }
+    .chunk-item.played { color: var(--pop-text-muted); opacity: 0.55; }
+    .speed-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+    .speed-label { font-size: 11px; color: var(--pop-text-dim); }
+    #speed-value { font-size: 11px; color: var(--pop-text); font-weight: 600; }
+    #temp-value  { font-size: 11px; color: var(--pop-text); font-weight: 600; }
+    .hint { font-size: 9px; color: #888; }
+    input[type="range"] { width: 100%; margin-bottom: 12px; }
+    #speed-slider { accent-color: var(--pop-accent); }
+    #temp-slider  { accent-color: #ef4444; }
+    .footer { font-size: 10px; color: var(--pop-text-muted); text-align: center; margin-bottom: 10px; opacity: 0.6; }
+    .error-msg { display: none; background: var(--pop-danger-bg); border: 1px solid var(--pop-danger-br); border-radius: 6px; padding: 8px 10px; font-size: 11px; color: var(--pop-danger-t); margin-bottom: 10px; }
+
+    /* --- Quality feedback bar --- */
+    .fb-bar { display: none; align-items: center; justify-content: space-between; background: var(--pop-bg); border-radius: 8px; padding: 6px 10px; margin-bottom: 8px; gap: 8px; }
+    .fb-bar span { font-size: 11px; color: var(--pop-text-muted); }
+    .fb-btns { display: flex; gap: 6px; }
+    .fb-btns button { flex: none; width: auto; padding: 4px 12px; font-size: 14px; border: none; border-radius: 6px; cursor: pointer; }
+    .fb-up   { background: var(--pop-ok); color: white; }
+    .fb-down { background: var(--pop-danger); color: white; }
+
+
+    /* --- Settings block (theme + overlay) --- */
+    #settings-toggle {
+      width: 100%; background: transparent; border: 1px solid var(--pop-border);
+      color: var(--pop-text-muted); padding: 6px; border-radius: 6px; cursor: pointer;
+      font-size: 10px; text-align: center; margin-bottom: 8px; letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+    #settings-toggle:hover { color: var(--pop-text-dim); border-color: var(--pop-accent); }
+    #open-dashboard {
+      width: 100%; background: var(--pop-accent); border: 1px solid var(--pop-accent);
+      color: var(--pop-on-accent); padding: 8px; border-radius: 6px; cursor: pointer;
+      font-size: 11px; font-weight: 700; text-align: center; margin-bottom: 8px;
+      letter-spacing: 1px; text-transform: uppercase;
+    }
+    #open-dashboard:hover { background: var(--pop-accent-hi); border-color: var(--pop-accent-hi); }
+    #toggle-highlight, #toggle-headerbar {
+      width: 100%; padding: 7px; border-radius: 6px; cursor: pointer;
+      font-size: 11px; font-weight: 600; text-align: center; margin-bottom: 8px;
+      letter-spacing: 1px; text-transform: uppercase;
+      background: var(--pop-accent); border: 1px solid var(--pop-accent); color: var(--pop-on-accent);
+    }
+    #toggle-highlight.off, #toggle-headerbar.off {
+      background: transparent; color: var(--pop-text-muted); border-color: var(--pop-border);
+    }
+    #toggle-highlight:hover, #toggle-headerbar:hover { border-color: var(--pop-accent); }
+    #settings-panel { display: none; background: var(--pop-bg-soft); border: 1px solid var(--pop-border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+    /* Each customisation block is a section with equal vertical rhythm and a
+       divider, so controls never crowd each other (consistent 14px gaps). */
+    .cust-section { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--pop-border); }
+    .cust-section:last-child { padding-bottom: 0; margin-bottom: 0; border-bottom: none; }
+    #settings-panel .section-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: var(--pop-text-muted); margin: 0 0 8px; }
+    .theme-picker { display: flex; gap: 6px; }
+    .theme-btn {
+      flex: 1; padding: 7px 4px; background: var(--pop-bg); border: 1px solid var(--pop-border);
+      border-radius: 6px; color: var(--pop-text-dim); font-size: 10px; font-weight: 600;
+      cursor: pointer; text-align: center; font-family: 'Segoe UI', sans-serif;
+    }
+    .theme-btn.active { background: var(--pop-accent); color: var(--pop-on-accent); border-color: var(--pop-accent); }
+    .overlay-row { display: flex; align-items: center; justify-content: space-between; font-size: 10px; color: var(--pop-text-dim); gap: 8px; }
+    .overlay-row input[type=color] { width: 36px; height: 24px; padding: 0; border: 1px solid var(--pop-border); border-radius: 4px; background: transparent; cursor: pointer; }
+    .overlay-row .val { color: var(--pop-text); font-weight: 600; min-width: 60px; text-align: right; font-family: monospace; }
+    .overlay-row input[type=range] { flex: 1; margin: 0; accent-color: var(--pop-accent); }
+    #reset-theme-colours {
+      width: 100%; padding: 7px; border-radius: 6px; cursor: pointer; font-size: 10px;
+      background: transparent; border: 1px solid var(--pop-border); color: var(--pop-text-muted);
+      letter-spacing: 1px; text-transform: uppercase;
+    }
+    #reset-theme-colours:hover { border-color: var(--pop-accent); color: var(--pop-text-dim); }
+  </style>
+</head>
+<body>
+  <script src="popup-theme-bootstrap.js"></script>
+  <h1>KAM TTS</h1>
+  <p class="subtitle">Locally powered excellence</p>
+
+  <div class="status-bar">
+    <div class="status-dot" id="status-dot"></div>
+    <span id="status-text">Checking server...</span>
+  </div>
+
+  <div class="mode-tabs">
+    <div class="tab active" id="tab-selection">Selected Text</div>
+    <div class="tab" id="tab-page">Read Page</div>
+    <div class="tab" id="tab-custom">Custom Text</div>
+  </div>
+
+  <div id="custom-text-area">
+    <textarea id="custom-input" placeholder="Type anything to hear in your voice..."></textarea>
+  </div>
+
+  <div class="error-msg" id="error-msg"></div>
+
+  <div class="controls">
+    <button id="speak-btn">▶ Speak</button>
+    <button id="stop-btn" title="Stop">■</button>
+  </div>
+
+  <div class="player-bar" id="player-bar">
+    <div class="player-top">
+      <span class="player-label" id="player-label">Reading 1 of 1</span>
+      <div class="player-controls">
+        <button id="btn-pause" title="Pause/Resume">⏸</button>
+      </div>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+  </div>
+
+  <div class="text-view" id="text-view"></div>
+
+  <!-- Feedback bar, which appears after each chunk -->
+  <div class="fb-bar" id="feedback-bar">
+    <span>Rate this chunk:</span>
+    <div class="fb-btns">
+      <button class="fb-up"   id="fb-up-btn">👍</button>
+      <button class="fb-down" id="fb-down-btn">👎</button>
+    </div>
+  </div>
+  <div class="speed-row">
+    <span class="speed-label" title="Adjusts speech rate — takes effect on next chunk">Speech <span class="hint">· speed</span></span>
+    <span id="speed-value">1.0x</span>
+  </div>
+  <input type="range" id="speed-slider" min="0.5" max="2.0" step="0.05" value="1.0" />
+
+  <div class="speed-row">
+    <span class="speed-label" title="Higher = more expressive/varied. Lower = more precise/robotic. Takes effect on next chunk, no reload needed.">Temperature <span class="hint">· speech diversity</span></span>
+    <span id="temp-value">0.33</span>
+  </div>
+  <input type="range" id="temp-slider" min="0.05" max="0.90" step="0.01" value="0.33" />
+
+
+  <!-- Themes & Customisation -->
+  <button id="open-dashboard" type="button">📊 Open Dashboard</button>
+  <button id="toggle-headerbar" type="button">📋 Header Bar: On</button>
+  <button id="toggle-highlight" type="button">✏️ Page Highlight: On</button>
+  <button id="settings-toggle" type="button">🎨 Themes &amp; Customisation</button>
+  <div id="settings-panel">
+
+    <div class="cust-section">
+      <div class="section-label">Theme</div>
+      <div class="theme-picker" role="tablist">
+        <button class="theme-btn" data-theme="arian" type="button">Arian</button>
+        <button class="theme-btn" data-theme="light" type="button">Light</button>
+        <button class="theme-btn" data-theme="dark"  type="button">Dark</button>
+      </div>
+    </div>
+
+    <div class="cust-section">
+      <div class="section-label" id="cust-theme-name">Highlight colour</div>
+      <div class="overlay-row">
+        <input id="ov-hl-colour" type="color" value="#f5c518">
+        <span class="val" id="ov-hl-colour-val">#f5c518</span>
+      </div>
+    </div>
+
+    <div class="cust-section">
+      <div class="section-label">Header bar colour</div>
+      <div class="overlay-row">
+        <input id="ov-bar-colour" type="color" value="#0f0f0f">
+        <span class="val" id="ov-bar-colour-val">#0f0f0f</span>
+      </div>
+    </div>
+    <div class="cust-section">
+      <div class="section-label">Reading overlay · text size</div>
+      <div class="overlay-row">
+        <input id="ov-size" type="range" min="10" max="20" step="1" value="12">
+        <span class="val" id="ov-size-val">12px</span>
+      </div>
+    </div>
+
+    <div class="cust-section">
+      <button id="reset-theme-colours" type="button">↺ Reset this theme's colours</button>
+    </div>
+
+  </div>
+
+  <div class="footer">Server: localhost:5050</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

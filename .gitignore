@@ -1,0 +1,39 @@
+# --- Per-install secrets and machine-specific artifacts ---
+# Note: git has no trailing-comment syntax, so a comment on a pattern line
+# becomes part of the pattern and silently matches nothing. Comments go above.
+kam_token.txt
+
+# The native-host manifest and its launcher, both written by register_host.py.
+# They embed absolute paths to this machine and this Python install, so they
+# must never be committed. Both manifest spellings are listed because
+# register_host.py writes the dotted form.
+com.kam.tts.json
+com_kam_tts.json
+kam_host.bat
+
+# Measured per machine by hardware_profile.py, or auto-detected on first boot.
+hardware_profile.json
+
+# --- Runtime state and learned data ---
+tts_quality.db
+tts_quality.db-*
+good_settings.json
+user_defaults.json
+voice_baseline*.json
+kam_server.log
+.kam_ready
+.kam_stage
+.kam_lock
+.warmup_done
+
+# --- Personal audio and voice clones ---
+*.wav
+voice_samples/
+voice_samples_*/
+voices/
+voice_latents*.pt
+my_voice.wav
+
+# --- Python ---
+__pycache__/
+*.pyc

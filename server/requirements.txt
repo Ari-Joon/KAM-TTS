@@ -1,0 +1,54 @@
+# KAM TTS server dependencies. Versions pinned where compatibility is a known
+# hard constraint; see comments. Install with:
+#   pip install -r requirements.txt
+#
+# torch / torchaudio are intentionally NOT pinned: install the build matching
+# YOUR hardware from https://pytorch.org. This is the one dependency that has to
+# match the machine:
+#   NVIDIA        CUDA build (e.g. cu128 for RTX 50-series / Blackwell)
+#   AMD (Linux)   ROCm build
+#   Apple Silicon the default macOS wheel (Metal/MPS support is built in)
+#   Intel Arc     the XPU build
+#   anything else the CPU build — works, just slower than playback
+# KAM detects whichever of these you installed and configures itself for it;
+# KAM_DEVICE=cpu|cuda|mps|xpu overrides the choice.
+torch
+torchaudio
+
+# coqui-tts 0.27.5 requires transformers >= 4.57 (older transformers breaks it).
+coqui-tts==0.27.5
+transformers>=4.57
+
+flask
+flask-cors
+scipy
+numpy
+soundfile
+pillow
+
+# Quality-learning loop (Whisper listens back to every chunk; librosa measures
+# prosody). The server runs without them but learning is silently disabled.
+openai-whisper
+librosa
+
+# POS-informed prosody (NLP layer). After install, fetch the small English
+# model once:  python -m spacy download en_core_web_sm
+spacy>=3.7
+
+# Optional: lets KAM report total system RAM in the hardware profile. Everything
+# works without it; the RAM figure is simply shown as "unknown".
+psutil
+
+# Optional: 4-5x faster CPU transcription, drop-in alternative backend.
+# pip install faster-whisper
+
+# Optional on NVIDIA GPUs: DeepSpeed can roughly halve XTTS inference time.
+# The server detects and enables it automatically if present.
+#
+# A plain `pip install deepspeed` FAILS on Windows: pip builds in an isolated
+# environment with no torch, and DS_BUILD_OPS defaults to pre-compiling every
+# CUDA op (which needs the full MSVC + CUDA toolchain). Use:
+#     set DS_BUILD_OPS=0
+#     pip install deepspeed --no-build-isolation
+# Even then Windows support is limited — DeepSpeed targets Linux/WSL. If it
+# will not install, KAM runs normally without it; nothing depends on it.
