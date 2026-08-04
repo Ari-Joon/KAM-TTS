@@ -1,0 +1,24 @@
+# Line endings.
+#
+# Everything text gets stored in the repository as LF and checked out as LF, on
+# every platform. Without this, git relies on each person's core.autocrlf, so
+# the same file can come out CRLF on one machine and LF on another and show up
+# as a whole-file diff that has nothing to do with the change.
+* text=auto eol=lf
+
+# Windows batch files are the exception, since cmd.exe is happier with CRLF.
+# kam_host.bat is generated per install and gitignored, but if a committed .bat
+# ever appears it should still get the right endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files, marked explicitly so git never tries to normalise them. It
+# detects most of these anyway, but a mistake here corrupts the file rather
+# than just producing a noisy diff, so it's worth being clear.
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.wav  binary
+*.pt   binary
+*.db   binary
+*.zip  binary
