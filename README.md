@@ -116,10 +116,8 @@ fetches the spaCy model, registers the Chrome native-messaging host, checks for
 voice reference audio, and offers to profile synthesis speed. It is idempotent —
 safe to re-run.
 
-It will pause and ask for your **extension id**. Chrome only assigns that once
-the extension has been loaded, so load it first (`chrome://extensions` →
-Developer mode → Load unpacked → the `extension/` folder) and paste the id when
-asked. You can press Enter to skip and do it later with `register_host.py`.
+Nothing to configure by hand: `manifest.json` pins a public key, so Chrome gives
+the extension the same id on every machine and the server already knows it.
 
 You must still **install PyTorch for your hardware first** — it is the one
 dependency that must match your machine. Get the correct command from
@@ -146,27 +144,26 @@ leaves torch unpinned for this reason. KAM adapts to whichever you installed.
    ```
    python check_voice_clips.py
    ```
-5. **Load the extension** (this has to come before the next step):
-   `chrome://extensions` → Developer mode → Load unpacked → select the
-   `extension/` folder. Copy the id shown under KAM TTS.
-6. **Register the native-messaging host**, passing that id:
+5. **Register the native-messaging host** (no arguments needed):
    ```
-   python register_host.py <EXTENSION_ID>
+   python register_host.py
    ```
-   This is only needed for the dashboard power button. Without it everything
+   Only the dashboard power button depends on this. Without it everything else
    still works, you just start the server yourself with `python server.py`.
 </details>
 
-Then **load the extension** if you have not already: `chrome://extensions` →
-Developer mode → Load unpacked → select the `extension/` folder. Start the
-server from the dashboard power button, or `python server.py`.
+Then **load the extension**: `chrome://extensions` → Developer mode → Load
+unpacked → select the `extension/` folder. Start the server from the dashboard
+power button, or `python server.py`.
 
-> **Why the extension id matters.** Chrome derives it from the folder it loaded
-> the extension from, so yours will differ from mine and the server has no way
-> to guess it. The server trusts whichever id is in the native-host manifest
-> that `register_host.py` writes, so registering is also what tells the server
-> to accept requests from your copy of the extension. If you skip it, set
-> `KAM_EXTENSION_ID` instead, or requests will be refused by CORS.
+> **About the extension id.** Chrome normally derives it by hashing the folder
+> it loaded the extension from, which would give every user a different id and
+> mean the server could not know in advance whose requests to trust. So
+> `manifest.json` pins a public key and Chrome derives the id from that instead:
+> everyone gets `mdhbimlofbadmgombcdmnmnebgglalob`, and CORS works with no
+> setup. If you fork this and replace the key, either run
+> `python register_host.py <YOUR_ID>` or set `KAM_EXTENSION_ID`, or the server
+> will refuse your build.
 
 ---
 
@@ -275,10 +272,11 @@ and baselines never bleed between voices. Only word pronunciations are shared.
 - The local API token is **generated per install** on first server run and stored
   in `server/kam_token.txt` (gitignored). The extension fetches it from the
   server's `/token` endpoint — no shared secret ships in source.
-- Chrome gives an unpacked extension a **different ID on every machine**, so the
-  server reads yours from the native-host manifest that `register_host.py`
-  writes. Running that one setup step is what tells both the power button and
-  the server which extension to trust.
+- The extension ID is **pinned by a public key** in `manifest.json`, so it is the
+  same on every machine and the server knows which origin to trust without any
+  setup. Only the public half is in the repo, which is how every Chrome Web
+  Store extension works; the private key signs `.crx` builds and is not needed
+  to run KAM.
 - The server binds to `127.0.0.1` only; CORS restricts callers to the extension
   origin.
 - Override with the `KAM_TOKEN` or `KAM_EXTENSION_ID` environment variables for
@@ -296,7 +294,7 @@ All optional — KAM works with none of them set.
 | `KAM_CPU_THREADS` | Override the CPU thread cap used for inference. |
 | `KAM_NO_BENCHMARK` | Set to `1` to skip the first-boot speed measurement. |
 | `KAM_TOKEN` | Use a fixed API token instead of the per-install generated one. |
-| `KAM_EXTENSION_ID` | Override which extension origin is allowed through CORS. Accepts several IDs separated by commas. Not normally needed, since the server reads the ID from the native-host manifest that `register_host.py` writes. |
+| `KAM_EXTENSION_ID` | Override which extension origin is allowed through CORS. Accepts several IDs separated by commas. Only needed if you replaced the pinned key in `manifest.json` with your own. |
 | `KAM_PYTHON` | Python interpreter the native host launches the server with. |
 | `KAM_SERVER_PY` | Path to `server.py` if it isn't next to `kam_host.py`. |
 | `KAM_FRESH_LATENTS` | Set to `1` to recompute voice latents instead of using the cache. |
@@ -305,12 +303,12 @@ All optional — KAM works with none of them set.
 
 ## Troubleshooting
 
-**The dashboard opens but nothing loads, or every request fails.** That is
-almost always the extension ID. Chrome gives an unpacked extension a different
-ID on each machine, and the server only accepts requests from the one it knows
-about. Find yours at `chrome://extensions` with Developer mode on, then run
-`python register_host.py <YOUR_EXTENSION_ID>` and restart the server. It prints
-which origin it trusts on every boot, so check the first few console lines.
+**The dashboard opens but nothing loads, or every request fails.** That is the
+extension ID not matching. It should not happen, since the ID is pinned by the
+key in `manifest.json`, but it will if you edited or removed that key. The
+server prints which origin it trusts on every boot, so compare the first few
+console lines against the ID at `chrome://extensions`. If they differ, run
+`python register_host.py <YOUR_EXTENSION_ID>` and restart the server.
 
 **It says "No GPU in use" but I have one.** The console prints which backends it
 found and why one was rejected. Usually it's a PyTorch build that doesn't match

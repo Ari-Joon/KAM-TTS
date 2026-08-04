@@ -3,6 +3,7 @@
   "name": "KAM TTS",
   "version": "1.0.0",
   "author": "Arian Kamali",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAv4gDOd5eDGBl1PYBQS8HHFSwmD0tMx/18bbzaARDgMa+j38YLq99bKStX37yn8g+ri1tM9vBmOBqfls1Xao94AEQ8QuLvAUfIbwxXaC9y45K+55OjlzLeybXRqnwoIrsq2flyB3Wva4UVPpBn0jndb2I6OtLi1V636Uu/hZ1gqfH/0hkEXEdMO8KVll2SGM7nVvR8HerGlUzNqEMY5IeMzCLFoBIC0BS6V8aNOO1vpCq5Lq/vxoe/HQZEgknOVOcIrmO0ggSai15w7fMuMHU1X/OMF/i5cmhiOuQigwSKnteK5g3iOKgl0paxuUmCgs8IX722dEqjibvBCMjC7Ll3QIDAQAB",
   "description": "Text to speech using a cloned voice, running locally.",
   "permissions": [
     "activeTab",

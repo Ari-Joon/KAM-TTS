@@ -14,6 +14,15 @@ kam_host.bat
 # Measured per machine by hardware_profile.py, or auto-detected on first boot.
 hardware_profile.json
 
+# The private half of the extension signing key. Only the public half belongs in
+# the repo, and it already sits in manifest.json as the "key" field, which is
+# what pins the extension id. The private key signs .crx builds and is kept
+# outside the repo entirely, so these patterns are a backstop against it ever
+# being copied in here by mistake.
+*.pem
+*.key
+kam_extension_key*
+
 # --- Runtime state and learned data ---
 tts_quality.db
 tts_quality.db-*

@@ -12,14 +12,20 @@ Run this ONCE so Chrome trusts the KAM host. It:
        • macOS/Linux: drops the manifest into Chrome's NativeMessagingHosts dir.
 
 Usage:
+    python register_host.py
+
+manifest.json pins a public key, so Chrome gives the extension the same id on
+every machine and there is nothing to look up. Only pass an id if you replaced
+that key with your own:
+
     python register_host.py <EXTENSION_ID>
 
 Find <EXTENSION_ID> at chrome://extensions (toggle Developer mode) — it's the
-long id under "KAM TTS", e.g. meikdhhiiofnpfidepkcgghjpafoegcj. It is also the
-host segment of the dashboard URL: chrome-extension://<EXTENSION_ID>/player.html
+long id under "KAM TTS". It is also the host segment of the dashboard URL:
+chrome-extension://<EXTENSION_ID>/player.html
 
-To unregister, pass --remove:
-    python register_host.py <EXTENSION_ID> --remove
+To unregister:
+    python register_host.py --remove
 """
 import sys
 import os
@@ -38,11 +44,16 @@ except Exception:
 
 HOST_NAME = "com.kam.tts"
 
-# Chrome derives the id from the extension folder, and it is always 32 letters
-# in a-p. Worth checking, since a typo here registers a host that nothing can
-# talk to and the failure only shows up much later as the power button doing
-# nothing.
+# Extension ids are always 32 letters in a-p. Worth checking, since a typo here
+# registers a host that nothing can talk to, and the failure only shows up much
+# later as the power button doing nothing.
 _EXT_ID_RE = re.compile(r"^[a-p]{32}$")
+
+# manifest.json pins a public key, so Chrome derives the id from that rather
+# than from the folder it was loaded from. That makes the id the same on every
+# machine, which is why this can be a default instead of something everyone has
+# to look up. Only differs if you replaced the key with your own.
+PINNED_EXTENSION_ID = "mdhbimlofbadmgombcdmnmnebgglalob"
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST_SCRIPT = os.path.join(HERE, "kam_host.py")
 MANIFEST_PATH = os.path.join(HERE, f"{HOST_NAME}.json")
@@ -163,16 +174,29 @@ def main():
     if args and args[0] in ("-h", "--help"):
         print(__doc__)
         return 0
-    if not args:
-        print(__doc__)
-        print("ERROR: no extension id given, so nothing was registered.")
-        return 2
-    ext_id = _parse_ext_id(args[0])
-    if not ext_id:
-        print(f"ERROR: '{args[0]}' is not a Chrome extension id.")
-        print("Expected 32 letters in the range a-p, which you can copy from")
-        print("chrome://extensions with Developer mode turned on.")
-        return 2
+    # --python takes a value, so skip that value rather than mistaking a path
+    # for the extension id.
+    positional, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a == "--python":
+            skip = True
+        elif not a.startswith("-"):
+            positional.append(a)
+    if not positional:
+        # The id is pinned by the key in manifest.json, so no argument is the
+        # normal case now. Passing one is only for a build with its own key.
+        ext_id = PINNED_EXTENSION_ID
+        print(f"Using the pinned extension id: {ext_id}")
+    else:
+        ext_id = _parse_ext_id(positional[0])
+        if not ext_id:
+            print(f"ERROR: '{positional[0]}' is not a Chrome extension id.")
+            print("Expected 32 letters in the range a-p, which you can copy")
+            print("from chrome://extensions with Developer mode turned on.")
+            return 2
     if "--remove" in args:
         remove(ext_id)
         return 0

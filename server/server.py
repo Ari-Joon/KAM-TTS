@@ -331,27 +331,29 @@ app = Flask(__name__)
 # that to the extension origin, so a page can fire requests at localhost but
 # can't read the token back.
 # Overrides: KAM_TOKEN env var (custom setups), KAM_EXTENSION_ID env var.
-_FALLBACK_EXTENSION_ID = "meikdhhiiofnpfidepkcgghjpafoegcj"
+_FALLBACK_EXTENSION_ID = "mdhbimlofbadmgombcdmnmnebgglalob"
 
 
 def _extension_origins():
     """Which chrome-extension origins may call this API.
 
-    Chrome gives an unpacked extension a different ID on every machine, so a
-    single hardcoded ID only ever worked for the install it was written on.
-    Anyone else cloning this got a server that started fine, a power button that
-    worked, and then every request blocked by CORS with nothing obvious to point
-    at. That was the worst kind of first-run failure: silent and in the wrong
-    place.
+    Chrome normally gives an unpacked extension a different ID on every machine,
+    since it hashes the folder it was loaded from. That meant a hardcoded ID
+    only worked on the install it was written on, and anyone else cloning this
+    got a server that started fine, a power button that worked, and then every
+    request blocked by CORS with nothing obvious to point at. The worst kind of
+    first-run failure: silent, and in the wrong place.
 
-    register_host.py already asks for the extension ID and writes it into the
-    native-messaging manifest next to this file, so that manifest is the natural
-    source of truth and reading it means one setup step covers both.
+    So manifest.json now pins a public key, which makes Chrome derive the ID
+    from that instead of the path. Everyone gets the same ID, and the fallback
+    below is correct for every install rather than just mine. The other two
+    routes stay because they cost nothing and cover the cases the key does not:
+    someone who edits the key out, or runs several builds side by side.
 
     Order of preference:
       1. KAM_EXTENSION_ID, which may list several IDs separated by commas.
       2. Whatever register_host.py wrote into the native-host manifest.
-      3. The original ID, so the install this was developed on keeps working.
+      3. The pinned ID, which is what almost everyone will actually be on.
 
     Note this is defence in depth rather than the lock itself. Every request
     also has to carry the per-install token, so a wrong origin here costs a
@@ -375,14 +377,13 @@ def _extension_origins():
                   f"{', '.join(origins)}")
             return origins
     except FileNotFoundError:
-        print("[BOOT] No native-host manifest yet — run register_host.py "
-              "<EXTENSION_ID> so the server knows which extension to trust.")
+        pass          # normal before register_host.py has been run
     except Exception as e:
         print(f"[BOOT] Could not read the native-host manifest ({e})")
 
-    print(f"[BOOT] Falling back to the built-in extension ID. If the dashboard "
-          f"loads but every request fails, run: python register_host.py "
-          f"<YOUR_EXTENSION_ID>")
+    print(f"[BOOT] Extension origin: the pinned ID "
+          f"{_FALLBACK_EXTENSION_ID}. If you changed the key in manifest.json, "
+          f"set KAM_EXTENSION_ID to your own ID.")
     return [f"chrome-extension://{_FALLBACK_EXTENSION_ID}"]
 
 
