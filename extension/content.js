@@ -323,6 +323,16 @@ let _hlEnabled = true;
 let _overlayEnabled = true;        // header bar shown during playback?
 let _overlayCreating = false;      // sync guard against duplicate header creation
 let _lastOverlay = null;           // {text,current,total} of latest chunk, for re-show
+
+// True only in the page's top frame. This script runs in every frame so the
+// highlighting can reach text inside iframes, but anything that draws chrome on
+// the page has to be top-frame only or you get one copy per frame. Accessing
+// window.top across origins can throw, and a throw means we are definitely in a
+// cross-origin sub-frame, so that case answers false.
+function _isTopFrame() {
+  try { return window.self === window.top; }
+  catch (_) { return false; }
+}
 try {
   chrome.storage.local.get({ highlightEnabled: true, overlayEnabled: true }, c => {
     _hlEnabled = c.highlightEnabled !== false;
@@ -506,6 +516,16 @@ function showOverlay(text, current, total) {
   // Remember the latest chunk so the bar can be re-shown if the user toggles
   // it back on mid-playback.
   _lastOverlay = { text, current, total };
+
+  // Only the top frame gets a header bar.
+  //
+  // The manifest runs this script with all_frames:true, which it has to,
+  // because plenty of sites keep the real article text inside an iframe and the
+  // highlighting needs to reach it. But every frame was then building its own
+  // bar, so an embedded video or widget got a second control bar floating
+  // inside it, overlapping the content. Highlighting still runs in sub-frames
+  // and is unaffected, since it's decoupled from the bar.
+  if (!_isTopFrame()) return;
 
   // The header bar is disabled so I don't create or update it, though the
   // highlighting still runs.

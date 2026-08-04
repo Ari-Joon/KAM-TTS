@@ -217,9 +217,18 @@ function addLog(raw) {
       div.innerHTML = `<span class="log-time">${now}</span><span class="log-msg">${esc(raw)}</span>`;
     }
   }
+  // Stick to the bottom only if that is where the reader already was.
+  //
+  // This used to set scrollTop unconditionally on every single line, so the
+  // moment you scrolled up to read something the next log line yanked you back
+  // down. Checking first means scrolling up is enough to hold your place, and
+  // scrolling back to the bottom resumes the follow. The 40px tolerance covers
+  // sub-pixel heights and a fractional scrollTop, which otherwise leave you a
+  // pixel short of the bottom and stop the follow for no visible reason.
+  const wasAtBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 40;
   el.appendChild(div); _logLines.push(div);
   if (_logLines.length > 500) _logLines.shift().remove();
-  el.scrollTop = el.scrollHeight;
+  if (wasAtBottom) el.scrollTop = el.scrollHeight;
 }
 function clearConsole() {
   const el = document.getElementById('console-log'); if(el) el.innerHTML=''; _logLines=[];
@@ -342,64 +351,87 @@ function _chunkCardHTML(row, q) {
     +(row.whisper_accuracy!=null?`<div class="chunk-quality">Whisper ${(row.whisper_accuracy*100).toFixed(0)}% · Pitch σ${row.pitch_variance!=null?row.pitch_variance:'—'}</div>`:'');
 }
 
+// Mark a card as rated, so the whole row shows its verdict rather than just the
+// small button. Applied optimistically on click and rolled back if the request
+// fails, so the click always feels immediate but never lies about what stuck.
+// state is 'up', 'down', or null to clear.
+function _setCardRated(card, state) {
+  if (!card) return;
+  card.classList.remove('rated-up', 'rated-down', 'just-rated');
+  if (!state) return;
+  card.classList.add(state === 'up' ? 'rated-up' : 'rated-down');
+  // Restart the flash animation. Removing the class and reading offsetWidth
+  // forces a reflow, without which re-adding it in the same frame is a no-op
+  // and a second rating on the same card would not flash.
+  void card.offsetWidth;
+  card.classList.add('just-rated');
+}
+
 const _FEED_CAP = 40;   // cards kept in the DOM
+
+// Feed pause. While paused the poll still runs and the data is still kept
+// current, but nothing is rendered, so cards stay exactly where they are while
+// you read and rate them.
+//
+// Before this the only way to hold the feed still was to scroll away from the
+// top, which is fragile: it is easy to drift back to the top by accident, and
+// the reconcile re-appends every card each poll, so even scrolled away the
+// viewport shifts under you.
+let _feedPaused = false;
+let _feedPendingRows = null;   // newest data received while paused
+
+function _setFeedPaused(paused) {
+  _feedPaused = paused;
+  const btn   = document.getElementById('feed-pause');
+  const badge = document.getElementById('feed-paused-badge');
+  if (btn) {
+    btn.textContent = paused ? '▶' : '⏸';
+    btn.style.color       = paused ? '#000' : 'var(--subtext)';
+    btn.style.background  = paused ? 'var(--accent, #f5c518)' : 'transparent';
+    btn.style.borderColor = paused ? 'var(--accent, #f5c518)' : 'var(--border)';
+    btn.title = paused
+      ? 'Resume the live feed'
+      : 'Freeze the feed so you can read and rate without cards moving. New chunks keep arriving and appear when you resume.';
+  }
+  if (badge) badge.style.display = paused ? '' : 'none';
+
+  // On resume, draw whatever arrived while we were frozen and return to the
+  // newest chunk, which is at the top.
+  if (!paused) {
+    const pending = _feedPendingRows;
+    _feedPendingRows = null;
+    if (pending) _renderChunkFeed(pending);
+    const body = document.getElementById('chunks-body');
+    if (body) body.scrollTop = 0;
+  }
+}
+
+function _updatePausedBadge(n) {
+  const badge = document.getElementById('feed-paused-badge');
+  if (badge) badge.textContent = n > 0 ? `PAUSED · ${n} NEW` : 'PAUSED';
+}
 
 function pollChunks() {
   api('/report/history?limit=' + _FEED_CAP)
     .then(rows => {
       if (!rows || !rows.length) return;
+      const prevTop = _allChunks && _allChunks.length ? _allChunks[0].chunk_id : null;
       _allChunks = rows;
-      const body = document.getElementById('chunks-body');
-      if (!body) return;
-      // Never fight the user mid-interaction: skip reconciling while chunks are
-      // selected for mass-rating, or the cards would be rebuilt under them.
-      if (_feedSelectMode && body.querySelector('.chunk-card.feed-selected')) return;
 
-      // Server order is newest-first; render oldest-first so the newest ends on
-      // top after we append in order.
-      const ordered = rows.filter(r => r.chunk_id)
-        .slice()
-        .sort((a,b) => ((a.ts||0)-(b.ts||0)) || ((a.seq||0)-(b.seq||0)));
-
-      const existing = new Map();
-      body.querySelectorAll('.chunk-card').forEach(c => existing.set(c.dataset.id, c));
-
-      const desiredTopDown = [];   // newest → oldest, i.e. final DOM order
-      for (let i = ordered.length - 1; i >= 0; i--) desiredTopDown.push(ordered[i]);
-
-      desiredTopDown.forEach(row => {
-        const q = row.quality_score;
-        const cls = q==null ? '' : q>=0.75 ? 'quality-high' : q>=0.5 ? 'quality-mid' : 'quality-low';
-        let card = existing.get(row.chunk_id);
-        if (!card) {
-          card = document.createElement('div');
-          card.dataset.id = row.chunk_id || '';
-          card.title = 'Click chunk text to report. Thumbs-up confirms good quality.';
-          card.dataset.sig = '';
-        }
-        // Rebuild the inner markup only when something actually changed, so we
-        // never clobber hover/selection state on every 3s poll.
-        const sig = [row.ts, q, row.quality_flags, row.user_feedback,
-                     row.whisper_accuracy, row.seq, row.total].join('|');
-        if (card.dataset.sig !== sig) {
-          card.innerHTML = _chunkCardHTML(row, q);
-          card.dataset.sig = sig;
-        }
-        card.dataset.text = row.chunk_text || '';
-        // Preserve the pinned marker; refresh only the quality classes.
-        const pinned = card.classList.contains('pinned');
-        card.className = 'chunk-card ' + cls + (pinned ? ' pinned' : '');
-        body.appendChild(card);          // appending in top-down order sorts them
-        existing.delete(row.chunk_id);
-      });
-
-      // Anything the server no longer returns has aged out of the window.
-      existing.forEach(c => c.remove());
-
-      _chunkCount = rows.length ? (rows[0].total || rows.length) : 0;
-      const ctr = document.getElementById('chunk-counter');
-      if (ctr) ctr.textContent = _chunkCount + ' chunks';
-      while (body.children.length > _FEED_CAP) body.lastChild.remove();
+      // Paused: keep the data fresh and count what is waiting, but do not touch
+      // the DOM. The count is how many chunks are newer than the one currently
+      // at the top of the frozen view.
+      if (_feedPaused) {
+        _feedPendingRows = rows;
+        let n = 0;
+        const body = document.getElementById('chunks-body');
+        const topCard = body && body.querySelector('.chunk-card');
+        const frozenTop = topCard ? topCard.dataset.id : prevTop;
+        for (const r of rows) { if (r.chunk_id === frozenTop) break; n++; }
+        _updatePausedBadge(n);
+        return;
+      }
+      _renderChunkFeed(rows);
     }).catch(err => {
       // Never swallow silently: a render error here empties the feed and looks
       // exactly like "the server sent nothing", which is what hid a scope bug
@@ -408,6 +440,78 @@ function pollChunks() {
       const ctr = document.getElementById('chunk-counter');
       if (ctr) ctr.textContent = 'feed error — see console';
     });
+}
+
+function _renderChunkFeed(rows) {
+  const body = document.getElementById('chunks-body');
+  if (!body) return;
+  // Never fight the user mid-interaction: skip reconciling while chunks are
+  // selected for mass-rating, or the cards would be rebuilt under them.
+  if (_feedSelectMode && body.querySelector('.chunk-card.feed-selected')) return;
+
+  // Reconciling re-appends every card, which moves them in the DOM and can
+  // shift what you are looking at. Remember where the reader was and put
+  // them back afterwards, unless they were at the very top, where following
+  // the newest chunk is the point.
+  const prevScroll = body.scrollTop;
+
+  // Server order is newest-first; render oldest-first so the newest ends on
+  // top after we append in order.
+  const ordered = rows.filter(r => r.chunk_id)
+    .slice()
+    .sort((a,b) => ((a.ts||0)-(b.ts||0)) || ((a.seq||0)-(b.seq||0)));
+
+  const existing = new Map();
+  body.querySelectorAll('.chunk-card').forEach(c => existing.set(c.dataset.id, c));
+
+  const desiredTopDown = [];   // newest → oldest, i.e. final DOM order
+  for (let i = ordered.length - 1; i >= 0; i--) desiredTopDown.push(ordered[i]);
+
+  desiredTopDown.forEach(row => {
+    const q = row.quality_score;
+    const cls = q==null ? '' : q>=0.75 ? 'quality-high' : q>=0.5 ? 'quality-mid' : 'quality-low';
+    let card = existing.get(row.chunk_id);
+    if (!card) {
+      card = document.createElement('div');
+      card.dataset.id = row.chunk_id || '';
+      card.title = 'Click chunk text to report. Thumbs-up confirms good quality.';
+      card.dataset.sig = '';
+    }
+    // Rebuild the inner markup only when something actually changed, so we
+    // never clobber hover/selection state on every 3s poll.
+    const sig = [row.ts, q, row.quality_flags, row.user_feedback,
+                 row.whisper_accuracy, row.seq, row.total].join('|');
+    if (card.dataset.sig !== sig) {
+      card.innerHTML = _chunkCardHTML(row, q);
+      card.dataset.sig = sig;
+    }
+    card.dataset.text = row.chunk_text || '';
+    // Preserve the pinned marker; refresh only the quality classes.
+    // The rated marker comes from the server's stored verdict, so a rating
+    // survives a refresh, a restart and the 3s reconcile. Only an explicit
+    // thumbs counts here: 'solid' means the chunk was auto-digested as
+    // heard-and-fine, which is not the same as the user having judged it.
+    const pinned = card.classList.contains('pinned');
+    const rated = row.user_feedback === 'positive' ? ' rated-up'
+                : row.user_feedback === 'negative' ? ' rated-down' : '';
+    card.className = 'chunk-card ' + cls + (pinned ? ' pinned' : '') + rated;
+    body.appendChild(card);          // appending in top-down order sorts them
+    existing.delete(row.chunk_id);
+  });
+
+  // Anything the server no longer returns has aged out of the window.
+  existing.forEach(c => c.remove());
+
+  _chunkCount = rows.length ? (rows[0].total || rows.length) : 0;
+  const ctr = document.getElementById('chunk-counter');
+  if (ctr) ctr.textContent = _chunkCount + ' chunks';
+  while (body.children.length > _FEED_CAP) body.lastChild.remove();
+
+  // Put the reader back where they were. At the very top we leave it there
+  // so the newest chunk stays in view, which is the whole point of a live
+  // feed; anywhere else, restoring the offset stops the list sliding around
+  // while they read.
+  if (prevScroll > 4) body.scrollTop = prevScroll;
 }
 
 // A plain-English explanation of why a chunk was flagged and what KAM does about
@@ -2356,18 +2460,22 @@ document.addEventListener('DOMContentLoaded',()=>{
         // Toggle: clicking an already-confirmed thumb reverts it.
         if (thumb.classList.contains('confirmed')) {
           thumb.classList.remove('confirmed');
+          _setCardRated(card, null);
           api('/chunk/verdict','POST',{ chunk_id: chunkId, verdict: 'revert',
                 chunk_text: (card && card.dataset.text) || '' })
             .then(r=>{ showToast('↩ ' + (r && r.applied_text || 'Reverted')); refreshStats(); })
-            .catch(()=>{ thumb.classList.add('confirmed'); showToast('Revert failed — try again'); });
+            .catch(()=>{ thumb.classList.add('confirmed'); _setCardRated(card, 'up');
+                         showToast('Revert failed — try again'); });
           return;
         }
         thumb.classList.add('confirmed');
         if (card) { const dn = card.querySelector('.chunk-thumb-down'); if (dn) dn.classList.remove('rejected'); }
+        _setCardRated(card, 'up');
         api('/chunk/verdict','POST',{ chunk_id: chunkId, verdict: 'sounded_perfect',
               chunk_text: (card && card.dataset.text) || '' })
           .then(r=>{ showToast('✓ ' + (r && r.applied_text || 'Reinforced — KAM trusts similar chunks more')); refreshStats(); })
-          .catch(()=>{ thumb.classList.remove('confirmed'); showToast('Feedback failed — try again'); });
+          .catch(()=>{ thumb.classList.remove('confirmed'); _setCardRated(card, null);
+                       showToast('Feedback failed — try again'); });
         return;
       }
 
@@ -2375,20 +2483,24 @@ document.addEventListener('DOMContentLoaded',()=>{
         // Toggle: clicking an already-rejected thumb reverts it.
         if (thumb.classList.contains('rejected')) {
           thumb.classList.remove('rejected');
+          _setCardRated(card, null);
           api('/chunk/verdict','POST',{ chunk_id: chunkId, verdict: 'revert',
                 chunk_text: (card && card.dataset.text) || '' })
             .then(r=>{ showToast('↩ ' + (r && r.applied_text || 'Reverted')); refreshStats(); })
-            .catch(()=>{ thumb.classList.add('rejected'); showToast('Revert failed — try again'); });
+            .catch(()=>{ thumb.classList.add('rejected'); _setCardRated(card, 'down');
+                         showToast('Revert failed — try again'); });
           return;
         }
         // A one-click hallucination report, logged directly with no round trip
         // through the Report tab.
         thumb.classList.add('rejected');
         if (card) { const up = card.querySelector('.chunk-thumb:not(.chunk-thumb-down)'); if (up) up.classList.remove('confirmed'); }
+        _setCardRated(card, 'down');
         api('/chunk/verdict','POST',{ chunk_id: chunkId, verdict: 'sounded_wrong',
               chunk_text: (card && card.dataset.text) || '' })
           .then(r=>{ showToast('👎 ' + (r && r.applied_text || 'Hallucination logged — voice steadied for similar chunks')); refreshStats(); })
-          .catch(()=>{ thumb.classList.remove('rejected'); showToast('Feedback failed — try again'); });
+          .catch(()=>{ thumb.classList.remove('rejected'); _setCardRated(card, null);
+                       showToast('Feedback failed — try again'); });
         return;
       }
       return;
@@ -2404,6 +2516,27 @@ document.addEventListener('DOMContentLoaded',()=>{
   });
 
   // --- Live-feed mass-select: rate many chunks at once (click or click-drag) ---
+  // Pause / resume the live feed.
+  const _feedPauseBtn = document.getElementById('feed-pause');
+  if (_feedPauseBtn) {
+    _feedPauseBtn.addEventListener('click', () => _setFeedPaused(!_feedPaused));
+  }
+  // Scrolling the feed away from the top is a strong hint that you are reading
+  // rather than watching, so pause automatically. Returning to the top resumes.
+  // The explicit button still wins: it holds the pause even at the top, which
+  // is what you want while rating the newest chunk.
+  const _feedBody = document.getElementById('chunks-body');
+  if (_feedBody) {
+    let _autoPaused = false;
+    _feedBody.addEventListener('scroll', () => {
+      if (_feedBody.scrollTop > 24 && !_feedPaused) {
+        _autoPaused = true; _setFeedPaused(true);
+      } else if (_feedBody.scrollTop <= 4 && _feedPaused && _autoPaused) {
+        _autoPaused = false; _setFeedPaused(false);
+      }
+    }, { passive: true });
+  }
+
   const _feedSelToggle = document.getElementById('feed-select-toggle');
   const _feedMassBar   = document.getElementById('feed-mass-bar');
   function _selectedCards() {
