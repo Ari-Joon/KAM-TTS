@@ -258,6 +258,10 @@ and baselines never bleed between voices. Only word pronunciations are shared.
 - The local API token is **generated per install** on first server run and stored
   in `server/kam_token.txt` (gitignored). The extension fetches it from the
   server's `/token` endpoint — no shared secret ships in source.
+- Chrome gives an unpacked extension a **different ID on every machine**, so the
+  server reads yours from the native-host manifest that `register_host.py`
+  writes. Running that one setup step is what tells both the power button and
+  the server which extension to trust.
 - The server binds to `127.0.0.1` only; CORS restricts callers to the extension
   origin.
 - Override with the `KAM_TOKEN` or `KAM_EXTENSION_ID` environment variables for
@@ -275,7 +279,7 @@ All optional — KAM works with none of them set.
 | `KAM_CPU_THREADS` | Override the CPU thread cap used for inference. |
 | `KAM_NO_BENCHMARK` | Set to `1` to skip the first-boot speed measurement. |
 | `KAM_TOKEN` | Use a fixed API token instead of the per-install generated one. |
-| `KAM_EXTENSION_ID` | Allow a different extension origin through CORS (unpacked extensions get a different ID per machine). |
+| `KAM_EXTENSION_ID` | Override which extension origin is allowed through CORS. Accepts several IDs separated by commas. Not normally needed, since the server reads the ID from the native-host manifest that `register_host.py` writes. |
 | `KAM_PYTHON` | Python interpreter the native host launches the server with. |
 | `KAM_SERVER_PY` | Path to `server.py` if it isn't next to `kam_host.py`. |
 | `KAM_FRESH_LATENTS` | Set to `1` to recompute voice latents instead of using the cache. |
@@ -283,6 +287,13 @@ All optional — KAM works with none of them set.
 ---
 
 ## Troubleshooting
+
+**The dashboard opens but nothing loads, or every request fails.** That is
+almost always the extension ID. Chrome gives an unpacked extension a different
+ID on each machine, and the server only accepts requests from the one it knows
+about. Find yours at `chrome://extensions` with Developer mode on, then run
+`python register_host.py <YOUR_EXTENSION_ID>` and restart the server. It prints
+which origin it trusts on every boot, so check the first few console lines.
 
 **It says "No GPU in use" but I have one.** The console prints which backends it
 found and why one was rejected. Usually it's a PyTorch build that doesn't match

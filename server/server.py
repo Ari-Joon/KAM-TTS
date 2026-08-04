@@ -330,11 +330,63 @@ app = Flask(__name__)
 # secret ships in the source. Clients fetch it from /token, and CORS restricts
 # that to the extension origin, so a page can fire requests at localhost but
 # can't read the token back.
-# Overrides: KAM_TOKEN env var (custom setups), KAM_EXTENSION_ID env var
-# (unpacked extensions get a different ID per machine).
-_EXTENSION_ORIGIN = ("chrome-extension://"
-                     + os.environ.get("KAM_EXTENSION_ID",
-                                      "meikdhhiiofnpfidepkcgghjpafoegcj"))
+# Overrides: KAM_TOKEN env var (custom setups), KAM_EXTENSION_ID env var.
+_FALLBACK_EXTENSION_ID = "meikdhhiiofnpfidepkcgghjpafoegcj"
+
+
+def _extension_origins():
+    """Which chrome-extension origins may call this API.
+
+    Chrome gives an unpacked extension a different ID on every machine, so a
+    single hardcoded ID only ever worked for the install it was written on.
+    Anyone else cloning this got a server that started fine, a power button that
+    worked, and then every request blocked by CORS with nothing obvious to point
+    at. That was the worst kind of first-run failure: silent and in the wrong
+    place.
+
+    register_host.py already asks for the extension ID and writes it into the
+    native-messaging manifest next to this file, so that manifest is the natural
+    source of truth and reading it means one setup step covers both.
+
+    Order of preference:
+      1. KAM_EXTENSION_ID, which may list several IDs separated by commas.
+      2. Whatever register_host.py wrote into the native-host manifest.
+      3. The original ID, so the install this was developed on keeps working.
+
+    Note this is defence in depth rather than the lock itself. Every request
+    also has to carry the per-install token, so a wrong origin here costs a
+    confusing failure, not a security hole.
+    """
+    env = (os.environ.get("KAM_EXTENSION_ID") or "").strip()
+    if env:
+        ids = [e.strip() for e in env.split(",") if e.strip()]
+        print(f"[BOOT] Extension origin(s) from KAM_EXTENSION_ID: {', '.join(ids)}")
+        return [f"chrome-extension://{i}" for i in ids]
+
+    manifest = os.path.join(_SERVER_DIR0, "com.kam.tts.json")
+    try:
+        with open(manifest) as f:
+            allowed = json.load(f).get("allowed_origins") or []
+        # Chrome writes these with a trailing slash; CORS wants them without.
+        origins = [o.rstrip("/") for o in allowed
+                   if isinstance(o, str) and o.startswith("chrome-extension://")]
+        if origins:
+            print(f"[BOOT] Extension origin(s) from the native-host manifest: "
+                  f"{', '.join(origins)}")
+            return origins
+    except FileNotFoundError:
+        print("[BOOT] No native-host manifest yet — run register_host.py "
+              "<EXTENSION_ID> so the server knows which extension to trust.")
+    except Exception as e:
+        print(f"[BOOT] Could not read the native-host manifest ({e})")
+
+    print(f"[BOOT] Falling back to the built-in extension ID. If the dashboard "
+          f"loads but every request fails, run: python register_host.py "
+          f"<YOUR_EXTENSION_ID>")
+    return [f"chrome-extension://{_FALLBACK_EXTENSION_ID}"]
+
+
+_EXTENSION_ORIGINS = _extension_origins()
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024   # 1MB request cap
 
 def _load_or_create_token():
@@ -361,7 +413,7 @@ def _load_or_create_token():
     return tok
 
 KAM_TOKEN = _load_or_create_token()
-CORS(app, resources={r"/*": {"origins": _EXTENSION_ORIGIN}}, supports_credentials=False)
+CORS(app, resources={r"/*": {"origins": _EXTENSION_ORIGINS}}, supports_credentials=False)
 
 @app.route("/token", methods=["GET"])
 def get_token():
