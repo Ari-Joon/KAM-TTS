@@ -35,7 +35,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _run(args, desc):
+    # Flush before handing the console to a child. Our own output is block
+    # buffered when this is piped to a file, while the child writes straight
+    # through, so without this a saved setup log has every heading collected at
+    # the end and the steps in the wrong order.
     print(f"\n=== {desc} ===")
+    sys.stdout.flush()
     r = subprocess.run(args, cwd=HERE)
     if r.returncode != 0:
         print(f"FAILED: {desc} (exit {r.returncode})")
@@ -156,6 +161,7 @@ def _register_host():
     Not fatal if it fails. Registering only affects the power button, and the
     server still runs with `python server.py`."""
     print("\n=== Registering Chrome native-messaging host ===")
+    sys.stdout.flush()
     r = subprocess.run([sys.executable, "register_host.py"], cwd=HERE)
     if r.returncode != 0:
         print("Could not register the native-messaging host.")

@@ -486,6 +486,15 @@ VOICE_SAMPLE      = os.path.join(_SERVER_DIR, "my_voice.wav")  # legacy single-f
 VOICES_DIR = os.path.join(_SERVER_DIR, "voices")
 _ACTIVE_VOICE = "default"   # loaded from settings at startup
 
+
+class NoVoiceClipsError(FileNotFoundError):
+    """Raised at startup when there is no reference audio to clone from.
+
+    Its own class because this is the one failure every new install hits, and it
+    is not a bug: reference clips are personal, so they are gitignored and can
+    never ship. Distinguishing it lets __main__ print instructions rather than a
+    traceback, while a genuine missing-file bug still gets one."""
+
 def _voice_dir(voice_id):
     return VOICE_SAMPLES_DIR if voice_id == "default" else os.path.join(VOICES_DIR, voice_id)
 
@@ -756,7 +765,7 @@ def load_model():
         t1 = _time.time()
         _clips = _discover_voice_samples()
         if not _clips:
-            raise FileNotFoundError(
+            raise NoVoiceClipsError(
                 "No voice reference clips found. Add .wav files to "
                 f"{VOICE_SAMPLES_DIR}/ or place a my_voice.wav next to the server.")
         _clips = _screen_voice_clips(_clips, _ACTIVE_VOICE)
@@ -4694,7 +4703,37 @@ if __name__ == "__main__":
 
     # Load the model and warm up, only here in __main__. A re-import under the
     # name "server" never reaches this, so startup can't run twice.
-    _run_startup()
+    #
+    # Missing reference clips is the one failure every fresh install hits, since
+    # voice audio is personal and cannot ship with the code. Letting it surface
+    # as a traceback made a normal setup step look like a crash, so it gets
+    # instructions instead. Anything else still raises properly, because a
+    # traceback is the right answer for an actual bug.
+    try:
+        _run_startup()
+    except NoVoiceClipsError:
+        BAR = "=" * 62
+        print(f"\n{C.WARN}{C.BOLD}{BAR}{C.RESET}")
+        print(f"  {C.WARN}{C.BOLD}No voice to clone yet{C.RESET}")
+        print(f"{C.WARN}{C.BOLD}{BAR}{C.RESET}")
+        print("  KAM speaks in a cloned voice, so it needs reference audio")
+        print("  before it can start. Nothing is broken, this is the one setup")
+        print("  step that cannot ship with the code.")
+        print()
+        print(f"  Put 6-10 WAV clips, 8-15 seconds each, in:")
+        print(f"    {C.BOLD}{VOICE_SAMPLES_DIR}{C.RESET}")
+        print()
+        print("  Clean speech, no music or processing. Separate clips clone")
+        print("  better than one long file, since XTTS averages across them.")
+        print("  The dashboard lists 16 passages to read under the microphone")
+        print("  tab, and they work well because they cover a good range.")
+        print()
+        print(f"  Then check them with:  {C.BOLD}python check_voice_clips.py{C.RESET}")
+        print(f"  and start the server again.")
+        print(f"{C.WARN}{C.BOLD}{BAR}{C.RESET}\n")
+        _stage("no-voice-clips")
+        import sys as _sx
+        _sx.exit(1)
 
     BAR = "=" * 50
     print(f"\n{C.OK}{C.BOLD}{BAR}{C.RESET}")
