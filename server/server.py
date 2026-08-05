@@ -648,7 +648,7 @@ def switch_voice(voice_id):
     clips = _discover_voice_samples(voice_id)
     if not clips:
         return {"ok": False, "error": f"No .wav clips found for voice '{voice_id}'. "
-                                      f"Record the 12 passages into its folder first."}
+                                      f"Record some passages for it in the dashboard first."}
     _ACTIVE_VOICE = voice_id
     _learner.set_setting("active_voice", voice_id)
     _learner.set_active_voice(voice_id)   # isolate all learning to this voice
@@ -4198,6 +4198,194 @@ def check_voice_route():
     })
 
 
+# --- Recording clips from the dashboard ---
+# The clips have to come from somewhere, and asking people to find recording
+# software, pick mono, pick a sample rate and save into the right folder was the
+# one step that assumed real comfort with computers. The dashboard records them
+# now, so these three routes are what it needs: save a take, list what has been
+# recorded, and delete a bad one. Playback reuses /voices/clip below.
+#
+# The browser sends a finished 24 kHz mono WAV, so there is no decoding here on
+# purpose. Keeping audio formats out of the server means no ffmpeg dependency
+# and one less thing to go wrong on someone else's machine.
+
+_MAX_CLIP_BYTES = 12 * 1024 * 1024      # about 4 minutes at 24 kHz mono 16-bit
+
+
+def _clip_path(vid, slot):
+    """Where a passage's take lives. Numbering by slot means re-recording
+    overwrites the previous attempt instead of piling up near-duplicates, which
+    would quietly skew the averaged speaker embedding."""
+    return os.path.join(_voice_dir(vid), f"passage_{int(slot):02d}.wav")
+
+
+def _transcript_path(wav_path):
+    """A clip's text lives beside it as a plain .txt with the same stem.
+
+    Keeping what was actually said is worth more than it looks. A reference clip
+    with known text can be checked against a transcription to catch a misread or
+    a stumble, and the punctuation says where the speaker paused, which is real
+    prosody evidence rather than something inferred from the audio alone. A
+    sidecar rather than a manifest because clip discovery globs *.wav, so a .txt
+    cannot be mistaken for audio, and deleting a clip by hand does not leave an
+    index pointing at a file that has gone."""
+    return os.path.splitext(wav_path)[0] + ".txt"
+
+
+def _read_transcript(wav_path):
+    try:
+        with open(_transcript_path(wav_path), encoding="utf-8") as f:
+            return f.read().strip()
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return ""
+
+
+@app.route("/voices/record", methods=["POST"])
+def record_clip():
+    """Save one recorded passage and say straight away whether it is usable.
+
+    The verdict matters more than the saving. Clipping, room noise, dead air and
+    clips that are too short are exactly what ruins a clone, and none of them are
+    obvious by ear, so finding out now beats finding out after sixteen takes.
+
+    Multipart rather than a raw body, since the take arrives with the text that
+    was read and I want both written together or not at all."""
+    vid  = (request.form.get("voice") or _ACTIVE_VOICE).strip()
+    text = (request.form.get("text") or "").strip()
+    try:
+        slot = int(request.form.get("slot") or 0)
+    except ValueError:
+        return jsonify({"ok": False, "error": "slot must be a number"}), 400
+
+    fs = request.files.get("audio")
+    if fs is None:
+        return jsonify({"ok": False, "error": "no audio received"}), 400
+    data = fs.read() or b""
+    if not data:
+        return jsonify({"ok": False, "error": "no audio received"}), 400
+    if len(data) > _MAX_CLIP_BYTES:
+        return jsonify({"ok": False, "error": "that recording is too long"}), 413
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return jsonify({"ok": False, "error": "that is not a WAV file"}), 400
+
+    os.makedirs(_voice_dir(vid), exist_ok=True)
+    # Slot 0 means a passage of the user's own, which has no fixed numbering, so
+    # it takes the next free slot above the standard ones.
+    if slot <= 0:
+        slot = _next_free_slot(vid)
+    elif slot > _MAX_SLOTS:
+        return jsonify({"ok": False, "error": f"slot must be 1-{_MAX_SLOTS}"}), 400
+
+    path = _clip_path(vid, slot)
+    # Write beside the target and rename, so a failed write can never leave a
+    # half-written clip that later reads as a corrupt reference.
+    tmp = path + ".part"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        if text:
+            with open(_transcript_path(path), "w", encoding="utf-8") as f:
+                f.write(text)
+    except Exception as e:
+        try: os.remove(tmp)
+        except OSError: pass
+        return jsonify({"ok": False, "error": f"could not save: {e}"}), 500
+
+    rep = _aq.analyse_clip(path)
+    print(f"[VOICE] Recorded passage {slot} for '{vid}': {rep.verdict}")
+    return jsonify({"ok": True, "voice_id": vid, "slot": slot,
+                    "clip": _clip_json(rep),
+                    "n_clips": len(_discover_voice_samples(vid))})
+
+
+# Room for the standard passages plus a good number of the user's own.
+_MAX_SLOTS = 99
+
+
+def _next_free_slot(vid):
+    """Lowest unused slot above the standard passages, so a custom recording
+    never lands on top of one of the numbered ones."""
+    used = set()
+    for p in _discover_voice_samples(vid):
+        m = re.match(r"passage_(\d+)\.wav$", os.path.basename(p), re.I)
+        if m:
+            used.add(int(m.group(1)))
+    n = len(VOICE_PASSAGES) + 1
+    while n in used and n < _MAX_SLOTS:
+        n += 1
+    return n
+
+
+def _clip_json(rep, path=None):
+    """One clip's measurements, shaped the same wherever they are returned."""
+    return {
+        "name": rep.name, "verdict": rep.verdict, "usable": rep.ok,
+        "duration": round(rep.duration, 1), "sample_rate": rep.sample_rate,
+        "peak": round(rep.peak, 3), "silence_frac": round(rep.silence_frac, 3),
+        "clip_frac": round(rep.clip_frac, 5),
+        "snr_db": (round(rep.snr_db, 1) if rep.snr_db is not None else None),
+        "reasons": rep.reasons,
+        "text": _read_transcript(path or rep.path),
+    }
+
+
+@app.route("/voices/clips", methods=["GET"])
+def list_clips():
+    """Every clip in a profile with its measurements, so the dashboard can show
+    what has been recorded without anyone opening a file manager."""
+    vid   = (request.args.get("voice") or _ACTIVE_VOICE).strip()
+    clips = _discover_voice_samples(vid)
+    out   = []
+    for p in clips:
+        rep  = _aq.analyse_clip(p)
+        info = _clip_json(rep)
+        m = re.match(r"passage_(\d+)\.wav$", os.path.basename(p), re.I)
+        info["slot"] = int(m.group(1)) if m else None
+        out.append(info)
+    out.sort(key=lambda c: (c["slot"] is None, c["slot"] or 0, c["name"]))
+    return jsonify({"ok": True, "voice_id": vid, "clips": out,
+                    "n_usable": sum(1 for c in out if c["usable"])})
+
+
+@app.route("/voices/clip", methods=["GET"])
+def get_clip():
+    """Serve one clip back so a take can be played in the dashboard.
+
+    The name is matched against the clips actually discovered rather than joined
+    onto the folder, since anything built from a query parameter is a path
+    traversal waiting to happen."""
+    vid  = (request.args.get("voice") or _ACTIVE_VOICE).strip()
+    name = (request.args.get("name") or "").strip()
+    for p in _discover_voice_samples(vid):
+        if os.path.basename(p) == name:
+            return send_file(p, mimetype="audio/wav")
+    return jsonify({"ok": False, "error": "no such clip"}), 404
+
+
+@app.route("/voices/clip/delete", methods=["POST"])
+def delete_clip():
+    """Throw away a take. Same name matching as playback, for the same reason."""
+    d    = request.get_json(silent=True) or {}
+    vid  = (d.get("voice_id") or _ACTIVE_VOICE).strip()
+    name = (d.get("name") or "").strip()
+    for p in _discover_voice_samples(vid):
+        if os.path.basename(p) == name:
+            try:
+                os.remove(p)
+            except OSError as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            # The transcript is only meaningful next to its audio, so it goes
+            # too rather than being left behind to confuse a later listing.
+            try:
+                os.remove(_transcript_path(p))
+            except OSError:
+                pass
+            print(f"[VOICE] Deleted {name} from '{vid}'")
+            return jsonify({"ok": True, "n_clips": len(_discover_voice_samples(vid))})
+    return jsonify({"ok": False, "error": "no such clip"}), 404
+
+
 @app.route("/voices/select", methods=["POST"])
 def select_voice():
     d = request.get_json(force=True) or {}
@@ -4210,8 +4398,8 @@ def select_voice():
 
 @app.route("/voices/create", methods=["POST"])
 def create_voice():
-    """Create an empty voice-profile folder. The user records the 12 passages
-    into it (or drops in cleaned clips), then selects it."""
+    """Create an empty voice-profile folder. The user records passages into it
+    from the dashboard (or drops in cleaned clips), then selects it."""
     d = request.get_json(force=True) or {}
     raw = (d.get("name") or "").strip()
     vid = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_").lower()

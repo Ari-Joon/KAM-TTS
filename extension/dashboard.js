@@ -247,8 +247,6 @@ function clearConsole() {
 function pollConsole() {
   api(`/console?since=${_logSince}`)
     .then(d => {
-      const dot = document.getElementById('refresh-dot');
-      if (dot) { dot.classList.add('active'); setTimeout(()=>dot.classList.remove('active'),200); }
       if (d.lines && d.lines.length) {
         // On the first successful poll the server returns its whole backlog, but
         // the power-button host has already streamed those startup lines to the

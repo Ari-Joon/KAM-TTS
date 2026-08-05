@@ -38,6 +38,8 @@ SUITES = [
     ("facets",        "test_facets.py",       "content-facet labelling accuracy"),
     ("audio",         "test_audio.py",        "gain staging and clipping"),
     ("feed",          "test_feed.mjs",        "dashboard live-feed pause"),
+    ("recorder",      "test_recorder.mjs",    "WAV encoding and take trimming"),
+    ("voiceclips",    "test_voiceclips.py",   "recording, transcripts, clip slots"),
 ]
 
 

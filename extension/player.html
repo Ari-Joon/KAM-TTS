@@ -802,12 +802,128 @@
     * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 
     /* --- Refresh indicator --- */
-    #refresh-dot {
-      width: 6px; height: 6px; border-radius: 50%;
-      background: var(--dim); display: inline-block; margin-left: 6px;
-      transition: background 0.2s;
+    /* --- Voice recorder --- */
+    /* Recording used to mean leaving the dashboard for other software, so this
+       is deliberately a full overlay: it is its own task and wants the room. */
+    #rec-overlay {
+      display: none; position: fixed; inset: 0; z-index: 200;
+      background: rgba(0,0,0,0.72); backdrop-filter: blur(2px);
+      align-items: center; justify-content: center;
     }
-    #refresh-dot.active { background: var(--green); }
+    #rec-overlay.open { display: flex; }
+    #rec-modal {
+      width: min(1000px, 94vw); height: min(680px, 92vh);
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    #rec-head {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 14px; border-bottom: 1px solid var(--border); flex: 0 0 auto;
+    }
+    #rec-head h2 { font-size: 13px; margin: 0; color: var(--text); font-weight: 600; }
+    #rec-body { display: flex; flex: 1 1 auto; min-height: 0; }
+    #rec-list {
+      width: 246px; flex: 0 0 auto; overflow-y: auto;
+      border-right: 1px solid var(--border); padding: 6px;
+    }
+    .rec-item {
+      display: flex; align-items: center; gap: 7px; width: 100%;
+      background: transparent; border: 1px solid transparent; border-radius: 5px;
+      color: var(--subtext); cursor: pointer; font-family: var(--font);
+      font-size: 10px; padding: 6px 7px; text-align: left;
+    }
+    .rec-item:hover  { background: var(--bg3); }
+    .rec-item.active { background: var(--bg3); border-color: var(--indigo); color: var(--text); }
+    .rec-dot {
+      width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+      background: var(--dim); border: 1px solid var(--border);
+    }
+    .rec-dot.good { background: var(--green); border-color: var(--green); }
+    .rec-dot.warn { background: var(--amber); border-color: var(--amber); }
+    .rec-dot.bad  { background: var(--red);   border-color: var(--red); }
+    #rec-main { flex: 1 1 auto; display: flex; flex-direction: column; padding: 14px; min-width: 0; }
+    #rec-passage-title { font-size: 11px; color: var(--indigo); margin-bottom: 8px; }
+    /* The passage is what they are reading aloud, so it gets to be comfortably
+       large. Everything else on this screen is secondary to it. */
+    #rec-passage-text {
+      flex: 1 1 auto; overflow-y: auto; font-size: 17px; line-height: 1.65;
+      color: var(--text); background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px; margin-bottom: 12px;
+    }
+    /* --- Trimmer --- */
+    #rec-trim {
+      position: relative; height: 76px; flex: 0 0 auto; margin-bottom: 6px;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+      overflow: hidden;
+    }
+    #rec-wave { display: block; width: 100%; height: 76px; }
+    .rec-handle {
+      position: absolute; top: 0; bottom: 0; width: 11px; margin-left: -5px;
+      cursor: ew-resize; display: none; z-index: 2;
+    }
+    .rec-handle::before {
+      content: ""; position: absolute; top: 0; bottom: 0; left: 4px;
+      width: 3px; background: var(--indigo); border-radius: 2px;
+    }
+    .rec-handle::after {
+      content: ""; position: absolute; top: 50%; left: 0; width: 11px; height: 18px;
+      margin-top: -9px; background: var(--indigo); border-radius: 3px;
+    }
+    #rec-trim.ready .rec-handle { display: block; }
+    #rec-playhead {
+      position: absolute; top: 0; bottom: 0; width: 1px; background: var(--green);
+      display: none; z-index: 3; pointer-events: none;
+    }
+    #rec-trim-bar {
+      display: flex; align-items: center; gap: 7px; flex: 0 0 auto; margin-bottom: 10px;
+    }
+    #rec-trim-info { font-size: 10px; color: var(--dim); }
+    #rec-controls { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
+    #rec-btn {
+      width: 62px; height: 62px; border-radius: 50%; flex: 0 0 auto;
+      background: var(--red); border: none; color: #fff; cursor: pointer;
+      font-size: 22px; display: flex; align-items: center; justify-content: center;
+      transition: transform 0.12s, box-shadow 0.12s;
+    }
+    #rec-btn:hover:not(:disabled) { transform: scale(1.06); }
+    #rec-btn:disabled { opacity: 0.4; cursor: default; }
+    #rec-btn.recording {
+      background: var(--bg3); border: 2px solid var(--red);
+      box-shadow: 0 0 0 6px rgba(255,90,90,0.15);
+      animation: rec-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes rec-pulse {
+      0%,100% { box-shadow: 0 0 0 5px  rgba(255,90,90,0.10); }
+      50%     { box-shadow: 0 0 0 11px rgba(255,90,90,0.22); }
+    }
+    #rec-meter-wrap { flex: 1 1 auto; min-width: 0; }
+    #rec-meter {
+      height: 9px; border-radius: 5px; background: var(--bg3);
+      overflow: hidden; border: 1px solid var(--border);
+    }
+    /* Green for a healthy level, amber approaching the ceiling, red when it is
+       actually clipping, since "too loud" is the failure people cannot hear. */
+    #rec-meter-fill { height: 100%; width: 0%; background: var(--green); transition: width 0.06s linear; }
+    #rec-meter-fill.hot  { background: var(--amber); }
+    #rec-meter-fill.over { background: var(--red); }
+    #rec-timer { font-size: 11px; color: var(--subtext); margin-top: 5px; }
+    #rec-verdict { font-size: 11px; margin-top: 5px; min-height: 15px; }
+    #rec-foot {
+      display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+      padding: 10px 14px; border-top: 1px solid var(--border); background: var(--bg);
+    }
+    #rec-progress { flex: 1 1 auto; font-size: 11px; color: var(--subtext); }
+    .rec-action {
+      background: var(--bg3); border: 1px solid var(--border); border-radius: 5px;
+      color: var(--subtext); cursor: pointer; font-family: var(--font);
+      font-size: 10px; padding: 6px 11px;
+    }
+    .rec-action:hover:not(:disabled) { color: var(--text); border-color: var(--indigo); }
+    .rec-action:disabled { opacity: 0.4; cursor: default; }
+    .rec-action.primary {
+      background: var(--green); border-color: var(--green); color: #000; font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -844,7 +960,8 @@
       <div id="voice-status" style="font-size:9px;color:var(--dim);margin-top:6px"></div>
     </div>
   </div>
-  <span id="refresh-dot"></span>
+  <button id="rec-open" type="button" title="Record voice clips"
+    style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;color:var(--subtext);cursor:pointer;font-family:var(--font);font-size:10px;margin-left:6px;padding:3px 10px">● Record</button>
   <div id="topbar-right">
     <button id="ui-font-cog" class="tab-btn" type="button" data-menu="uifont">Fonts</button>
     <button id="tts-tune-cog" class="tab-btn" type="button" data-menu="tune">Speech Tuning</button>
@@ -1656,8 +1773,65 @@
   </div>
 </div>
 
+<!-- Voice recorder. Everything needed to build a voice lives in here, so nobody
+     has to find recording software or a file manager to get started. -->
+<div id="rec-overlay">
+  <div id="rec-modal">
+    <div id="rec-head">
+      <h2>● Record voice clips</h2>
+      <select id="rec-voice" class="rec-action" title="Which voice profile these clips belong to"></select>
+      <button id="rec-newvoice" class="rec-action" type="button">＋ New voice</button>
+      <span style="flex:1"></span>
+      <button id="rec-close" class="rec-action" type="button">Close</button>
+    </div>
+    <div id="rec-body">
+      <div id="rec-list"></div>
+      <div id="rec-main">
+        <div id="rec-passage-title">Passage</div>
+        <!-- Editable on purpose. Reading something familiar beats reading a
+             stock paragraph, and whatever is here gets saved with the audio so
+             the clip has a known transcript. -->
+        <div id="rec-passage-text" contenteditable="true" spellcheck="false"></div>
+        <!-- Trimmer. Takes nearly always open with a breath and close with the
+             click of the mouse coming back to stop, and both end up in the clip
+             that gets cloned, so the take is reviewed before it is saved. -->
+        <div id="rec-trim">
+          <canvas id="rec-wave" height="76"></canvas>
+          <div id="rec-handle-a" class="rec-handle"></div>
+          <div id="rec-handle-b" class="rec-handle"></div>
+          <div id="rec-playhead"></div>
+        </div>
+        <div id="rec-trim-bar">
+          <span id="rec-trim-info">Record a take and you can trim it here before saving.</span>
+          <span style="flex:1"></span>
+          <button id="rec-auto"  class="rec-action" type="button" disabled>Auto-trim</button>
+          <button id="rec-reset" class="rec-action" type="button" disabled>Whole take</button>
+          <button id="rec-save"  class="rec-action primary" type="button" disabled>Save clip</button>
+        </div>
+        <div id="rec-controls">
+          <button id="rec-btn" type="button" title="Start recording">●</button>
+          <div id="rec-meter-wrap">
+            <div id="rec-meter"><div id="rec-meter-fill"></div></div>
+            <div id="rec-timer">Ready when you are.</div>
+            <div id="rec-verdict"></div>
+          </div>
+          <button id="rec-play"   class="rec-action" type="button" disabled>▶ Play</button>
+          <button id="rec-dl"     class="rec-action" type="button" disabled title="Save this clip as a .wav on your computer">↓ WAV</button>
+          <button id="rec-delete" class="rec-action" type="button" disabled>Delete</button>
+        </div>
+      </div>
+    </div>
+    <div id="rec-foot">
+      <span id="rec-progress">No clips yet.</span>
+      <button id="rec-use" class="rec-action primary" type="button" disabled>Use this voice</button>
+    </div>
+  </div>
+</div>
+
 <script src="player.js"></script>
 
+<script src="recorder.js"></script>
+<script src="recorder-ui.js"></script>
 <script src="dashboard.js"></script>
 
 </body>

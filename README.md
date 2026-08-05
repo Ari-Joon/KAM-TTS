@@ -135,16 +135,16 @@ leaves torch unpinned for this reason. KAM adapts to whichever you installed.
    pip install -r requirements.txt
    python -m spacy download en_core_web_sm
    ```
-3. **Add voice reference clips.** Record the **16 standard passages** (shown in
-   the dashboard under 🎤 → *Recording passages*) as separate WAV files, 8–15
-   seconds each, clean speech, no processing, into `server/voice_samples/`.
+3. **Add voice reference clips.** Easiest from the dashboard: click **● Record**
+   in the top bar and read the passages aloud. It records, trims, checks and
+   saves each clip for you, so there is nothing to install and no files to move.
+   See [Recording a voice](#recording-a-voice) below.
+
+   If you would rather do it yourself, drop WAV files of 8–15 seconds each into
+   `server/voice_samples/` and check them with `python check_voice_clips.py`.
    XTTS averages them into a single speaker embedding — separate clips clone
    better than one long file. A single `server/my_voice.wav` also works.
-4. **Check the clips**:
-   ```
-   python check_voice_clips.py
-   ```
-5. **Register the native-messaging host** (no arguments needed):
+4. **Register the native-messaging host** (no arguments needed):
    ```
    python register_host.py
    ```
@@ -172,7 +172,7 @@ power button, or `python server.py`.
 Clone quality is set almost entirely by the reference audio, so this matters
 more than any parameter:
 
-- **The 16 standard passages** (12–20 clips is the sweet spot) (dashboard → 🎤 → *Recording passages*) cover
+- **The 16 standard passages** (12–20 clips is the sweet spot, dashboard → **● Record**) cover
   declaratives, questions, numbers, long clauses, lists, warmth, explanation,
   closings, exclamations, quoted speech, asides and fragments — the full
   prosodic range KAM reads daily.
@@ -256,14 +256,43 @@ own defaults.
 
 ---
 
+## Recording a voice
+
+Click **● Record** in the dashboard top bar. Everything happens in that one
+screen, so no separate recording software and no moving files around.
+
+- **Pick the profile** you are recording into, or make a new one, from the
+  dropdown at the top.
+- **Pick a passage** from the list on the left, or choose *Write my own passage*
+  and type anything you like. The text is editable either way, and whatever is
+  on screen is saved next to the clip as a `.txt`, so every recording has a
+  known transcript. That is worth having: the punctuation says where you paused,
+  and a clip with known text can be checked against what was actually said.
+- **Record**, watching the level meter. Green is healthy, amber is close to the
+  ceiling, red is clipping, which is the one fault you cannot hear yourself.
+- **Trim the take.** Almost every recording opens with a breath and ends with
+  the click of the mouse going back to the stop button, and both otherwise end
+  up in the clip that gets cloned. Drag the handles, or press **Auto-trim**,
+  which looks for where the level stays up rather than where it is merely loud,
+  so a short click at the end is not mistaken for speech. **▶ Play** previews
+  exactly what will be saved.
+- **Save**, and the server measures the clip and says straight away whether it
+  is usable, naming the problem if not. A dot next to each passage tracks what
+  is done.
+- **↓ WAV** downloads any clip, since the files are still the real artefact and
+  you should never be locked out of them.
+
+Six good clips make a solid voice, and 12 to 20 is the sweet spot. Press
+**Use this voice** when you are done, which rebuilds the speaker embedding
+without restarting the server.
+
 ## Voice profiles
 
-Create additional voices from the dashboard: **🎤 → ＋ New voice** creates a
-folder under `server/voices/<name>/`, opens it, and shows the 16 recording
-passages. Record them, clean them (`python clean_voice_clips.py --in <raw>
---out <folder>`), press **Use**. Switching is instant once a voice's latents
-are cached, and **each voice learns independently** — tuning, quality history
-and baselines never bleed between voices. Only word pronunciations are shared.
+Switching is instant once a voice's latents are cached, and **each voice learns
+independently** — tuning, quality history and baselines never bleed between
+voices. Only word pronunciations are shared. Clips recorded outside the
+dashboard can be cleaned with `python clean_voice_clips.py --in <raw> --out
+<folder>`.
 
 ---
 
