@@ -121,14 +121,18 @@ says("plus-minus",       "±0.5",   "plus or minus")
 says("times glyph",      "3 × 4",  "times")
 says("equals is spoken", "x² = 5", "equals")
 
-print("\n=== list markers are still stripped at the head of a line ===")
-exact("lettered marker", "a) first item",   "first item")
-exact("capital marker",  "B) second item",  "second item")
-exact("numbered marker", "1. numbered item", "numbered item")
-exact("paren number",    "3) another",      "another")
-exact("bullet glyph",    "• bullet item", "bullet item")
-exact("dash bullet",     "- dash item",     "dash item")
-exact("star bullet",     "* star item",     "star item")
+print("\n=== list markers are stripped, and the item gets an ending ===")
+# The full stop is deliberate. The boundary between items collapses to a space
+# further down the pipeline, so without it the items run together into one long
+# sentence and the pause between separate thoughts disappears.
+exact("lettered marker", "a) first item",    "first item.")
+exact("capital marker",  "B) second item",   "second item.")
+exact("numbered marker", "1. numbered item", "numbered item.")
+exact("paren number",    "3) another",       "another.")
+exact("bullet glyph",    "• bullet item",  "bullet item.")
+exact("dash bullet",     "- dash item",      "dash item.")
+exact("star bullet",     "* star item",      "star item.")
+exact("existing punctuation is not doubled", "- already done.", "already done.")
 
 print("\n=== every marker in a multi-line list, not just the first ===")
 says("all three numbers go", "Steps:\n1. Boil water\n2. Add tea\n3. Wait",
@@ -136,6 +140,22 @@ says("all three numbers go", "Steps:\n1. Boil water\n2. Add tea\n3. Wait",
 never("no numbers left over", "Steps:\n1. Boil water\n2. Add tea\n3. Wait",
       "1.", "2.", "3.")
 never("no letters left over", "Options:\na) keep it\nb) drop it", "a)", "b)")
+
+print("\n=== the shape a page actually sends, which is |BREAK| not newlines ===")
+# popup.js has li in its block tags, so items arrive separated by |BREAK|.
+# Splitting on newlines alone missed every one of them, and a numbered list came
+# through with its numbers intact and then read them out loud.
+never("numbered markers go",
+      "Steps:|BREAK|1. Boil water|BREAK|2. Add tea|BREAK|3. Wait", "1.", "2.", "3.")
+says("and the items survive",
+     "Steps:|BREAK|1. Boil water|BREAK|2. Add tea|BREAK|3. Wait",
+     "Boil water", "Add tea", "Wait")
+never("dash markers go", "|BREAK|- keep it|BREAK|- drop it", " - ")
+exact("bullets become separate thoughts",
+      "|BREAK|• one|BREAK|• two|BREAK|• three", "one. two. three.")
+exact("dashes too", "|BREAK|- keep it|BREAK|- drop it", "keep it. drop it.")
+says("items do not run together",
+     "Steps:|BREAK|1. Boil water|BREAK|2. Add tea", "water. Add")
 
 print("\n=== prose that only looks like a marker is left alone ===")
 # The rule used to fire on anything after a space, so ordinary sentences lost

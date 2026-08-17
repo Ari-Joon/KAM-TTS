@@ -2612,24 +2612,44 @@ def _strip_list_markers(text):
     characters, and a rule loose enough to catch the first silently eats the
     second along with its bracket.
 
-    Bullet glyphs are also matched mid-line, since nothing else uses them, but a
-    letter or digit marker has to be at a line start to count."""
-    out = []
-    for line in text.split("\n"):
-        stripped = line.lstrip()
-        pad = line[:len(line) - len(stripped)]
+    A newline is not the only boundary. popup.js has li in its block tags, so
+    what actually arrives from a page is items separated by |BREAK| markers, and
+    splitting on newlines alone missed every one of them: a numbered list came
+    through with "1." and "2." still in it, which then got read out as numbers.
+    |BREAK| means a block boundary, so it counts as the head of a line here.
+
+    Each item also gets a full stop if it has no terminal punctuation of its own.
+    Otherwise the markers go, |BREAK| collapses to a space, and the items run
+    together into one long sentence with no pause between them, which is both
+    hard to follow and wrong: bullet items are separate thoughts."""
+    parts = re.split(r'(\|BREAK\||\n)', text)
+    at_boundary = True
+    for k, part in enumerate(parts):
+        if part == "\n" or part == "|BREAK|":
+            at_boundary = True
+            continue
+        if not at_boundary:
+            continue
+        at_boundary = False
+        stripped = part.lstrip()
+        pad = part[:len(part) - len(stripped)]
         # A digit or letter marker, so "1." / "2)" / "a)" / "B."
         m = re.match(r'(?:\d{1,3}|[a-zA-Z])[.)]\s+(?=\S)', stripped)
-        if m:
-            stripped = stripped[m.end():]
-        else:
+        if not m:
             # Bullet glyphs, including a hyphen or asterisk used as one. A dash
             # needs the trailing space, so a negative number is left alone.
             m = re.match(r'[•‣⁃▪▫◦∙·]\s*(?=\S)|[–—\-\*]\s+(?=\S)', stripped)
-            if m:
-                stripped = stripped[m.end():]
-        out.append(pad + stripped)
-    return "\n".join(out)
+        if not m:
+            continue
+        stripped = stripped[m.end():]
+        # Give the item an ending so it stays a separate thought once the
+        # boundary marker itself collapses to whitespace.
+        body = stripped.rstrip()
+        if body and body[-1] not in '.!?;:,':
+            trail = stripped[len(body):]
+            stripped = body + '.' + trail
+        parts[k] = pad + stripped
+    return "".join(parts)
 
 
 def clean_text(text):
