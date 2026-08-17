@@ -36,6 +36,7 @@ SUITES = [
     ("reinforcement", "test_reinforcement.py","what the learning loop reinforces"),
     ("extension_id",  "test_extension_id.py", "which extension origin the server trusts"),
     ("facets",        "test_facets.py",       "content-facet labelling accuracy"),
+    ("maths",         "test_maths.py",        "LaTeX, unicode maths, list markers"),
     ("audio",         "test_audio.py",        "gain staging and clipping"),
     ("feed",          "test_feed.mjs",        "dashboard live-feed pause"),
     ("recorder",      "test_recorder.mjs",    "WAV encoding and take trimming"),

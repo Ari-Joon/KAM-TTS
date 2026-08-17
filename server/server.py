@@ -1894,6 +1894,25 @@ def expand_math_symbols(text):
     DIGIT_WORD = {'0':'zero','1':'one','2':'two','3':'three','4':'four',
                   '5':'five','6':'six','7':'seven','8':'eight','9':'nine'}
 
+    # Whether this is maths at all, decided from the text as it arrived rather
+    # than after substitutions have muddied it. The plain operators at the end of
+    # this function are only safe to read in that context: "=" wants to be
+    # "equals" in an equation but "is set to" in an assignment, and "+" has to
+    # survive long enough for the code pass to notice "++".
+    #
+    # It used to work by accident. Equations carried underscores from subscripts,
+    # which tripped the code-symbol heuristic, so operators got read by the code
+    # path. Once subscripts were spoken properly the underscores went and the
+    # operators fell silent, which is a bad thing to depend on either way.
+    _MATHS_MARK = ('≠≤≥≈≡⊆⊇⊂⊃'
+                   '∩∪∈∉∀∃±×÷'
+                   '√∞∑∏∫∇∂→≤')
+    _is_maths = ('\\' in text or '_{' in text or '^{' in text
+                 or any(c in text for c in _MATHS_MARK)
+                 or any(c in text for c in SUB)
+                 or any(c in text for c in SUP)
+                 or any(c in text for c in GREEK))
+
     # Unicode subscripts: a base letter immediately followed by subscript chars.
     def _sub_repl(m):
         base = m.group(1)
@@ -1947,45 +1966,177 @@ def expand_math_symbols(text):
         text = text.replace(sym, word)
 
     # --- LaTeX equation source → spoken maths ---
-    # Selections now yield LaTeX for rendered equations (MathJax/KaTeX embed it),
-    # so I expand it into clear teacher-style speech before the simpler subscript
-    # rules below, which would otherwise mangle braced groups like X_{t+1}.
+    # Selections yield LaTeX for rendered equations, since MathJax and KaTeX both
+    # embed the source, so I expand it into clear teacher-style speech before the
+    # simpler subscript rules below, which would otherwise mangle braced groups
+    # like X_{t+1}.
+    #
+    # The rule that matters most is at the end: an unrecognised command is read
+    # rather than deleted. Deleting it used to turn "I don't support this" into
+    # "quietly wrong meaning", and that is much worse, because a reading you can
+    # hear is wrong is fixable while a silent one is not. P(A \cap B) became
+    # "P(A B)" and lost the intersection, and \frac{\partial L}{\partial w} became
+    # "L over w", which is no longer a derivative at all.
     if "\\" in text or "_{" in text or "^{" in text:
+        # Environments and layout commands carry nothing when spoken, so they go
+        # before anything tries to read them as words.
+        text = re.sub(r"\\(?:begin|end)\s*\{[^{}]*\}", " ", text)
+        text = re.sub(r"\\(?:left|right|middle|big{1,2}|Big{1,2}|quad|qquad|"
+                      r"displaystyle|textstyle|limits|nolimits)(?![A-Za-z])", " ", text)
+        text = re.sub(r"\\[,;:!> ]", " ", text)          # thin spaces and \!
+        # Escaped punctuation is literal, and has to survive the command sweep.
+        for esc, lit in ((r"\\%", "%"), (r"\\&", " and "), (r"\\\$", "$"),
+                         (r"\\#", "#"), (r"\\\{", "("), (r"\\\}", ")")):
+            text = re.sub(esc, lit, text)
+        # Wrappers exist to change the font, so the contents are what gets read.
+        for _ in range(3):
+            new = re.sub(r"\\(?:text|textrm|textbf|textit|textsf|texttt|mathrm|"
+                         r"mathbf|mathbb|mathcal|mathit|mathsf|boldsymbol|"
+                         r"operatorname)\s*\{([^{}]*)\}", r" \1 ", text)
+            if new == text:
+                break
+            text = new
+
         _GREEK = {
-            "alpha":"alpha","beta":"beta","gamma":"gamma","delta":"delta",
-            "epsilon":"epsilon","theta":"theta","lambda":"lambda","mu":"mu",
-            "pi":"pi","sigma":"sigma","phi":"phi","omega":"omega","tau":"tau",
+            "alpha": "alpha", "beta": "beta", "gamma": "gamma", "delta": "delta",
+            "epsilon": "epsilon", "varepsilon": "epsilon", "zeta": "zeta",
+            "eta": "eta", "theta": "theta", "vartheta": "theta", "iota": "iota",
+            "kappa": "kappa", "lambda": "lambda", "mu": "mu", "nu": "nu",
+            "xi": "xi", "omicron": "omicron", "pi": "pi", "varpi": "pi",
+            "rho": "rho", "varrho": "rho", "sigma": "sigma", "varsigma": "sigma",
+            "tau": "tau", "upsilon": "upsilon", "phi": "phi", "varphi": "phi",
+            "chi": "chi", "psi": "psi", "omega": "omega",
+            # Capitals read as "capital X", since Delta especially changes the
+            # meaning and "delta x" would hide that.
+            "Gamma": "capital gamma", "Delta": "delta", "Theta": "capital theta",
+            "Lambda": "capital lambda", "Xi": "capital xi", "Pi": "capital pi",
+            "Sigma": "capital sigma", "Upsilon": "capital upsilon",
+            "Phi": "capital phi", "Psi": "capital psi", "Omega": "capital omega",
         }
+        # Operators and relations. Every one of these used to fall through to the
+        # catch-all and disappear, which is how an intersection became a space.
         _CMD = {
-            r"\\times": " times ", r"\\div": " divided by ", r"\\cdot": " times ",
-            r"\\pm": " plus or minus ", r"\\leq": " is less than or equal to ",
-            r"\\geq": " is greater than or equal to ", r"\\neq": " is not equal to ",
-            r"\\approx": " is approximately ", r"\\to": " goes to ",
-            r"\\infty": " infinity ", r"\\sum": " the sum of ",
-            r"\\prod": " the product of ", r"\\int": " the integral of ",
-            r"\\sqrt": " the square root of ", r"\\log": " log ", r"\\ln": " natural log ",
-            r"\\hat": " hat ", r"\\bar": " bar ", r"\\left": " ", r"\\right": " ",
+            "times": " times ", "div": " divided by ", "cdot": " times ",
+            "ast": " times ", "star": " star ", "circ": " composed with ",
+            "pm": " plus or minus ", "mp": " minus or plus ",
+            "leq": " is less than or equal to ", "le": " is less than or equal to ",
+            "geq": " is greater than or equal to ", "ge": " is greater than or equal to ",
+            "neq": " is not equal to ", "ne": " is not equal to ",
+            "ll": " is much less than ", "gg": " is much greater than ",
+            "approx": " is approximately ", "simeq": " is approximately ",
+            "cong": " is congruent to ", "equiv": " is equivalent to ",
+            "sim": " is distributed as ", "propto": " is proportional to ",
+            "cap": " intersection ", "cup": " union ",
+            "bigcap": " the intersection of ", "bigcup": " the union of ",
+            "setminus": " without ", "emptyset": " the empty set ",
+            "varnothing": " the empty set ",
+            "in": " in ", "notin": " is not in ", "ni": " contains ",
+            "subset": " is a subset of ", "subseteq": " is a subset of or equal to ",
+            "supset": " is a superset of ", "supseteq": " is a superset of or equal to ",
+            "forall": " for all ", "exists": " there exists ",
+            "nexists": " there is no ", "neg": " not ", "lnot": " not ",
+            "land": " and ", "wedge": " and ", "lor": " or ", "vee": " or ",
+            "oplus": " exclusive or ", "otimes": " tensor ",
+            "to": " goes to ", "rightarrow": " goes to ", "leftarrow": " comes from ",
+            "mapsto": " maps to ", "implies": " implies ",
+            "Rightarrow": " implies ", "Leftarrow": " is implied by ",
+            "iff": " if and only if ", "Leftrightarrow": " if and only if ",
+            "leftrightarrow": " if and only if ",
+            "infty": " infinity ", "partial": " partial ", "nabla": " gradient ",
+            "sum": " the sum of ", "prod": " the product of ", "int": " the integral of ",
+            "oint": " the contour integral of ", "iint": " the double integral of ",
+            "lim": " the limit of ", "max": " max ", "min": " min ",
+            "sup": " the supremum of ", "inf": " the infimum of ",
+            "arg": " arg ", "argmax": " arg max ", "argmin": " arg min ",
+            "log": " log ", "ln": " natural log ", "exp": " e to the power of ",
+            "sin": " sine ", "cos": " cosine ", "tan": " tangent ",
+            "det": " the determinant of ", "dim": " the dimension of ",
+            "deg": " degree ", "gcd": " the greatest common divisor of ",
+            "bmod": " mod ", "mod": " mod ", "pmod": " mod ",
+            "perp": " is perpendicular to ", "parallel": " is parallel to ",
+            "angle": " angle ", "triangle": " triangle ",
+            "ldots": " and so on ", "cdots": " and so on ", "dots": " and so on ",
+            "vdots": " and so on ", "prime": " prime ",
+            "hat": " hat ", "bar": " bar ", "vec": " vector ", "tilde": " tilde ",
+            "dot": " dot ", "ddot": " double dot ", "overline": " bar ",
+            "underline": " underlined ", "binom": " choose ", "choose": " choose ",
+            "lfloor": " the floor of ", "rfloor": " ", "lceil": " the ceiling of ",
+            "rceil": " ", "vert": " ", "Vert": " the norm of ",
+            "mathhyphen": "-",
         }
-        # Fractions first (nested braces are rare in prose maths).
-        text = re.sub(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r" \1 over \2 ", text)
-        for pat, rep in _CMD.items():
-            text = re.sub(pat + r"(?![A-Za-z])", rep, text)
+
+        # Sums and integrals read far better with their limits spoken as limits
+        # rather than as a subscript, and this is the commonest shape on a maths
+        # or machine-learning page.
+        def _limits(m):
+            word = {"sum": "the sum", "prod": "the product",
+                    "int": "the integral", "lim": "the limit"}[m.group(1)]
+            lo, hi = m.group(2), m.group(3)
+            if m.group(1) == "lim":
+                return f" {word} as {_spoken_group(lo)} of "
+            return f" {word} from {_spoken_group(lo)} to {_spoken_group(hi)} of "
+
+        def _spoken_group(g):
+            """Read a sub/superscript group aloud, operators included.
+
+            A leading minus is the case that bit me: e^{-\\lambda t} left the sign
+            as a bare hyphen, which a later cleanup step removed, so the exponent
+            silently changed sign."""
+            g = g.strip()
+            g = re.sub(r"^[-\u2212]\s*", " minus ", g)
+            g = g.replace("+", " plus ").replace("\u2212", " minus ")
+            g = re.sub(r"(?<=[A-Za-z0-9\s])-(?=[A-Za-z0-9])", " minus ", g)
+            g = g.replace("=", " equals ")
+            return re.sub(r"\s{2,}", " ", g).strip()
+
+        # Fractions, innermost first. Iterating handles one or two levels of
+        # nesting, which is as deep as prose maths tends to go.
+        for _ in range(4):
+            new = re.sub(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}",
+                         lambda m: f" {_spoken_group(m.group(1))} over "
+                                   f"{_spoken_group(m.group(2))} ", text)
+            if new == text:
+                break
+            text = new
+        text = re.sub(r"\\sqrt\s*\[\s*([^\]]*)\s*\]\s*\{([^{}]*)\}",
+                      lambda m: f" the {_spoken_group(m.group(1))} root of "
+                                f"{_spoken_group(m.group(2))} ", text)
+        text = re.sub(r"\\sqrt\s*\{([^{}]*)\}",
+                      lambda m: f" the square root of {_spoken_group(m.group(1))} ", text)
+
+        # Limits before the generic sub/superscript rules, so the two parts are
+        # still adjacent and recognisable as a pair.
+        text = re.sub(r"\\(sum|prod|int|lim)\s*_\s*\{([^{}]*)\}\s*\^\s*\{([^{}]*)\}", _limits, text)
+        text = re.sub(r"\\(sum|prod|int|lim)\s*_\s*\{([^{}]*)\}\s*\^\s*(\\?[A-Za-z0-9]+)", _limits, text)
+        text = re.sub(r"\\(sum|prod|int)\s*_\s*([A-Za-z0-9])\s*\^\s*(\\?[A-Za-z0-9]+)", _limits, text)
+        text = re.sub(r"\\(lim)\s*_\s*\{([^{}]*)\}()", _limits, text)
+
+        for name, spoken in _CMD.items():
+            text = re.sub(r"\\" + name + r"(?![A-Za-z])", spoken, text)
         for name, spoken in _GREEK.items():
             text = re.sub(r"\\" + name + r"(?![A-Za-z])", " " + spoken + " ", text)
+
         # Braced sub/superscripts: X_{t+1} → "X sub t plus 1"; x^{2} → "x squared".
-        # Operators inside the group must be spoken, not silently dropped.
-        def _spoken_group(g):
-            g = g.replace("+", " plus ").replace("−", " minus ")
-            g = re.sub(r"(?<=[A-Za-z0-9])\s*-\s*(?=[A-Za-z0-9])", " minus ", g)
-            return re.sub(r"\s{2,}", " ", g).strip()
-        text = re.sub(r"\^\s*\{?\s*2\s*\}?(?![0-9])", " squared ", text)
-        text = re.sub(r"\^\s*\{?\s*3\s*\}?(?![0-9])", " cubed ", text)
+        text = re.sub(r"\^\s*\{\s*2\s*\}", " squared ", text)
+        text = re.sub(r"\^\s*\{\s*3\s*\}", " cubed ", text)
         text = re.sub(r"\^\s*\{([^{}]*)\}",
                       lambda m: f" to the power of {_spoken_group(m.group(1))} ", text)
         text = re.sub(r"_\s*\{([^{}]*)\}",
                       lambda m: f" sub {_spoken_group(m.group(1))} ", text)
-        # Strip any remaining LaTeX braces/commands so they're never spoken.
-        text = re.sub(r"\\[A-Za-z]+", " ", text)
+        # Unbraced ones, which are just as common and used to be spoken as the
+        # literal characters: \int_0^\infty read as "underscore zero caret".
+        text = re.sub(r"\^\s*2(?![0-9.])", " squared ", text)
+        text = re.sub(r"\^\s*3(?![0-9.])", " cubed ", text)
+        text = re.sub(r"\^\s*([-\u2212]?[A-Za-z0-9]+)",
+                      lambda m: f" to the power of {_spoken_group(m.group(1))} ", text)
+        text = re.sub(r"_\s*([A-Za-z0-9]+)",
+                      lambda m: f" sub {_spoken_group(m.group(1))} ", text)
+
+        # Anything still carrying a backslash is a command I have no reading for,
+        # so it is read as its own name. That keeps an unsupported command audible
+        # instead of letting it change the meaning on the way past.
+        text = re.sub(r"\\([A-Za-z]+)", r" \1 ", text)
+        text = re.sub(r"\\(.)", r" \1 ", text)          # stray escaped symbol
         text = text.replace("{", " ").replace("}", " ")
         text = re.sub(r"\s{2,}", " ", text).strip()
 
@@ -2005,6 +2156,16 @@ def expand_math_symbols(text):
         spoken = ' '.join(str(DIGIT_WORD.get(d, d)) for d in digits)
         return f'{letter} {spoken}'
     text = re.sub(r'(?<![A-Za-z0-9])([A-Za-z])([0-9]{1,2})(?![A-Za-z0-9])', _var_repl, text)
+
+    # Bare operators, in maths only. XTTS says nothing at all for a lone "=", so
+    # an equation without this loses the very thing that makes it an equation.
+    if _is_maths:
+        text = re.sub(r'(?<![=<>!+\-*/])=(?!=)', ' equals ', text)
+        text = re.sub(r'\+', ' plus ', text)
+        # A spaced hyphen between operands is a minus. Unspaced is left alone so
+        # "well-known" and "state-of-the-art" keep their hyphens.
+        text = re.sub(r'(?<=[A-Za-z0-9)])\s+-\s+(?=[A-Za-z0-9(])', ' minus ', text)
+        text = re.sub(r'\s{2,}', ' ', text)
 
     return text
 
@@ -2052,6 +2213,10 @@ def expand_symbols(text):
     text = text.replace('=>',  ' arrow ')
     text = text.replace('&&',  ' and ')
     text = text.replace('||',  ' or ')
+    # Language names before the operator, since C++ is not an increment and
+    # "C increment" is a genuinely confusing thing to hear in a sentence about
+    # programming languages.
+    text = re.sub(r'\b([Cc]|[Gg])\+\+', r'\1 plus plus', text)
     text = text.replace('++',  ' increment ')
     text = text.replace('--',  ' decrement ')
     text = re.sub(r'\$(\d[\d,\.]*)', lambda m: m.group(1) + ' dollars ', text)
@@ -2438,10 +2603,47 @@ def decode_semantic_markers(text: str) -> str:
     return _learner.apply_learned_rules(text)
 
 
+def _strip_list_markers(text):
+    """Remove list and bullet markers, judging each one by its line.
+
+    A marker opens an item, so it sits at the head of a line. Deciding that from
+    the line is the only reliable way, because once the newlines are folded into
+    spaces "b)" starting an item and "b)" inside a sentence are the same three
+    characters, and a rule loose enough to catch the first silently eats the
+    second along with its bracket.
+
+    Bullet glyphs are also matched mid-line, since nothing else uses them, but a
+    letter or digit marker has to be at a line start to count."""
+    out = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        pad = line[:len(line) - len(stripped)]
+        # A digit or letter marker, so "1." / "2)" / "a)" / "B."
+        m = re.match(r'(?:\d{1,3}|[a-zA-Z])[.)]\s+(?=\S)', stripped)
+        if m:
+            stripped = stripped[m.end():]
+        else:
+            # Bullet glyphs, including a hyphen or asterisk used as one. A dash
+            # needs the trailing space, so a negative number is left alone.
+            m = re.match(r'[•‣⁃▪▫◦∙·]\s*(?=\S)|[–—\-\*]\s+(?=\S)', stripped)
+            if m:
+                stripped = stripped[m.end():]
+        out.append(pad + stripped)
+    return "\n".join(out)
+
+
 def clean_text(text):
     # Per-chunk structure record (heading level, …) starts empty; the marker
     # decoder fills it in as it recognises wrappers.
     _reset_structure()
+
+    # 0-pre. List markers, while the line breaks that identify them still exist.
+    #        The marker decoder folds newlines into spaces, so this cannot wait
+    #        until the old step 6: by then "1." at the head of a line and "b)" in
+    #        the middle of a sentence look identical, and matching both is how
+    #        P(A ∩ B) lost its closing bracket and a spaced minus disappeared out
+    #        of an exponent. Anchoring to the line is the whole point.
+    text = _strip_list_markers(text)
 
     # 0. Decode the semantic markers, which has to run before everything else so
     #    that heading, bold, italic and code content gets routed through the
@@ -2515,10 +2717,11 @@ def clean_text(text):
     text = re.sub(r'\b(download\s+pdf|view\s+pdf|open\s+pdf|read\s+more|learn\s+more|see\s+more|back\s+to\s+top|skip\s+to\s+content|click\s+here)\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\[\s*(pdf|doc|docx|xlsx|download)\s*\]', '', text, flags=re.IGNORECASE)
 
-    # 6. List / bullet markers
-    text = re.sub(r'(?:^|\s)[\u2022\u2023\u2043\u2013\u2014\-\*]\s+', ' ', text, flags=re.MULTILINE)
-    text = re.sub(r'(?:^|\s)\d+[.)]\s+', ' ', text, flags=re.MULTILINE)
-    text = re.sub(r'(?:^|\s)[a-zA-Z][.)]\s+', ' ', text, flags=re.MULTILINE)
+    # 6. Bullet glyphs that survived, which happens when a list was written as a
+    #    run on one line. Only the unambiguous glyphs are safe here, since the
+    #    newlines are gone by now and a bare letter or digit would take real
+    #    words with it. The line-anchored stripping happens in step 0-pre.
+    text = re.sub(r'\s*[\u2022\u2023\u2043]\s*', '. ', text)
     text = re.sub(r':\s*\n', '. ', text)
 
     # 7. Reference / nav noise
