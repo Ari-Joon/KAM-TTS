@@ -1283,13 +1283,24 @@ document.addEventListener('DOMContentLoaded',()=>{
       if (name) name.textContent = d.active || 'default';
       const list = document.getElementById('voice-list');
       if (!list) return;
-      list.innerHTML = (d.voices || []).map(v =>
-        `<div style="display:flex;align-items:center;gap:6px;padding:4px 6px;border:1px solid var(--border);border-radius:5px;${v.active?'background:var(--bg3)':''}">
+      // The icon buttons share one style, since there are now three of them and
+      // repeating the whole declaration per button is how they drift apart.
+      const _vbtn = 'background:transparent;border:1px solid var(--border);color:var(--subtext);'
+                  + 'border-radius:4px;padding:2px 6px;cursor:pointer;font-family:var(--font);font-size:9px';
+      list.innerHTML = (d.voices || []).map(v => {
+        // 'default' is the base voice_samples folder every install expects, so
+        // it can be recorded into but never renamed or removed. The active
+        // voice cannot be deleted either: it is the one being spoken.
+        const base = v.voice_id === 'default';
+        const del  = !base && !v.active;
+        return `<div style="display:flex;align-items:center;gap:6px;padding:4px 6px;border:1px solid var(--border);border-radius:5px;${v.active?'background:var(--bg3)':''}">
            <span style="flex:1;color:var(--text);font-size:10px">${esc(v.voice_id)}${v.active?' <span style="color:var(--green)">●</span>':''}</span>
            <span style="color:var(--dim);font-size:9px">${v.clips} clip${v.clips===1?'':'s'}</span>
-           ${v.active?'':`<button class="voice-use" data-id="${esc(v.voice_id)}" ${v.clips?'':'disabled'} title="${v.clips?'Switch to this voice':'No clips recorded yet'}" style="background:transparent;border:1px solid var(--border);color:var(--subtext);border-radius:4px;padding:2px 7px;cursor:pointer;font-family:var(--font);font-size:9px">Use</button>`}
-           <button class="voice-files" data-id="${esc(v.voice_id)}" title="Open this voice's clip folder to add or edit recordings" style="background:transparent;border:1px solid var(--border);color:var(--subtext);border-radius:4px;padding:2px 6px;cursor:pointer;font-family:var(--font);font-size:9px">📁</button>
-         </div>`).join('');
+           ${v.active?'':`<button class="voice-use" data-id="${esc(v.voice_id)}" ${v.clips?'':'disabled'} title="${v.clips?'Switch to this voice':'No clips recorded yet'}" style="${_vbtn};padding:2px 7px">Use</button>`}
+           <button class="voice-files" data-id="${esc(v.voice_id)}" title="Open this voice's clip folder to add or edit recordings" style="${_vbtn}">📁</button>
+           ${base?'':`<button class="voice-rename" data-id="${esc(v.voice_id)}" title="Rename this voice, moving its clips and everything it has learned" style="${_vbtn}">✎</button>`}
+           <button class="voice-delete" data-id="${esc(v.voice_id)}" ${del?'':'disabled'} title="${base?'The default voice cannot be deleted':v.active?'This is the voice being spoken — switch to another one first':'Delete this voice, its clips and its learning'}" style="${_vbtn}${del?'':';opacity:.35;cursor:default'}">🗑</button>
+         </div>`; }).join('');
     }).catch(()=>_vSay('Server offline — voices unavailable.'));
   }
   if (vPill) vPill.addEventListener('click', () => {
@@ -1317,6 +1328,59 @@ document.addEventListener('DOMContentLoaded',()=>{
       api('/voices/open','POST',{ voice_id: files.dataset.id })
         .then(r => _vSay('Opened: ' + (r.path || 'folder')))
         .catch(() => _vSay('Could not open the folder.'));
+      return;
+    }
+
+    const ren = e.target.closest('.voice-rename');
+    if (ren) {
+      const was = ren.dataset.id;
+      const name = prompt(`Rename '${was}' to (letters/numbers):`, was);
+      if (!name || name === was) return;
+      _vSay('Renaming…');
+      api('/voices/rename','POST',{ voice_id: was, name }).then(r => {
+        if (!r.ok) { _vSay(r.error || 'Could not rename.'); return; }
+        _voiceRefresh();
+        const m = r.moved || {};
+        // Saying what moved matters: the whole point of the rename is that the
+        // learning came too, and silence there is indistinguishable from a
+        // profile that quietly started again from nothing.
+        const carried = (m.observations || m.chunks || m.settings)
+          ? ` Its learning came too — ${m.observations||0} observations, `
+            + `${m.chunks||0} chunks, ${m.settings||0} tuned entries.`
+          : ' It had nothing learned yet.';
+        _vSay(`Renamed '${r.was}' to '${r.voice_id}'.${carried}`);
+        showToast(`🎤 Renamed to ${r.voice_id}`);
+      }).catch(() => _vSay('Server offline.'));
+      return;
+    }
+
+    const del = e.target.closest('.voice-delete');
+    if (del && !del.disabled) {
+      const id = del.dataset.id;
+      // Ask the server what is actually at stake first. Clips are recordings
+      // that cannot be made again from here, and observations are weeks of
+      // accumulated evidence, so the confirm names both rather than asking
+      // "are you sure?" about an unknown quantity.
+      _vSay('Checking what that would remove…');
+      api(`/voices/data?voice_id=${encodeURIComponent(id)}`).then(dd => {
+        const bits = [`${dd.clips} recorded clip${dd.clips===1?'':'s'}`];
+        if (dd.observations) bits.push(`${dd.observations} observations`);
+        if (dd.chunks)       bits.push(`${dd.chunks} logged chunks`);
+        if (dd.settings)     bits.push(`${dd.settings} tuned entries`);
+        _vSay('');
+        if (!confirm(`Delete the voice '${id}'?\n\nThis permanently removes `
+                   + bits.join(', ') + `.\n\nThe recordings cannot be recovered `
+                   + `from here — copy them out with 📁 first if you want to keep them.`)) return;
+        _vSay('Deleting…');
+        api('/voices/delete','POST',{ voice_id: id, confirm: true }).then(r => {
+          if (!r.ok) { _vSay(r.error || 'Could not delete.'); return; }
+          _voiceRefresh();
+          const g = r.removed || {};
+          _vSay(`Deleted '${r.voice_id}' — ${r.clips} clip${r.clips===1?'':'s'}, `
+              + `${g.observations||0} observations and ${g.settings||0} tuned entries gone.`);
+          showToast(`🎤 Deleted ${r.voice_id}`);
+        }).catch(() => _vSay('Server offline.'));
+      }).catch(() => _vSay('Server offline — cannot check what that would remove.'));
     }
   });
   const vNew = document.getElementById('voice-new');

@@ -117,5 +117,76 @@ L.set_active_voice("default")
 check("default voice uses its learned value", base != 4.1, True)
 check("other voice does NOT inherit it", other, 4.1)
 
+print("\n=== renaming a voice carries its learning with it ===")
+# A voice's name is the key on every row and on every learned setting, so a
+# rename that moved only the folder would leave a profile that looks unchanged
+# and has quietly forgotten everything. The neighbour voice is here throughout
+# because the real danger is not failing to move rows, it is moving somebody
+# else's.
+OLD, NEW, OTHER = "_kam_test_old", "_kam_test_new", "_kam_test_other"
+_c = sqlite3.connect(str(L.DB_PATH))
+with _c:
+    for i in range(4):
+        _c.execute("INSERT INTO chunks (id, text, voice) VALUES (?,?,?)",
+                   (f"{OLD}-{i}", "a chunk", OLD))
+    for i in range(7):
+        _c.execute("INSERT INTO param_observations (profile, voice, quality) VALUES (?,?,?)",
+                   ("band|len|punct|lex", OLD, 0.8))
+    _c.execute("INSERT INTO chunks (id, text, voice) VALUES (?,?,?)",
+               (f"{OTHER}-0", "not mine", OTHER))
+    _c.execute("INSERT INTO param_observations (profile, voice, quality) VALUES (?,?,?)",
+               ("band|len|punct|lex", OTHER, 0.5))
+_c.close()
+
+L.set_active_voice(OLD)
+L.record_good_settings("sentence", {"temperature": 0.42, "repetition_penalty": 3.3,
+                                    "top_k": 40, "top_p": 0.9})
+L.set_active_voice(OTHER)
+L.record_good_settings("sentence", {"temperature": 0.77, "repetition_penalty": 5.5,
+                                    "top_k": 40, "top_p": 0.9})
+L.set_active_voice("default")
+
+before = L.voice_data_counts(OLD)
+check("counts the chunks",       before["chunks"], 4)
+check("counts the observations", before["observations"], 7)
+check("counts the learned entries", before["settings"] >= 1, True)
+
+moved = L.rename_voice_data(OLD, NEW)
+check("moved every chunk",       moved["chunks"], 4)
+check("moved every observation", moved["observations"], 7)
+check("moved the learned entries", moved["settings"] >= 1, True)
+
+after_old, after_new = L.voice_data_counts(OLD), L.voice_data_counts(NEW)
+check("nothing left under the old name", (after_old["chunks"], after_old["observations"],
+                                          after_old["settings"]), (0, 0, 0))
+check("all of it under the new name",    (after_new["chunks"], after_new["observations"]), (4, 7))
+
+# The learned value has to survive the move, not merely the row count.
+L.set_active_voice(NEW)
+check("and the tuned value came too",
+      L.get_preferred_param("sentence", "repetition_penalty", 4.1, 1.0, 10.0) != 4.1, True)
+L.set_active_voice("default")
+
+neighbour = L.voice_data_counts(OTHER)
+check("the neighbouring voice is untouched",
+      (neighbour["chunks"], neighbour["observations"]), (1, 1))
+check("and keeps its own learned entry", neighbour["settings"] >= 1, True)
+
+print("\n=== forgetting a voice takes its own and nothing else ===")
+gone = L.forget_voice_data(NEW)
+check("removed every chunk",       gone["chunks"], 4)
+check("removed every observation", gone["observations"], 7)
+check("removed the learned entries", gone["settings"] >= 1, True)
+emptied = L.voice_data_counts(NEW)
+check("nothing left for it", (emptied["chunks"], emptied["observations"],
+                              emptied["settings"]), (0, 0, 0))
+
+still = L.voice_data_counts(OTHER)
+check("the neighbour survived the delete",
+      (still["chunks"], still["observations"]), (1, 1))
+check("with its learned entry intact", still["settings"] >= 1, True)
+
+L.forget_voice_data(OTHER)     # leave the copied database as we found it
+
 print(f"\n{'='*62}\n  {PASS} passed, {FAIL} failed\n{'='*62}")
 sys.exit(1 if FAIL else 0)

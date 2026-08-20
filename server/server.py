@@ -193,6 +193,7 @@ import os
 import re
 import json
 import struct
+import shutil as _shutil
 import scipy.io.wavfile as wav  # type: ignore
 import numpy as np  # type: ignore
 from scipy import signal  # type: ignore
@@ -586,11 +587,19 @@ def _screen_voice_clips(clips, voice_id):
     }
     return usable
 
+def LATENT_CACHE_PATH_FOR(voice_id):
+    """The latent cache belonging to one named voice.
+
+    Split out from LATENT_CACHE_PATH so renaming and deleting a profile can
+    reach the file of a voice that is not the active one, which is the usual
+    case: you rename the voice you are not currently listening to."""
+    if voice_id == "default":
+        return os.path.join(_SERVER_DIR, "voice_latents.pt")
+    return os.path.join(_SERVER_DIR, f"voice_latents_{voice_id}.pt")
+
 def LATENT_CACHE_PATH():
     """Per-voice latent cache so switching voices is instant after first use."""
-    if _ACTIVE_VOICE == "default":
-        return os.path.join(_SERVER_DIR, "voice_latents.pt")
-    return os.path.join(_SERVER_DIR, f"voice_latents_{_ACTIVE_VOICE}.pt")
+    return LATENT_CACHE_PATH_FOR(_ACTIVE_VOICE)
 
 # NOTE: there is deliberately no warmup FLAG file. Kernel caches are
 # per-process, so a saved "already warmed" marker did real harm: it made a fresh
@@ -4690,6 +4699,129 @@ def create_voice():
     os.makedirs(path, exist_ok=True)
     print(f"[VOICE] Created profile '{vid}' → {path}")
     return jsonify({"ok": True, "voice_id": vid, "path": path})
+
+
+# A voice profile's name is its key in five places: the clip folder, the cached
+# latents, the drift baseline, the two database tables, and the prefix on its
+# learned settings. Both handlers below move or remove all five, because a
+# rename that only moved the folder would leave a profile that looks unchanged
+# and has quietly forgotten everything it learned.
+
+def _voice_artefacts(vid):
+    """The per-voice files that live outside the clip folder."""
+    return [LATENT_CACHE_PATH_FOR(vid), _learner.baseline_path_for(vid)]
+
+
+def _voice_id_from(raw):
+    """Sanitise a requested name the same way /voices/create does, so a profile
+    can never be created under one spelling and looked up under another."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", (raw or "").strip()).strip("_").lower()
+
+
+@app.route("/voices/rename", methods=["POST"])
+def rename_voice():
+    """Rename a voice profile, taking its clips and its learning with it."""
+    global _ACTIVE_VOICE
+    d   = request.get_json(force=True) or {}
+    old = (d.get("voice_id") or "").strip()
+    new = _voice_id_from(d.get("name"))
+
+    if old == "default":
+        return jsonify({"ok": False, "error":
+            "'default' is the base voice_samples folder every install expects, so it "
+            "cannot be renamed. Make a new voice and copy the clips across instead."}), 400
+    if not old or not os.path.isdir(_voice_dir(old)):
+        return jsonify({"ok": False, "error": f"No voice called '{old}'."}), 404
+    if not new or new == "default":
+        return jsonify({"ok": False, "error": "Give the voice a simple name (letters/numbers)."}), 400
+    if new == old:
+        return jsonify({"ok": True, "voice_id": old, "moved": {}, "note": "name unchanged"})
+    if os.path.isdir(_voice_dir(new)):
+        return jsonify({"ok": False, "error": f"Voice '{new}' already exists."}), 400
+
+    # The folder goes first, since it is the only step that can fail in a way I
+    # cannot put back. Everything after it is recoverable by renaming again.
+    try:
+        os.rename(_voice_dir(old), _voice_dir(new))
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"Could not rename the folder: {e}"}), 500
+
+    for src, dst in zip(_voice_artefacts(old), _voice_artefacts(new)):
+        try:
+            if os.path.exists(src):
+                os.replace(src, dst)
+        except OSError as e:
+            # A lost latent cache costs one recompute, so it is worth saying and
+            # not worth failing the rename over.
+            print(f"  {C.WARN}[VOICE]{C.RESET} could not move {os.path.basename(str(src))}: {e}")
+
+    moved = _learner.rename_voice_data(old, new)
+
+    if _ACTIVE_VOICE == old:
+        _ACTIVE_VOICE = new
+        _learner.set_setting("active_voice", new)
+        _learner.set_active_voice(new)
+
+    print(f"[VOICE] Renamed '{old}' → '{new}' "
+          f"({moved['chunks']} chunks, {moved['observations']} observations, "
+          f"{moved['settings']} learned entries moved)")
+    return jsonify({"ok": True, "voice_id": new, "was": old, "moved": moved,
+                    "active": _ACTIVE_VOICE == new})
+
+
+@app.route("/voices/delete", methods=["POST"])
+def delete_voice():
+    """Delete a voice profile, its clips and everything learned for it.
+
+    This throws away recordings, which are personal and cannot be regenerated,
+    so it needs confirm=true from a caller that has already shown the user what
+    they are about to lose. GET the counts from /voices/data first."""
+    d   = request.get_json(force=True) or {}
+    vid = (d.get("voice_id") or "").strip()
+
+    if vid == "default":
+        return jsonify({"ok": False, "error":
+            "'default' is the base voice, so it cannot be deleted. Delete its clips "
+            "individually if you want it empty."}), 400
+    if not vid or not os.path.isdir(_voice_dir(vid)):
+        return jsonify({"ok": False, "error": f"No voice called '{vid}'."}), 404
+    if vid == _ACTIVE_VOICE:
+        return jsonify({"ok": False, "error":
+            f"'{vid}' is the voice being spoken right now. Switch to another one "
+            f"first, so nothing is deleted out from under a read in progress."}), 400
+    if not d.get("confirm"):
+        return jsonify({"ok": False, "error": "confirm required"}), 400
+
+    counts = _learner.voice_data_counts(vid)
+    n_clips = len(_discover_voice_samples(vid))
+    try:
+        _shutil.rmtree(_voice_dir(vid))
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"Could not remove the folder: {e}"}), 500
+
+    for p in _voice_artefacts(vid):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+    gone = _learner.forget_voice_data(vid)
+    print(f"[VOICE] Deleted '{vid}' ({n_clips} clips, {gone['chunks']} chunks, "
+          f"{gone['observations']} observations, {gone['settings']} learned entries)")
+    return jsonify({"ok": True, "voice_id": vid, "clips": n_clips,
+                    "removed": gone, "counts": counts})
+
+
+@app.route("/voices/data", methods=["GET"])
+def voice_data():
+    """What a voice would lose if it were deleted, so the dashboard can say so
+    before asking rather than after."""
+    vid = (request.args.get("voice_id") or _ACTIVE_VOICE).strip()
+    out = _learner.voice_data_counts(vid)
+    out["clips"] = len(_discover_voice_samples(vid))
+    out["voice_id"] = vid
+    return jsonify(out)
 
 
 @app.route("/voices/open", methods=["POST"])

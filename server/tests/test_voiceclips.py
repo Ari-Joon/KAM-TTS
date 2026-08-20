@@ -13,6 +13,16 @@ import struct
 import sys
 import tempfile
 
+# server.py reconfigures its own streams to UTF-8 at boot, so the arrows and
+# stars its log lines use are safe there. Here the handlers are executed without
+# that boot block, so the console encoding has to be set up the same way or a
+# print inside the code under test fails and looks like a test failure.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 PASS = FAIL = 0
 
 
@@ -143,6 +153,123 @@ MAX_SLOTS = ns["_MAX_SLOTS"]
 check("slot 0 means allocate one",           0 <= 0, True)
 check("the ceiling is above the passages",   MAX_SLOTS > 16, True)
 check("a slot past the ceiling is refused",  MAX_SLOTS + 1 > MAX_SLOTS, True)
+
+print("\n=== renaming and deleting a whole voice profile ===")
+# These two are the only handlers that move or destroy recordings, so what is
+# worth testing is the refusals. Everything they guard against would either lose
+# clips that cannot be made again or leave the learning orphaned.
+
+class _FakeLearner:
+    """Records what the handlers ask of the learner, so the test can check the
+    name was carried across rather than only that the folder moved."""
+    def __init__(self):
+        self.renamed = None
+        self.forgot  = None
+        self.settings = {}
+    def baseline_path_for(self, vid):
+        return str(VOICES / f"_baseline_{vid}.json")
+    def voice_data_counts(self, vid):
+        return {"chunks": 3, "observations": 9, "settings": 2}
+    def rename_voice_data(self, old, new):
+        self.renamed = (old, new)
+        return {"chunks": 3, "observations": 9, "settings": 2}
+    def forget_voice_data(self, vid):
+        self.forgot = vid
+        return {"chunks": 3, "observations": 9, "settings": 2}
+    def set_setting(self, k, v):
+        self.settings[k] = v
+    def set_active_voice(self, v):
+        self.settings["active"] = v
+
+
+class _Req:
+    def __init__(self, payload, args): self._p, self.args = payload, args
+    def get_json(self, *a, **k):       return self._p
+
+
+import shutil as _sh
+vns = dict(ns)
+vns.update({
+    "_shutil": _sh,
+    "jsonify": lambda d: d,
+    "app": type("A", (), {"route": staticmethod(lambda *a, **k: (lambda f: f))})(),
+    "C": type("C", (), {"WARN": "", "RESET": ""})(),
+    "LATENT_CACHE_PATH_FOR": lambda vid: str(VOICES / f"_latents_{vid}.pt"),
+})
+fake = _FakeLearner()
+vns["_learner"] = fake
+exec(_extract("def _voice_artefacts(vid):", "@app.route(\"/voices/open\""), vns)
+
+rename, delete = vns["rename_voice"], vns["delete_voice"]
+
+
+def call(fn, **payload):
+    vns["request"] = _Req(payload, {})
+    r = fn()
+    return r if isinstance(r, tuple) else (r, 200)
+
+
+(VOICES / "keeper").mkdir()
+(VOICES / "keeper" / "passage_01.wav").write_bytes(wav_bytes())
+(VOICES / "occupied").mkdir()
+_pl.Path(vns["LATENT_CACHE_PATH_FOR"]("keeper")).write_bytes(b"latents")
+_pl.Path(fake.baseline_path_for("keeper")).write_text("{}", encoding="utf-8")
+
+body, code = call(rename, voice_id="default", name="anything")
+check("the default voice cannot be renamed", code, 400)
+check("and it says why", "voice_samples" in body["error"], True)
+body, code = call(rename, voice_id="nosuchvoice", name="x")
+check("renaming a voice that is not there is a 404", code, 404)
+body, code = call(rename, voice_id="keeper", name="occupied")
+check("renaming onto an existing voice is refused", code, 400)
+body, code = call(rename, voice_id="keeper", name="!!!")
+check("a name that sanitises to nothing is refused", code, 400)
+body, code = call(rename, voice_id="keeper", name="default")
+check("nothing can be renamed to 'default'", code, 400)
+
+body, code = call(rename, voice_id="keeper", name="Keeper Two")
+check("a good rename succeeds", code, 200)
+check("the id is sanitised the same way create does it", body["voice_id"], "keeper_two")
+check("the clips moved with it", (VOICES / "keeper_two" / "passage_01.wav").exists(), True)
+check("the old folder is gone", (VOICES / "keeper").exists(), False)
+check("the cached latents followed",
+      _pl.Path(vns["LATENT_CACHE_PATH_FOR"]("keeper_two")).exists(), True)
+check("so did the drift baseline",
+      _pl.Path(fake.baseline_path_for("keeper_two")).exists(), True)
+check("and the learning was told to move", fake.renamed, ("keeper", "keeper_two"))
+
+# Renaming the voice currently being spoken has to move the active pointer too,
+# or the server keeps reading from a folder that is no longer there.
+vns["_ACTIVE_VOICE"] = "keeper_two"
+body, code = call(rename, voice_id="keeper_two", name="keeper_three")
+check("renaming the active voice works", code, 200)
+check("and the active pointer follows it", vns["_ACTIVE_VOICE"], "keeper_three")
+check("the choice is persisted", fake.settings.get("active_voice"), "keeper_three")
+vns["_ACTIVE_VOICE"] = "default"
+
+body, code = call(delete, voice_id="default", confirm=True)
+check("the default voice cannot be deleted", code, 400)
+body, code = call(delete, voice_id="nosuchvoice", confirm=True)
+check("deleting a voice that is not there is a 404", code, 404)
+vns["_ACTIVE_VOICE"] = "keeper_three"
+body, code = call(delete, voice_id="keeper_three", confirm=True)
+check("the voice being spoken cannot be deleted", code, 400)
+check("and it says to switch away first", "Switch to another" in body["error"], True)
+vns["_ACTIVE_VOICE"] = "default"
+body, code = call(delete, voice_id="keeper_three")
+check("deleting without confirmation is refused", code, 400)
+check("clips are still there after the refusal",
+      (VOICES / "keeper_three" / "passage_01.wav").exists(), True)
+
+body, code = call(delete, voice_id="keeper_three", confirm=True)
+check("a confirmed delete succeeds", code, 200)
+check("the folder is gone", (VOICES / "keeper_three").exists(), False)
+check("the latents went with it",
+      _pl.Path(vns["LATENT_CACHE_PATH_FOR"]("keeper_three")).exists(), False)
+check("the baseline too",
+      _pl.Path(fake.baseline_path_for("keeper_three")).exists(), False)
+check("and the learning was told to forget it", fake.forgot, "keeper_three")
+check("the untouched voice is still there", (VOICES / "occupied").exists(), True)
 
 print()
 print(f"{PASS} passed, {FAIL} failed")

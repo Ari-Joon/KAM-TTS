@@ -64,12 +64,19 @@ def _vk(key):
     """Voice-namespace a good-settings store key ('default' stays bare)."""
     return key if _ACTIVE_VOICE == "default" else f"v:{_ACTIVE_VOICE}:{key}"
 
+def baseline_path_for(voice_id):
+    """The baseline file belonging to one named voice.
+
+    Split out from _baseline_path so renaming and deleting a profile can reach
+    the file of a voice that is not the active one."""
+    if voice_id == "default":
+        return BASELINE_PATH
+    return _HERE / f"voice_baseline_{voice_id}.json"
+
 def _baseline_path():
     """The baseline file for one voice, since drift has to be measured against
     the active clone rather than whichever voice recorded a baseline first."""
-    if _ACTIVE_VOICE == "default":
-        return BASELINE_PATH
-    return _HERE / f"voice_baseline_{_ACTIVE_VOICE}.json"
+    return baseline_path_for(_ACTIVE_VOICE)
 
 # ---
 # Optional heavy dependencies, which degrade gracefully if they aren't installed
@@ -2021,6 +2028,119 @@ def get_setting(key, default=None):
         return (_load_good_settings().get("settings") or {}).get(key, default)
     except Exception:
         return default
+
+
+# ---
+# Moving and forgetting a whole voice's learning
+# ---
+# A voice profile is not just its folder. Its name is the key on every row in
+# chunks and param_observations, and the prefix _vk() puts on every learned
+# entry in good_settings. Renaming the folder on its own would leave all of that
+# filed under a name nothing looks up again, so the profile would look the same
+# and quietly behave like a brand new one, which is the worst of both. So the
+# name moves everywhere at once or the caller is told it did not.
+
+def _voice_prefix(voice_id):
+    """The good-settings key prefix for a voice, matching _vk()."""
+    return "" if voice_id == "default" else f"v:{voice_id}:"
+
+
+def voice_data_counts(voice_id):
+    """How much learned evidence is filed under this voice.
+
+    The dashboard asks for this before it offers to delete anything, since
+    observations are the expensive thing in the system: one row per chunk ever
+    synthesised, accumulated over weeks, and no way to get them back."""
+    vid = (voice_id or "").strip()
+    out = {"chunks": 0, "observations": 0, "settings": 0}
+    try:
+        with _db_lock:
+            conn = _get_db()
+            try:
+                out["chunks"] = conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE voice=?", (vid,)).fetchone()[0]
+                out["observations"] = conn.execute(
+                    "SELECT COUNT(*) FROM param_observations WHERE voice=?", (vid,)).fetchone()[0]
+            finally:
+                conn.close()
+    except Exception as e:
+        print(f"[LEARNER] voice_data_counts error: {e}")
+    try:
+        pref = _voice_prefix(vid)
+        if pref:
+            out["settings"] = sum(1 for k in _load_good_settings() if k.startswith(pref))
+    except Exception:
+        pass
+    return out
+
+
+def rename_voice_data(old_id, new_id):
+    """Carry a voice's learned rows and settings across to its new name."""
+    moved = {"chunks": 0, "observations": 0, "settings": 0}
+    with _db_lock:
+        conn = _get_db()
+        try:
+            # One transaction, so the two tables can never disagree about which
+            # name a voice's history is under.
+            with conn:
+                moved["chunks"] = conn.execute(
+                    "UPDATE chunks SET voice=? WHERE voice=?", (new_id, old_id)).rowcount
+                moved["observations"] = conn.execute(
+                    "UPDATE param_observations SET voice=? WHERE voice=?",
+                    (new_id, old_id)).rowcount
+        finally:
+            conn.close()
+
+    old_p, new_p = _voice_prefix(old_id), _voice_prefix(new_id)
+    if old_p:
+        with _good_settings_lock:
+            store = dict(_load_good_settings())
+            for k in [k for k in store if k.startswith(old_p)]:
+                store[new_p + k[len(old_p):]] = store.pop(k)
+                moved["settings"] += 1
+            global _good_settings_cache
+            _good_settings_cache = store
+            try:
+                with open(_good_settings_path(), "w") as f:
+                    json.dump(store, f, indent=2)
+            except Exception as e:
+                print(f"[LEARNER] rename_voice_data save error: {e}")
+    return moved
+
+
+def forget_voice_data(voice_id):
+    """Delete everything the learner holds for a voice.
+
+    Called only when its folder is going too. Leaving the rows behind would be
+    the orphan case again, just pointing the other way: evidence filed under a
+    profile that no longer exists, counted in totals and reachable by nothing."""
+    gone = {"chunks": 0, "observations": 0, "settings": 0}
+    with _db_lock:
+        conn = _get_db()
+        try:
+            with conn:
+                gone["chunks"] = conn.execute(
+                    "DELETE FROM chunks WHERE voice=?", (voice_id,)).rowcount
+                gone["observations"] = conn.execute(
+                    "DELETE FROM param_observations WHERE voice=?", (voice_id,)).rowcount
+        finally:
+            conn.close()
+
+    pref = _voice_prefix(voice_id)
+    if pref:
+        with _good_settings_lock:
+            store = dict(_load_good_settings())
+            for k in [k for k in store if k.startswith(pref)]:
+                store.pop(k)
+                gone["settings"] += 1
+            global _good_settings_cache
+            _good_settings_cache = store
+            try:
+                with open(_good_settings_path(), "w") as f:
+                    json.dump(store, f, indent=2)
+            except Exception as e:
+                print(f"[LEARNER] forget_voice_data save error: {e}")
+    return gone
 
 
 def set_autotune(on):

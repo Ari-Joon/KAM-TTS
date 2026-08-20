@@ -312,6 +312,16 @@ voices. Only word pronunciations are shared. Clips recorded outside the
 dashboard can be cleaned with `python clean_voice_clips.py --in <raw> --out
 <folder>`.
 
+Rename a voice with **✎** and remove one with **🗑**, both in the voice menu. A
+rename carries everything with it, since a profile's name is the key on its clip
+folder, its cached latents, its drift baseline, its rows in the database and its
+learned settings, and moving only the folder would leave a voice that looks the
+same and has quietly forgotten what it knew. Deleting throws away recordings
+that cannot be made again from here, so it tells you how many clips and how many
+observations are about to go and asks first. The `default` voice cannot be
+renamed or deleted because it is the base `voice_samples/` folder, and the voice
+currently being spoken cannot be deleted until you switch away from it.
+
 ---
 
 ## Security
