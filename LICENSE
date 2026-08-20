@@ -16,6 +16,13 @@ NOTE: This licence covers the KAM TTS source code only. The XTTS-v2 model
 weights are licensed separately (Coqui Public Model License — non-commercial);
 verify the licence of the exact weights you download before any commercial use.
 
+NOTE: The voice recordings in server/voice_samples/ are NOT covered by this
+licence. They are recordings of a real person's voice, included so the project
+can be heard working, and they may be used to run and evaluate KAM TTS but not
+published, redistributed as a voice, or used to represent that person. See
+VOICE.md for the full terms, and record your own voice from the dashboard to
+replace them.
+
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE

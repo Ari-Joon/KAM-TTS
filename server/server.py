@@ -491,10 +491,12 @@ _ACTIVE_VOICE = "default"   # loaded from settings at startup
 class NoVoiceClipsError(FileNotFoundError):
     """Raised at startup when there is no reference audio to clone from.
 
-    Its own class because this is the one failure every new install hits, and it
-    is not a bug: reference clips are personal, so they are gitignored and can
-    never ship. Distinguishing it lets __main__ print instructions rather than a
-    traceback, while a genuine missing-file bug still gets one."""
+    Its own class because this is not a bug, it is a state a normal install can
+    be in. A fresh clone does ship with my clips in voice_samples/, so it speaks
+    straight away, but anyone who deletes them to use their own voice passes
+    through here before they have recorded anything. Distinguishing it lets
+    __main__ print instructions rather than a traceback, while a genuine
+    missing-file bug still gets one."""
 
 def _voice_dir(voice_id):
     return VOICE_SAMPLES_DIR if voice_id == "default" else os.path.join(VOICES_DIR, voice_id)

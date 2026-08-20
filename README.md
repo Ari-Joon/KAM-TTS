@@ -5,15 +5,33 @@ Python/Flask server. It reads web pages aloud using XTTS-v2, with a Whisper-base
 quality-learning loop that adapts synthesis parameters per chunk fingerprint
 over time.
 
+## The voice it ships with
+
+My own voice ships in `server/voice_samples/`, so a fresh clone speaks the
+moment it starts rather than asking you to record sixteen passages before you
+know whether you like it. **The code is MIT; the recordings are not.** Use them
+to run and evaluate KAM TTS, but not in anything you publish, and not to
+represent me. [VOICE.md](VOICE.md) has the terms and the fifteen-minute path to
+replacing them with your own, which is the point of the project.
+
+Nothing else of mine ships. The quality database, the learned settings, the
+tuning history and the drift baselines are all gitignored, so every install
+starts with a clean slate and learns your reading rather than inheriting mine.
+The one exception is `pronunciation_store.json`, a starter dictionary of
+technical words (`JSON` → "Jayson", `AWS` → "A.W.S"), which has nothing personal
+in it and saves everyone teaching the same acronyms again.
+
 ## Status
 
 **Version 0.9.** Everything described below works and the suites cover it, so it
 is worth using, but I am calling it 0.9 rather than 1.0 for two honest reasons.
 
-- **My own voice profile is not finished.** The standard passages exist to cover
-  a spread of prosody and I have recorded eight of the sixteen, so my clips do
-  not yet cover the range they are meant to. That affects how my voice sounds
-  rather than how yours will, since you record your own from the dashboard.
+- **The voice it ships with is not finished.** The standard passages exist to
+  cover a spread of prosody and I have recorded eight of the sixteen, so the
+  clips do not yet span the range they are meant to. Expect the shipped voice to
+  be weakest on the registers passages 9 to 16 cover, which is sustained low
+  pitch, contrastive stress, equations read aloud and steady enumeration under
+  load. Recording your own sixteen fixes this for your copy.
 - **Some of it is proven by tests rather than by use.** The non-NVIDIA backends
   (ROCm, MPS, Intel XPU) are logic-tested and have never run on real hardware,
   and only the "runaway" kind of hallucination has ever actually been caught, so
@@ -391,9 +409,13 @@ Speech Tuning, since a high sampling temperature is what drives these failures.
 
 ---
 
-## What is not committed
+## What is and is not committed
 
-Runtime state and personal data are gitignored: the token file, the SQLite
-quality database, learned settings and baselines, your voice clips, cached
-latents, logs, and the generated native-host manifest. All are created per
-install.
+The one piece of personal data that ships is the default voice in
+`server/voice_samples/`, deliberately, on the terms in [VOICE.md](VOICE.md).
+
+Everything else is gitignored and created per install: the token file, the
+SQLite quality database, learned settings, drift baselines, cached latents, any
+voice profiles you add under `voices/`, logs, and the generated native-host
+manifest. So you inherit the voice and nothing else — no reading history, no
+tuning, no rules. Your copy learns you from scratch.

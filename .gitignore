@@ -36,12 +36,29 @@ kam_server.log
 .warmup_done
 
 # --- Personal audio and voice clones ---
+# Audio stays out by default. The one deliberate exception is below.
 *.wav
-voice_samples/
 voice_samples_*/
 voices/
 voice_latents*.pt
 my_voice.wav
+
+# The default voice ships with the project on purpose, so a fresh clone can be
+# heard speaking without recording anything first. See VOICE.md for what may and
+# may not be done with these recordings; the code is MIT, the voice is not.
+#
+# Two gotchas are baked into these three lines, so please don't "tidy" them.
+#
+# First, the paths start at server/ rather than reading voice_samples/. A
+# pattern with a slash anywhere but the end is anchored to the directory holding
+# the .gitignore, so !voice_samples/*.wav only ever matches a folder at the repo
+# root and leaves the real clips under server/ still caught by *.wav above.
+#
+# Second, the folder has to be re-included before the files, since git will not
+# re-include anything underneath a directory that is itself excluded.
+!server/voice_samples/
+!server/voice_samples/*.wav
+!server/voice_samples/*.txt
 
 # --- Python ---
 __pycache__/
