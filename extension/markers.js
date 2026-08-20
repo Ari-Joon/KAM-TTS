@@ -19,8 +19,11 @@ const KAM_MARKER_NAMES = ["H1", "H2", "H3", "BOLD", "ITALIC", "CODE", "CALLOUT",
 // constant is only for one-shot .replace() use.
 const KAM_MARKER_RE = /\|\/?(?:H1|H2|H3|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST|BREAK)\|/g;
 
-// A chunk that begins with a heading marker came from an h1, h2 or h3.
-const KAM_HEADING_START_RE = /^\s*\|H[123]\|/;
+// A chunk that begins with a heading marker came from an h1, h2 or h3, and the
+// level is captured because it is worth more than the fact of being a heading:
+// the server has a separate pause for each of the three and the generic bucket
+// is 10 ms short of an h2 and 28 ms short of an h1.
+const KAM_HEADING_START_RE = /^\s*\|H([123])\|/;
 
 // A chunk carrying the closing list marker is the last chunk of a bullet, so it
 // is the one whose trailing gap is the gap between items. I test the close

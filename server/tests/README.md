@@ -30,7 +30,7 @@ learner builds an empty one and the tests still pass.
 | `test_audio.py` | Gain staging: level preserved against the old chain, nothing clipped |
 | `test_feed.mjs` | The dashboard live-feed pause and its pending count |
 | `test_maths.py` | LaTeX and unicode maths, and list markers that prose only looks like |
-| `test_markers.mjs` | The `\|LIST\|` marker from the page walkers through the chunker to the position hint, and that the marker grammar matches across the four files that strip it |
+| `test_markers.mjs` | Structure from the page walkers through the chunker to the position hint: that a bullet is wrapped and a heading keeps its level, that every hint is one `_POSITION_TYPE` acts on, and that the marker grammar matches across the four files that strip it |
 | `test_recorder.mjs` | WAV encoding and where a take gets trimmed |
 | `test_voiceclips.py` | Clip slots, transcript sidecars, and what the recorder uploads |
 

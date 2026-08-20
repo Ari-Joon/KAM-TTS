@@ -194,18 +194,35 @@ check('the middle of a long bullet asks for nothing',
       detectPositionHint('|LIST| Add the tea.'), null);
 check('and its last piece asks for item pacing',
       detectPositionHint('Wait three minutes.|/LIST|'), 'list_item');
-check('a heading still outranks it',
-      detectPositionHint('|H2|Making Tea.|/H2|'), 'heading');
+// The level and not just the fact, since the server keeps a separate pause for
+// each of the three and the generic bucket reaches none of them.
+check('an h1 asks for the section pause',  detectPositionHint('|H1|Tea.|/H1|'), 'h1');
+check('an h2 asks for its own',            detectPositionHint('|H2|Making Tea.|/H2|'), 'h2');
+check('an h3 asks for the lighter one',    detectPositionHint('|H3|The Pot.|/H3|'), 'h3');
+check('a heading still outranks a bullet',
+      detectPositionHint('|H2|Making Tea.|/H2||/LIST|'), 'h2');
 check('ordinary prose is still unmarked',
       detectPositionHint('The kettle matters more than the leaf.'), null);
 check('a chunk closing a paragraph still asks for the breath',
       detectPositionHint('The kettle matters more than the leaf. |BREAK|'), 'paragraph_end');
 
-// Every chunk the walker produces has to resolve to a hint the server knows, or
-// the label silently falls back to generic pacing.
-const KNOWN_HINTS = new Set(['heading', 'list_item', 'paragraph_end', null]);
-check('every chunk maps to a known hint',
-      chunks.every(c => KNOWN_HINTS.has(detectPositionHint(c))), true);
+// Every hint the reader can emit has to be one the server knows, so I read the
+// names out of server.py rather than listing them here. A hint the server has
+// no entry for does not fail anywhere: it falls through to the text heuristic
+// and the chunk is paced as though the structure had never been seen, which is
+// exactly how the heading levels sat unreachable for so long.
+const serverSrc = fs.readFileSync(new URL('../server.py', import.meta.url), 'utf8');
+const table = serverSrc.slice(serverSrc.indexOf('_POSITION_TYPE = {'));
+const KNOWN_HINTS = new Set(
+  [...table.slice(0, table.indexOf('}')).matchAll(/'([a-z0-9_]+)':/g)].map(m => m[1]));
+check('the server table was found', KNOWN_HINTS.size >= 4, true);
+// 'paragraph_end' carries no label of its own, it only lengthens the gap, so it
+// is legitimately absent from that table.
+KNOWN_HINTS.add('paragraph_end').add(null);
+const unknown = chunks.map(detectPositionHint).filter(h => !KNOWN_HINTS.has(h));
+check('every chunk maps to a hint the server acts on', unknown, []);
+check('and the heading levels are among them',
+      ['h1', 'h2', 'h3'].every(h => KNOWN_HINTS.has(h)), true);
 
 console.log(`\n${'='.repeat(60)}\n  ${PASS} passed, ${FAIL} failed\n${'='.repeat(60)}`);
 process.exit(FAIL ? 1 : 0);

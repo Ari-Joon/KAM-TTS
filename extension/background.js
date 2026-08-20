@@ -8,7 +8,7 @@ try {
 } catch (e) {
   console.error("[TTS-BG] markers.js failed to load — using inline fallback. Restore markers.js to the extension folder.", e);
   self.KAM_MARKER_RE        = /\|\/?(?:H1|H2|H3|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST|BREAK)\|/g;
-  self.KAM_HEADING_START_RE = /^\s*\|H[123]\|/;
+  self.KAM_HEADING_START_RE = /^\s*\|H([123])\|/;
   self.KAM_LIST_END_RE      = /\|\/LIST\|\s*$/;
   self.KAM_PARAGRAPH_END_RE = /\|BREAK\|\s*$/;
   self.kamStripMarkers = t => String(t).replace(self.KAM_MARKER_RE, " ").replace(/\s+/g, " ").trim();
@@ -473,7 +473,12 @@ function sanitizeText(text) {
 // anything the server needs to know about the shape of the page has to be
 // decided here and named in this string.
 function detectPositionHint(rawText) {
-  if (KAM_HEADING_START_RE.test(rawText)) return "heading";
+  // The level, not just the fact of being a heading. This used to return the
+  // generic "heading" for all three, so the server's h1_heading, h2_heading and
+  // h3_heading labels were defined and unreachable: every heading whatever its
+  // depth got the same 62 ms, and a chapter boundary sounded like a sub-section.
+  const heading = KAM_HEADING_START_RE.exec(rawText);
+  if (heading)                            return "h" + heading[1];
   if (KAM_LIST_END_RE.test(rawText))      return "list_item";
   if (KAM_PARAGRAPH_END_RE.test(rawText)) return "paragraph_end";
   return null;

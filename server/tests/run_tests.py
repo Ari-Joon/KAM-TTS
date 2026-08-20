@@ -39,7 +39,7 @@ SUITES = [
     ("maths",         "test_maths.py",        "LaTeX, unicode maths, list markers"),
     ("audio",         "test_audio.py",        "gain staging and clipping"),
     ("feed",          "test_feed.mjs",        "dashboard live-feed pause"),
-    ("markers",       "test_markers.mjs",     "the |LIST| marker from page to hint"),
+    ("markers",       "test_markers.mjs",     "page structure from walker to position hint"),
     ("recorder",      "test_recorder.mjs",    "WAV encoding and take trimming"),
     ("voiceclips",    "test_voiceclips.py",   "recording, transcripts, clip slots"),
 ]
