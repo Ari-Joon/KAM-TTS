@@ -5,6 +5,24 @@ Python/Flask server. It reads web pages aloud using XTTS-v2, with a Whisper-base
 quality-learning loop that adapts synthesis parameters per chunk fingerprint
 over time.
 
+## Status
+
+**Version 0.9.** Everything described below works and the suites cover it, so it
+is worth using, but I am calling it 0.9 rather than 1.0 for two honest reasons.
+
+- **My own voice profile is not finished.** The standard passages exist to cover
+  a spread of prosody and I have recorded eight of the sixteen, so my clips do
+  not yet cover the range they are meant to. That affects how my voice sounds
+  rather than how yours will, since you record your own from the dashboard.
+- **Some of it is proven by tests rather than by use.** The non-NVIDIA backends
+  (ROCm, MPS, Intel XPU) are logic-tested and have never run on real hardware,
+  and only the "runaway" kind of hallucination has ever actually been caught, so
+  I don't know whether the other detectors are too conservative or those cases
+  simply don't arise on the pages I read.
+
+I read real pages with this on an RTX 5090 Laptop at RTF 0.452, meaning synthesis
+runs about twice as fast as playback.
+
 ## Features
 
 - **Voice cloning from your own recordings** — 8–12 short clips, averaged by
