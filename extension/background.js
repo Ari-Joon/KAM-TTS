@@ -7,8 +7,9 @@ try {
   importScripts("markers.js");
 } catch (e) {
   console.error("[TTS-BG] markers.js failed to load — using inline fallback. Restore markers.js to the extension folder.", e);
-  self.KAM_MARKER_RE        = /\|\/?(?:H1|H2|H3|BOLD|ITALIC|CODE|CALLOUT|CAPTION|BREAK)\|/g;
+  self.KAM_MARKER_RE        = /\|\/?(?:H1|H2|H3|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST|BREAK)\|/g;
   self.KAM_HEADING_START_RE = /^\s*\|H[123]\|/;
+  self.KAM_LIST_END_RE      = /\|\/LIST\|\s*$/;
   self.KAM_PARAGRAPH_END_RE = /\|BREAK\|\s*$/;
   self.kamStripMarkers = t => String(t).replace(self.KAM_MARKER_RE, " ").replace(/\s+/g, " ").trim();
 }
@@ -464,9 +465,16 @@ function sanitizeText(text) {
 
 // The document-structure hint for prosody, read from the chunk's raw markers
 // before sanitizeText strips them. A chunk from an h1, h2 or h3 gets the
-// heading announce pause; a chunk closing a paragraph gets a longer breath.
+// heading announce pause; a chunk closing a bullet gets the inter-item gap; a
+// chunk closing a paragraph gets a longer breath.
+//
+// This hint is the only structural channel the server actually has, since
+// sanitizeText strips every marker out of the text before it is posted, so
+// anything the server needs to know about the shape of the page has to be
+// decided here and named in this string.
 function detectPositionHint(rawText) {
   if (KAM_HEADING_START_RE.test(rawText)) return "heading";
+  if (KAM_LIST_END_RE.test(rawText))      return "list_item";
   if (KAM_PARAGRAPH_END_RE.test(rawText)) return "paragraph_end";
   return null;
 }

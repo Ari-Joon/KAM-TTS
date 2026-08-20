@@ -157,6 +157,19 @@ exact("dashes too", "|BREAK|- keep it|BREAK|- drop it", "keep it. drop it.")
 says("items do not run together",
      "Steps:|BREAK|1. Boil water|BREAK|2. Add tea", "water. Add")
 
+print("\n=== the |LIST| wrapper each item now arrives in ===")
+# popup.js wraps every li, so the item's own "1." no longer sits at the head of
+# the part: the marker does. The strip has to count the wrapper as a boundary,
+# otherwise the number comes through and gets read out.
+exact("numbered item inside a wrapper", "|LIST| 1. Boil water|/LIST|", "Boil water.")
+exact("bullet glyph inside a wrapper",  "|LIST| • one|/LIST|",         "one.")
+exact("lettered item inside a wrapper", "|LIST| a) keep it|/LIST|",    "keep it.")
+never("the wrapper is never spoken",    "|LIST| 1. Boil water|/LIST|", "LIST", "|")
+exact("wrapped items stay separate thoughts",
+      "|LIST| • one|/LIST||BREAK||LIST| • two|/LIST|", "one. two.")
+exact("an item that punctuates itself is not doubled",
+      "|LIST| - already done.|/LIST|", "already done.")
+
 print("\n=== prose that only looks like a marker is left alone ===")
 # The rule used to fire on anything after a space, so ordinary sentences lost
 # characters at random.

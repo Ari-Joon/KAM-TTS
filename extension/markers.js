@@ -12,15 +12,22 @@
 "use strict";
 
 // All marker names the chunker may emit.
-const KAM_MARKER_NAMES = ["H1", "H2", "H3", "BOLD", "ITALIC", "CODE", "CALLOUT", "CAPTION", "BREAK"];
+const KAM_MARKER_NAMES = ["H1", "H2", "H3", "BOLD", "ITALIC", "CODE", "CALLOUT", "CAPTION", "LIST", "BREAK"];
 
 // Matches any opening or closing marker, so |H1|, |/BOLD|, |BREAK| and so on.
 // Where lastIndex matters I build a fresh regex per call, since this global
 // constant is only for one-shot .replace() use.
-const KAM_MARKER_RE = /\|\/?(?:H1|H2|H3|BOLD|ITALIC|CODE|CALLOUT|CAPTION|BREAK)\|/g;
+const KAM_MARKER_RE = /\|\/?(?:H1|H2|H3|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST|BREAK)\|/g;
 
 // A chunk that begins with a heading marker came from an h1, h2 or h3.
 const KAM_HEADING_START_RE = /^\s*\|H[123]\|/;
+
+// A chunk carrying the closing list marker is the last chunk of a bullet, so it
+// is the one whose trailing gap is the gap between items. I test the close
+// rather than the open because a long item splits into several chunks and only
+// the last one ends the item; pacing the first would put the inter-item pause
+// in the middle of the bullet.
+const KAM_LIST_END_RE = /\|\/LIST\|\s*$/;
 
 // A chunk ending in |BREAK| is closing a paragraph.
 const KAM_PARAGRAPH_END_RE = /\|BREAK\|\s*$/;

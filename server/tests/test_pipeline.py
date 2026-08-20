@@ -200,5 +200,34 @@ check("clean_text returns sentinel", S.clean_text("skip me"), learner.SUPPRESS_S
 learner.apply_learned_rules = lambda t: t
 print("  sentinel propagates instead of being spoken as the word SUPPRESS")
 
+print("\n=== 13. A bullet is paced as an item, not as a sentence ===")
+# Nothing in the words of a bullet says it was one, so the marker is the only
+# thing carrying it. Until now 'list_item' sat in the silence table with no code
+# path producing it, so every item was paced as ordinary prose.
+S._reset_structure()
+_item = S.clean_text("|LIST| 1. Boil the water|/LIST|")
+check("the wrapper is recorded",        S._detected_list_item(), True)
+check("and the bullet number still goes", _item, "Boil the water.")
+show("wrapped item", _item)
+
+S._reset_structure()
+S.clean_text("An ordinary sentence about water.")
+check("prose is not an item", S._detected_list_item(), False)
+
+_ctx = S.analyse_prosody("Boil the water.", "list_item")
+check("labelled list_item",   _ctx.sentence_type, "list_item")
+check("and gets the item gap", _ctx.silence_ms, S._SILENCE_MS["list_item"])
+show("list_item -> label / silence", (_ctx.sentence_type, _ctx.silence_ms))
+
+# Being a bullet says the chunk is one of several and says nothing about how it
+# is spoken, so an explicit question mark keeps its own label and its longer
+# pause. A heading hint is the other way round and overrides outright.
+check("a bullet that asks stays a question",
+      S.analyse_prosody("Which one should I use?", "list_item").sentence_type, "question")
+check("and one that shouts stays an exclamation",
+      S.analyse_prosody("Never do this!", "list_item").sentence_type, "exclamation")
+check("a heading hint still wins outright",
+      S.analyse_prosody("Which one should I use?", "h2").sentence_type, "h2_heading")
+
 print(f"\n{'='*60}\n  {PASS} passed, {FAIL} failed\n{'='*60}")
 sys.exit(1 if FAIL else 0)

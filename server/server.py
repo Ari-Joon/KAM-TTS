@@ -2422,7 +2422,7 @@ def guard_against_hallucination(text):
     text = text.strip().lstrip('.,;:!?-').rstrip(',:;-')
 
     # Final defence: strip any semantic markers that survived all previous passes
-    text = re.sub(r'\|/?(?:H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION|BREAK)\|', ' ', text)
+    text = re.sub(r'\|/?(?:H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST|BREAK)\|', ' ', text)
     text = re.sub(r'\|/?[A-Z][A-Z0-9/_]{1,15}\|', ' ', text)
 
     text = re.sub(r'\s+', ' ', text).strip()
@@ -2452,6 +2452,7 @@ def guard_against_hallucination(text):
 #   |CODE|...|/CODE|     inline code token
 #   |CALLOUT|...|/CALLOUT| admonition / blockquote / note box
 #   |CAPTION|...|/CAPTION| figure or table caption
+#   |LIST|...|/LIST|       one item of a bulleted or numbered list
 #
 # Each marker is decoded here into a prosody-aware transformation:
 #   Headings   → spoken with a clear pause before and after; sentence type
@@ -2464,6 +2465,15 @@ def guard_against_hallucination(text):
 #   Callout    → prefixed with the admonition type ("Note.", "Warning.") and
 #                set off with sentence breaks so it reads as a distinct aside
 #   Caption    → prefixed with "Figure:" and treated as a definition
+#   List item  → nothing is added to what gets said, since a bullet is not
+#                spoken, it is paced. The marker only records that the chunk
+#                was an item so the prosody engine can use the list gap
+#
+# In the normal reading path these wrappers never arrive, because background.js
+# strips every marker before it posts the text and sends the structure it found
+# as the "position" field instead. They are decoded here anyway, since custom
+# text and anything that posts to /speak directly can still carry them, and a
+# marker that reached XTTS would be read out as pipes and capitals.
 
 # Admonition type sniffed from callout text
 _ADMONITION_PATTERN = re.compile(
@@ -2480,11 +2490,17 @@ _structure = _threading.local()
 def _reset_structure():
     """Start a fresh structure record for this request's chunk."""
     _structure.heading_level = None
+    _structure.list_item     = False
 
 
 def _detected_heading_level():
     """The heading level the marker decoder saw for this chunk, or None."""
     return getattr(_structure, "heading_level", None)
+
+
+def _detected_list_item():
+    """True when the marker decoder saw this chunk wrapped as a list item."""
+    return bool(getattr(_structure, "list_item", False))
 
 
 def _decode_heading(level: str, content: str) -> str:
@@ -2535,6 +2551,17 @@ def _decode_caption(content: str) -> str:
     t = content.strip()
     return f' Figure caption: {t} '
 
+def _decode_list_item(content: str) -> str:
+    """
+    A bullet, which adds nothing to what is said and only changes the pacing.
+
+    So I record the fact and hand the words back untouched. Saying the word
+    "bullet" out loud would be worse than the run-together reading it replaces,
+    and the item already got its full stop in _strip_list_markers.
+    """
+    _structure.list_item = True
+    return f' {content.strip()} '
+
 def decode_semantic_markers(text: str) -> str:
     """
     Decode all the semantic markers popup.js injects.
@@ -2560,6 +2587,10 @@ def decode_semantic_markers(text: str) -> str:
     text = re.sub(r'\|CAPTION\|(.+?)\|/CAPTION\|',
                   lambda m: _decode_caption(m.group(1)), text, flags=re.DOTALL)
 
+    # List items, before bold and italic since an item often has bold inside it
+    text = re.sub(r'\|LIST\|(.+?)\|/LIST\|',
+                  lambda m: _decode_list_item(m.group(1)), text, flags=re.DOTALL)
+
     # Bold
     text = re.sub(r'\|BOLD\|(.+?)\|/BOLD\|',
                   lambda m: _decode_bold(m.group(1)), text, flags=re.DOTALL)
@@ -2578,10 +2609,10 @@ def decode_semantic_markers(text: str) -> str:
     # will read the pipe characters and tag names out literally.
     #
     # Pass 1: any remaining complete marker pair with content
-    text = re.sub(r'\|(?:H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION)\|.*?\|/(?:H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION)\|',
+    text = re.sub(r'\|(?:H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST)\|.*?\|/(?:H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST)\|',
                   ' ', text, flags=re.DOTALL)
     # Pass 2: any remaining lone opening or closing tag
-    text = re.sub(r'\|/?(?:H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION|BREAK)\|', ' ', text)
+    text = re.sub(r'\|/?(?:H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST|BREAK)\|', ' ', text)
     # Pass 3: any remaining pipe-word-pipe pattern (catches unknown future markers)
     # The /? handles both opening |WORD| and closing |/WORD| forms.
     text = re.sub(r'\|/?[A-Z][A-Z0-9/_]{1,15}\|', ' ', text)
@@ -2618,14 +2649,20 @@ def _strip_list_markers(text):
     through with "1." and "2." still in it, which then got read out as numbers.
     |BREAK| means a block boundary, so it counts as the head of a line here.
 
+    |LIST| opens an item by definition, so it counts too, and its closing tag
+    ends one. Without the closing tag as a boundary the item body would run up
+    to the "|" of "|/LIST|", and the full stop this adds would land after the
+    marker rather than after the words.
+
     Each item also gets a full stop if it has no terminal punctuation of its own.
     Otherwise the markers go, |BREAK| collapses to a space, and the items run
     together into one long sentence with no pause between them, which is both
     hard to follow and wrong: bullet items are separate thoughts."""
-    parts = re.split(r'(\|BREAK\||\n)', text)
+    _BOUNDARIES = ("\n", "|BREAK|", "|LIST|", "|/LIST|")
+    parts = re.split(r'(\|BREAK\||\|/?LIST\||\n)', text)
     at_boundary = True
     for k, part in enumerate(parts):
-        if part == "\n" or part == "|BREAK|":
+        if part in _BOUNDARIES:
             at_boundary = True
             continue
         if not at_boundary:
@@ -3003,11 +3040,20 @@ SENTENCE_TYPES = tuple(k for k in _SILENCE_MS if k != 'unknown')
 # to the label they force. Anything the extension knows for certain beats the
 # text heuristics, because it saw the actual DOM element.
 _POSITION_TYPE = {
-    'h1':      'h1_heading',
-    'h2':      'h2_heading',
-    'h3':      'h3_heading',
-    'heading': 'heading',
+    'h1':        'h1_heading',
+    'h2':        'h2_heading',
+    'h3':        'h3_heading',
+    'heading':   'heading',
+    'list_item': 'list_item',
 }
+
+# Labels that come from an explicit signal in the text itself, so a "?" or a
+# "Note." prefix. A bullet does not outrank these, since being an item says the
+# chunk is one of several and says nothing about how it is spoken, while a
+# question mark says exactly how it is spoken. Headings are the other way round
+# and override outright, because the reader saw the real h1 and the title-case
+# heuristic is only ever guessing at it.
+_INTONATION_TYPES = frozenset({'question', 'exclamation', 'callout', 'caption'})
 
 # Question-word starters, which I use to spot implicit questions
 _QUESTION_STARTERS = re.compile(
@@ -3228,6 +3274,7 @@ def analyse_prosody(text: str, position: Optional[str] = None) -> ProsodicContex
     heuristics:
       'h1' | 'h2' | 'h3'  chunk came from a heading of that level
       'heading'           chunk came from a heading of unknown level
+      'list_item'         chunk closes a bullet, so it earns the item gap
       'paragraph_end'     chunk closes a paragraph, so it earns a longer breath
 
     The chunk is parsed ONCE here and the result is shared with
@@ -3245,6 +3292,8 @@ def analyse_prosody(text: str, position: Optional[str] = None) -> ProsodicContex
     # so an H1 is labelled h1_heading and gets the full section-boundary pause
     # instead of collapsing to the generic 'heading' bucket.
     forced = _POSITION_TYPE.get(position or '')
+    if forced == 'list_item' and sentence_type in _INTONATION_TYPES:
+        forced = None       # a bullet that is a question stays a question
     if forced:
         sentence_type = forced
 
@@ -3643,7 +3692,7 @@ def clean_display_text(raw: str) -> str:
     the whitespace, but keeps the grammar exactly as it appeared on the page,
     with no pronunciation substitution and no number expansion. So 'SQL 3.5'
     shows as 'SQL 3.5' rather than 'sequel three point five'."""
-    t = re.sub(r'\|\/?(?:H1|H2|H3|BOLD|ITALIC|CODE|CALLOUT|CAPTION|BREAK)\|', ' ', raw or '')
+    t = re.sub(r'\|\/?(?:H1|H2|H3|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST|BREAK)\|', ' ', raw or '')
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
@@ -3819,6 +3868,13 @@ def speak():
     _level = _detected_heading_level()
     if _level:
         _position = _level
+    elif _detected_list_item() and not _position:
+        # A |LIST| wrapper that survived into the request, which happens when
+        # something posts raw marked-up text rather than going through the
+        # reader. The reader normally works this out itself and sends
+        # 'list_item' in the position field, so I only fall back to the wrapper
+        # when it has said nothing at all.
+        _position = 'list_item'
 
     if len(text) > _MAX_CHUNK_CHARS:
         print(f"  {C.WARN}[WARN]{C.RESET} over-length ({len(text)}c) — truncating")

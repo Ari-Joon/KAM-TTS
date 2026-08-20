@@ -448,7 +448,7 @@ const _MARKERS = {
   'H1':1,'/H1':1,'H2':1,'/H2':1,'H3':1,'/H3':1,
   'BOLD':1,'/BOLD':1,'ITALIC':1,'/ITALIC':1,
   'CODE':1,'/CODE':1,'CALLOUT':1,'/CALLOUT':1,
-  'CAPTION':1,'/CAPTION':1,'BREAK':1
+  'CAPTION':1,'/CAPTION':1,'LIST':1,'/LIST':1,'BREAK':1
 };
 function _stripMarkers(text) {
   return text.split('|')

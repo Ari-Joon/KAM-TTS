@@ -208,7 +208,7 @@ function initSettings() {
 
 function stripMarkersForDisplay(text) {
   return text
-    .replace(/\|\/?(H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION)\|/g, '')
+    .replace(/\|\/?(H[1-3]|BOLD|ITALIC|CODE|CALLOUT|CAPTION|LIST)\|/g, '')
     .replace(/\|BREAK\|/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -1141,9 +1141,16 @@ function updateProgressFill(current, total) {
 //   |CODE| ... |/CODE|        an inline code term
 //   |CALLOUT| ... |/CALLOUT|  a note, warning, tip or blockquote
 //   |CAPTION| ... |/CAPTION|  a figure or table caption
+//   |LIST| ... |/LIST|        one item of a bulleted or numbered list
 //   |BREAK|                   a paragraph or block boundary
 //
 // The server strips the markers once it has used them, so they never reach XTTS.
+//
+// |LIST| is the one marker I close tight against its text, with no space in
+// front of the closing tag. That keeps the tag and the last word as a single
+// token, so none of the length-based splitters below can cut between them and
+// leave "|/LIST|" as a chunk with nothing to say. It also makes the emitted
+// shape canonical, which is what the server's decoder and the tests read.
 // =============================================================================
 
 // Wrap a text-extraction promise so it can never hang the UI. If the page does
@@ -1304,6 +1311,30 @@ function getSelectedText() {
                 return;
               }
 
+              // A list item, wrapped so the server knows the chunk was a bullet
+              // and can give it the gap between items rather than the gap
+              // between sentences. Nothing else carries that fact: once the
+              // marker is stripped, "Boil the water." from a bullet and the
+              // same words from a paragraph are the same string.
+              //
+              // I only wrap an item that has words in it, since |LIST| brings
+              // four letters of its own and the chunker keeps any segment with
+              // two letters or more, so an empty bullet would otherwise arrive
+              // as a chunk with nothing to say.
+              if (tag === 'li') {
+                if (parts.length > 0 && !lastWasBlock) parts.push(' |BREAK| ');
+                const _at = parts.length;
+                Array.from(node.childNodes).forEach(walk);
+                const _inner = parts.slice(_at).join('').replace(/\|\/?[A-Z0-9]+\|/g, '');
+                if ((_inner.match(/[a-zA-Z]/g) || []).length >= 2) {
+                  parts.splice(_at, 0, '|LIST| ');
+                  parts.push('|/LIST|');
+                }
+                parts.push(' |BREAK| ');
+                lastWasBlock = true;
+                return;
+              }
+
               // Block elements → inject |BREAK| before and after
               if (BLOCK_TAGS.has(tag)) {
                 if (parts.length > 0 && !lastWasBlock) parts.push(' |BREAK| ');
@@ -1325,6 +1356,10 @@ function getSelectedText() {
 
             let text = parts.join('')
               .replace(/(\|BREAK\|\s*){2,}/g, ' |BREAK| ')
+              // Pull the closing list marker tight against its item, so the tag
+              // and the last word stay one token and no length-based split can
+              // strand the tag in a chunk of its own.
+              .replace(/\s+\|\/LIST\|/g, '|/LIST|')
               // Collapse only spaces and tabs, not punctuation, so ". However"
               // survives.
               .replace(/[ \t]{2,}/g, ' ')
@@ -1461,6 +1496,22 @@ function getPageText() {
               // Code blocks get skipped, since they're too noisy for TTS
               if (tag === 'pre') return;
 
+              // A list item, wrapped so the server can pace it as a bullet.
+              // See the note on the selection walker above: an item with no
+              // words in it is left unwrapped, because the marker's own letters
+              // would carry an empty bullet past the chunker's length gate.
+              if (tag === 'li') {
+                if (!lastWasBlock && parts.length > 0) parts.push(' |BREAK| ');
+                const _at = parts.length;
+                Array.from(node.childNodes).forEach(walk);
+                const _inner = parts.slice(_at).join('').replace(/\|\/?[A-Z0-9]+\|/g, '');
+                if ((_inner.match(/[a-zA-Z]/g) || []).length < 2) return;
+                parts.splice(_at, 0, '|LIST| ');
+                parts.push('|/LIST| |BREAK| ');
+                lastWasBlock = true;
+                return;
+              }
+
               // Block elements, where I inject the break boundaries
               if (BLOCK.has(tag)) {
                 const hadContent = parts.length;
@@ -1498,6 +1549,10 @@ function getPageText() {
               .replace(/&&/g,' and ')
               // Collapse
               .replace(/(\|BREAK\|\s*){2,}/g, ' |BREAK| ')
+              // Keep the closing list marker tight against its item, so the tag
+              // and the last word stay one token and no length-based split can
+              // strand the tag in a chunk of its own.
+              .replace(/\s+\|\/LIST\|/g, '|/LIST|')
               .replace(/\s+/g, ' ')
               .trim();
 
