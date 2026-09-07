@@ -90,6 +90,10 @@ try {
       // chunk is mid-play. Combined with the offscreen-side silent tone this
       // makes reaping between chunks effectively impossible.
       try { chrome.runtime.sendMessage({ target: "offscreen", action: "keepAlive" }).catch(() => {}); } catch (e) {}
+      // Same idea for the native host: a quiet port is an idle worker, and an
+      // idle worker is a closed port, which kam_host.py treats as "kill the
+      // server". So the port is kept warm for as long as it is open.
+      try { _hostPing(); } catch (e) {}
       try {
         chrome.storage.session.get('playerTabId').then(d => {
           if (d && d.playerTabId && playerTabId === null) playerTabId = d.playerTabId;
@@ -267,6 +271,95 @@ function stripMarkersForDisplay(text) {
 // MESSAGE HANDLER
 // =============================================================================
 
+// =============================================================================
+// THE NATIVE HOST, OWNED HERE
+// =============================================================================
+//
+// The power button used to live only in the dashboard, and it had to, because
+// kam_host.py kills the server when its port closes ("clean up the child so we
+// don't leave an orphan"). A port opened from the popup dies the moment the
+// popup loses focus, which is a few seconds into a boot that takes most of a
+// minute, so a popup button would have looked like it worked and then killed
+// the server halfway through loading torch.
+//
+// So the worker holds the port instead. It outlives the popup, the existing
+// keepAlive alarm pings the host every 24 seconds so neither the port nor the
+// worker goes idle, and the server therefore stays up for as long as Chrome
+// does. The dashboard keeps its own connection and is untouched; a second host
+// process just finds the server already on 5050 and reports it as running.
+const HOST_NAME = "com.kam.tts";
+let _hostPort  = null;
+let _hostState = { connected: false, running: false, ready: false,
+                   stage: "", error: "", startedAt: 0 };
+
+function hostSnapshot() {
+  return Object.assign({}, _hostState);
+}
+
+// Tell anyone listening (the popup, mostly) that something moved. Wrapped
+// because with no popup open there is no receiver and that rejects.
+function _hostBroadcast() {
+  try {
+    chrome.runtime.sendMessage({ action: "hostEvent", state: hostSnapshot() })
+      .catch(() => {});
+  } catch (e) { /* nobody listening */ }
+}
+
+function hostStart() {
+  if (!_hostPort) {
+    try {
+      _hostPort = chrome.runtime.connectNative(HOST_NAME);
+    } catch (e) {
+      _hostState.error = "Native host unavailable. Run register_host.py once, then restart Chrome.";
+      _hostBroadcast();
+      return;
+    }
+    _hostState.connected = true;
+    _hostState.error = "";
+    _hostPort.onMessage.addListener(m => {
+      if (!m) return;
+      if (m.type === "stage")  _hostState.stage = m.stage || "";
+      if (m.type === "ready")  { _hostState.ready = true; _hostState.running = true; _hostState.stage = "ready"; }
+      if (m.type === "status") _hostState.running = !!m.running;
+      if (m.type === "error")  _hostState.error = m.message || "host error";
+      if (m.type === "exit")   { _hostState.running = false; _hostState.ready = false; _hostState.stage = ""; }
+      if (m.type === "stage" || m.type === "ready" || m.type === "status"
+          || m.type === "error" || m.type === "exit") _hostBroadcast();
+    });
+    _hostPort.onDisconnect.addListener(() => {
+      const err = chrome.runtime.lastError;
+      _hostPort = null;
+      _hostState.connected = false;
+      // Not cleared: whether the server is up is now a question for the health
+      // check, since the host going away does not by itself say it stopped.
+      if (err && !_hostState.error) {
+        _hostState.error = "Native host unavailable. Run register_host.py once, then restart Chrome.";
+      }
+      _hostBroadcast();
+    });
+  }
+  _hostState.ready = false;
+  _hostState.stage = "process-started";
+  _hostState.startedAt = Date.now();
+  _hostBroadcast();
+  try { _hostPort.postMessage({ cmd: "start" }); } catch (e) {
+    _hostState.error = String(e && e.message || e);
+    _hostBroadcast();
+  }
+}
+
+function hostStop() {
+  if (!_hostPort) return;
+  try { _hostPort.postMessage({ cmd: "stop" }); } catch (e) { /* already gone */ }
+}
+
+function _hostPing() {
+  if (!_hostPort) return;
+  // Traffic in either direction resets the worker's idle timer, which is what
+  // keeps the port, and therefore the server, alive between chunks.
+  try { _hostPort.postMessage({ cmd: "ping" }); } catch (e) { _hostPort = null; }
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Completion broadcast from offscreen, keyed by chunk seq. This is the single
@@ -396,6 +489,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ status: "ok" });
     return true;
   }
+
+  // --- Starting the server from anywhere, not just the dashboard ---
+  if (request.action === "hostStart") { hostStart(); sendResponse(hostSnapshot()); return true; }
+  if (request.action === "hostStop")  { hostStop();  sendResponse(hostSnapshot()); return true; }
+  if (request.action === "hostState") { sendResponse(hostSnapshot()); return true; }
 
   // The dashboard data proxy, since player.html routes its server fetches here
   if (request.action === "dashboardFetch") {

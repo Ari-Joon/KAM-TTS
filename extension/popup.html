@@ -81,7 +81,31 @@
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--pop-text-muted); flex-shrink: 0; }
     .status-dot.online { background: var(--pop-ok); }
     .status-dot.offline { background: var(--pop-danger); }
-    #status-text { color: var(--pop-text-dim); }
+    /* The status bar carries a headline, a step line and a progress rail in a
+       340px popup, so every one of them is clipped rather than allowed to wrap.
+       min-width:0 on the column is what makes the ellipsis work at all: a flex
+       item defaults to min-width:auto and refuses to shrink below its text,
+       which pushes the button off the edge instead of truncating. */
+    .status-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+    #status-text { color: var(--pop-text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #status-step {
+      display: none; font-size: 10px; color: var(--pop-text-muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #status-prog { display: none; height: 2px; background: var(--pop-border); border-radius: 1px; overflow: hidden; }
+    #status-prog > i { display: block; height: 100%; width: 0; background: var(--pop-accent); transition: width .3s ease; }
+    /* flex:none because the base button rule above is flex:1, and in a flex row
+       its flex-basis:0 beats a plain width and stretches this to 130px. The
+       player and feedback buttons already have to say the same thing. */
+    #status-start {
+      display: none; flex: none; width: 28px; height: 28px; padding: 0;
+      border-radius: 6px; border: 1px solid var(--pop-border); background: transparent;
+      color: var(--pop-text-dim); font-size: 13px; line-height: 1; cursor: pointer;
+      align-items: center; justify-content: center; transition: all .15s;
+    }
+    #status-start.show { display: flex; }
+    #status-start:hover:not(:disabled) { border-color: var(--pop-accent); color: var(--pop-accent); }
+    #status-start:disabled { opacity: .45; cursor: default; }
     .mode-tabs { display: flex; gap: 6px; margin-bottom: 14px; }
     .tab { flex: 1; padding: 7px; background: var(--pop-bg-soft); border: 1px solid var(--pop-border); border-radius: 6px; color: var(--pop-text-muted); font-size: 11px; cursor: pointer; text-align: center; transition: all 0.2s; }
     .tab.active { background: var(--pop-accent); border-color: var(--pop-accent); color: var(--pop-on-accent); font-weight: 700; }
@@ -190,7 +214,12 @@
 
   <div class="status-bar">
     <div class="status-dot" id="status-dot"></div>
-    <span id="status-text">Checking server...</span>
+    <div class="status-body">
+      <span id="status-text">Checking server...</span>
+      <span id="status-step"></span>
+      <div id="status-prog"><i></i></div>
+    </div>
+    <button id="status-start" title="Start the KAM TTS server">⏻</button>
   </div>
 
   <div class="mode-tabs">

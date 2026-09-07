@@ -441,14 +441,129 @@ async function checkServer() {
                              /Failed to fetch|NetworkError/i.test(String(err.message || err)));
     if (!expected) console.error("[KAM] health check failed:", err);
   }
-  const dot = document.getElementById("status-dot");
-  const txt = document.getElementById("status-text");
-  const btn = document.getElementById("speak-btn");
-  if (dot) dot.className = online ? "status-dot online" : "status-dot offline";
-  if (txt) txt.textContent = online ? "Server online" : "Server offline. Start server.py";
-  if (btn) btn.disabled = !online;
+  _serverOnline = online;
+  paintStatus();
   if (!online) setTimeout(checkServer, 3000);   // retry every 3 seconds
 }
+
+// =============================================================================
+// SERVER STATUS AND THE START BUTTON
+// =============================================================================
+//
+// The server writes its progress to .kam_stage as it boots and the native host
+// relays each change, so the popup can say which part of a slow start it is on
+// rather than sitting on "offline" for most of a minute. Loading torch and XTTS
+// is the long one and it is worth naming, because a progress line that stops
+// moving there looks broken and is not.
+//
+// The names below are the server's own stage strings. An unrecognised one is
+// shown as-is rather than swallowed, since a stage nothing renders is how you
+// end up with a blank line and no idea why.
+const BOOT_STEPS = [
+  ["process-started",    "Starting up"],
+  ["flask-import",       "Loading the web layer"],
+  ["torch-tts-imported", "Loading PyTorch and XTTS"],
+  ["device-probe",       "Choosing the compute device"],
+  ["model-loading",      "Loading the voice model"],
+  ["adapting",           "Adapting to your hardware"],
+  ["benchmarking",       "Measuring synthesis speed"],
+  ["model-loaded",       "Model ready"],
+];
+const BOOT_ASIDES = {
+  "standby":           "Standing by to save power",
+  "waking":            "Waking the model",
+  "no-voice-clips":    "No voice clips found — record some first",
+  "duplicate-aborted": "Another server is already running",
+  "ready":             "Ready",
+};
+
+let _serverOnline = false;
+let _hostState    = { connected: false, running: false, ready: false, stage: "", error: "" };
+
+function _stepFor(stage) {
+  const i = BOOT_STEPS.findIndex(s => s[0] === stage);
+  if (i >= 0) return { label: BOOT_STEPS[i][1], pct: Math.round((i + 1) / BOOT_STEPS.length * 100) };
+  if (BOOT_ASIDES[stage]) return { label: BOOT_ASIDES[stage], pct: null };
+  return stage ? { label: stage, pct: null } : null;
+}
+
+function paintStatus() {
+  const dot  = document.getElementById("status-dot");
+  const txt  = document.getElementById("status-text");
+  const step = document.getElementById("status-step");
+  const prog = document.getElementById("status-prog");
+  const start= document.getElementById("status-start");
+  const speak= document.getElementById("speak-btn");
+  if (!dot || !txt) return;
+
+  // Booting means the host has told us a stage and the health check has not yet
+  // seen the server answer. Once it answers, the stage line has nothing to add.
+  const booting = !_serverOnline && !!_hostState.stage && !_hostState.error;
+  const info    = booting ? _stepFor(_hostState.stage) : null;
+
+  dot.className = _serverOnline ? "status-dot online"
+                : booting       ? "status-dot"          // amber-neutral while it works
+                                : "status-dot offline";
+
+  if (_serverOnline)            txt.textContent = "Server online";
+  else if (_hostState.error)    txt.textContent = _hostState.error;
+  else if (booting)             txt.textContent = "Starting the server…";
+  else                          txt.textContent = "Server offline";
+
+  if (step) {
+    const show = booting && info;
+    step.style.display = show ? "block" : "none";
+    step.textContent   = show ? info.label : "";
+  }
+  if (prog) {
+    const show = booting && info && info.pct !== null;
+    prog.style.display = show ? "block" : "none";
+    if (show) prog.firstElementChild.style.width = info.pct + "%";
+  }
+  if (start) {
+    // Offered whenever the server is not up, including after a failure, since
+    // "try again" is the obvious next move and hiding the button hides it.
+    start.classList.toggle("show", !_serverOnline);
+    start.disabled = booting;
+    start.title = booting ? "Starting…" : "Start the KAM TTS server";
+  }
+  if (speak) speak.disabled = !_serverOnline;
+}
+
+// The worker owns the host connection, so the popup asks it for the current
+// state on open and then listens. Without the initial ask, reopening the popup
+// mid-boot would show "offline" until the next stage happened to change.
+try {
+  chrome.runtime.sendMessage({ action: "hostState" }, s => {
+    if (chrome.runtime.lastError) return;
+    if (s) { _hostState = s; paintStatus(); }
+  });
+  chrome.runtime.onMessage.addListener(msg => {
+    if (msg && msg.action === "hostEvent" && msg.state) {
+      _hostState = msg.state;
+      paintStatus();
+      if (_hostState.ready) checkServer();   // confirm with a real health check
+    }
+  });
+} catch (e) { /* worker not up yet; the health check still drives the dot */ }
+
+document.addEventListener("DOMContentLoaded", () => {
+  const start = document.getElementById("status-start");
+  if (!start) return;
+  start.addEventListener("click", () => {
+    _hostState = { connected: false, running: false, ready: false,
+                   stage: "process-started", error: "" };
+    paintStatus();
+    chrome.runtime.sendMessage({ action: "hostStart" }, s => {
+      if (chrome.runtime.lastError) {
+        _hostState.error = "Could not reach the extension worker. Reload the extension.";
+      } else if (s) {
+        _hostState = s;
+      }
+      paintStatus();
+    });
+  });
+});
 
 function setMode(mode) {
   currentMode = mode;
