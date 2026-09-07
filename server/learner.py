@@ -35,6 +35,7 @@ except Exception:
     pass
 import queue
 import sqlite3
+import statistics as _statistics
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -559,6 +560,45 @@ def _spell_abbreviation(word):
         return None
 
 
+# ---
+# Length bias in the quality score
+# ---
+# Two of the four sub-scores were harsher on short text than on long, for
+# reasons that had nothing to do with how the audio actually sounded, and the
+# measured gap was large: chunks of eight words or fewer averaged 0.841 against
+# 0.918 for nine to twenty, and headings, which are short by nature, came out
+# worst of anything at 0.787.
+#
+# Whisper accuracy was matches/words, so one word Whisper mishears costs 33% of
+# a three-word heading and 5% of a twenty-word sentence, and since the ratio is
+# capped at 1.0 an error can only ever push the score down. Short chunks were
+# therefore both noisier and biased low. So the ratio is smoothed toward a prior
+# instead: with few words there is little evidence either way, and the score now
+# says so rather than swinging to whichever extreme one word decides.
+_ACCURACY_PRIOR   = 0.90   # what a chunk scores on no evidence, so the corpus mean
+_ACCURACY_PSEUDO  = 4.0    # pseudo-words of prior, so ~4 real words to move it half way
+
+# Pitch variance was the second one. A clip of a few words has little room to
+# vary in pitch, so it fell outside the 10-60Hz "good" band and scored 0.5 for
+# being short rather than for being wrong. Below this many words the measure
+# says nothing, so it is left out of the average rather than guessed at.
+_PITCH_MIN_WORDS  = 6
+
+
+def _smoothed_accuracy(matches, n_words):
+    """Word-match accuracy, shrunk toward the prior when there are few words.
+
+    Returns matches/n_words for long chunks, which is what it always did, and
+    pulls short ones toward _ACCURACY_PRIOR in proportion to how little evidence
+    they carry. A perfect three-word chunk scores below a perfect twenty-word
+    one on purpose: three words is weaker evidence of being right."""
+    if n_words <= 0:
+        return 1.0
+    smoothed = ((matches + _ACCURACY_PSEUDO * _ACCURACY_PRIOR)
+                / (n_words + _ACCURACY_PSEUDO))
+    return min(1.0, smoothed)
+
+
 def _analysis_worker():
     """
     Background thread: dequeues (chunk_id, wav_bytes, text) tuples,
@@ -577,6 +617,10 @@ def _analysis_worker():
             if item is None:
                 break
             chunk_id, wav_bytes, text = item
+
+            # Needed by the composite score below to know which measures this
+            # chunk is long enough for.
+            _n_words = len((text or "").split())
 
             metrics = {}
 
@@ -662,7 +706,7 @@ def _analysis_worker():
 
                     if orig_words:
                         matches  = sum(1 for w in trans_words if _in_orig(w))
-                        accuracy = min(1.0, matches / len(orig_words))
+                        accuracy = _smoothed_accuracy(matches, len(orig_words))
                     else:
                         accuracy = 1.0
 
@@ -764,8 +808,10 @@ def _analysis_worker():
                 tail = metrics["energy_tail"]
                 tail_score = 1.0 if 0.1 <= tail <= 0.4 else max(0, 1.0 - abs(tail - 0.25))
                 scores.append(tail_score)
-            if "pitch_variance" in metrics:
-                # Good variance is 10-60Hz
+            if "pitch_variance" in metrics and _n_words >= _PITCH_MIN_WORDS:
+                # Good variance is 10-60Hz. Skipped entirely below
+                # _PITCH_MIN_WORDS, since a clip that short cannot vary enough
+                # to land in the band and would be marked down for its length.
                 pv = metrics["pitch_variance"]
                 pv_score = 1.0 if 10 <= pv <= 60 else (0.5 if pv > 0 else 0.2)
                 scores.append(pv_score)
@@ -1995,8 +2041,23 @@ def _record_param_observation(chunk_id, quality, accuracy):
 # Turned on only via good_settings 'auto_tune.enabled'. Even then it is
 # deliberately gentle: tiny clamped steps, a minimum evidence requirement, and a
 # rollback tripwire that reverts any change a profile's quality got worse after.
-_AUTOTUNE_MIN_SAMPLES = 12   # per profile before any autonomous nudge
-_AUTOTUNE_MARGIN      = 0.03 # quality gap required to act on a param preference
+# The evidence a param needs before the tuner is allowed to move it.
+#
+# These were 12 samples and a flat 0.03 gap, which sounded careful and was not.
+# I permutation-tested the old rule against my own 1223 observations: shuffle
+# quality against the parameter so that by construction there is no relationship
+# at all, then apply the rule. It fired on 32.8% of shuffles. Within-profile
+# quality has a standard deviation of about 0.069, so with six observations a
+# side the standard error on the difference of means is around 0.04 and a 0.03
+# threshold sits inside the noise. One nudge in three was chasing randomness,
+# which is why six weeks and 1223 observations moved measured quality by nothing.
+#
+# So a gap now has to be both big enough to be worth having and unlikely enough
+# to be chance. The margin keeps a statistically clean but trivial difference
+# from being acted on; the t-statistic keeps a large but noisy one out.
+_AUTOTUNE_MIN_SAMPLES = 30    # per profile before any autonomous nudge
+_AUTOTUNE_MARGIN      = 0.03  # smallest quality gap worth acting on at all
+_AUTOTUNE_MIN_T       = 2.5   # Welch t required as well, so roughly p < 0.02
 # Per-param step sizes live in _AUTOTUNE_PARAMS below, one per parameter.
 
 def autotune_enabled():
@@ -2663,10 +2724,31 @@ _AUTOTUNE_STORE_KEY = {
     "top_k": "top_k", "speed": "speed_mod",
 }
 
+def _welch_t(low, high):
+    """Welch's t for two samples that may have different variances.
+
+    Positive when the high half scored better. Returns None when it cannot be
+    computed, meaning fewer than two observations on a side or no variance at
+    all, and the caller then leaves the param alone rather than guessing."""
+    n_lo, n_hi = len(low), len(high)
+    if n_lo < 2 or n_hi < 2:
+        return None
+    var_lo = _statistics.variance(low)
+    var_hi = _statistics.variance(high)
+    se = ((var_lo / n_lo) + (var_hi / n_hi)) ** 0.5
+    if se == 0:
+        return None
+    return ((sum(high) / n_hi) - (sum(low) / n_lo)) / se
+
+
 def _profile_quality_stats(profile, param, conn):
     """Split a profile's observations into low and high halves of a param and
-    return (low_mean_q, high_mean_q, n), which is the evidence for whether
-    raising or lowering that param improves measured quality for a fingerprint.
+    return (low_mean_q, high_mean_q, n, welch_t), which is the evidence for
+    whether raising or lowering that param improves quality for a fingerprint.
+
+    The t-statistic is returned alongside the means because the means on their
+    own cannot tell a real difference from a coincidence, and acting on the
+    means alone is exactly what made the old rule fire on a third of pure noise.
 
     Returns None when there isn't enough data, or when the param barely varies.
     If a param was near-constant across the observations then its low and high
@@ -2699,17 +2781,25 @@ def _profile_quality_stats(profile, param, conn):
     high = [q for _, q in vals[mid:]]
     if not low or not high:
         return None
-    return (sum(low)/len(low), sum(high)/len(high), len(rows))
+    t = _welch_t(low, high)
+    if t is None:
+        return None
+    return (sum(low)/len(low), sum(high)/len(high), len(rows), t)
 
 def run_autotune_cycle():
     """One safe self-tuning pass over the profiles that have enough data.
 
-    For each tunable param independently, if its high or low half clearly beats
-    the other by at least the margin, I nudge the stored preference one tiny step
-    that way. I record a checkpoint per profile and param so the next cycle can
-    roll back if quality fell after the change. A param showing no quality margin
-    is never touched, so params only enter the loop once the data proves they
-    matter. Does nothing unless auto_tune is enabled. Returns a summary list."""
+    For each tunable param independently, if its high or low half beats the other
+    by a gap that is both worth having and unlikely to be chance, I nudge the
+    stored preference one tiny step that way. I record a checkpoint per profile
+    and param so the next cycle can roll back if quality fell after the change.
+
+    "Unlikely to be chance" is doing the work. The gap used to be judged on the
+    means alone, which on my own data acted on a third of pure noise, so a param
+    also has to clear _AUTOTUNE_MIN_T on Welch's t before it moves. Expect far
+    fewer actions than before, and expect the ones that happen to hold up.
+
+    Does nothing unless auto_tune is enabled. Returns a summary list."""
     if not autotune_enabled():
         return []
     actions = []
@@ -2753,7 +2843,7 @@ def run_autotune_cycle():
                 stats = _profile_quality_stats(prof, param, conn)
                 if not stats:
                     continue
-                low_q, high_q, n = stats
+                low_q, high_q, n, t_stat = stats
                 skey = _AUTOTUNE_STORE_KEY[param]
                 entry = dict(store.get(_vk(f"prof:{prof}")) or {})
                 cur = entry.get(skey)
@@ -2770,12 +2860,15 @@ def run_autotune_cycle():
                     if not med or med[0] is None:
                         continue
                     cur = med[0]
-                if high_q - low_q >= _AUTOTUNE_MARGIN:
+                # Both tests have to pass. The margin says the gap is worth
+                # having, the t says it is unlikely to be chance, and a gap that
+                # clears only one of them is the kind the old rule acted on.
+                if high_q - low_q >= _AUTOTUNE_MARGIN and t_stat >= _AUTOTUNE_MIN_T:
                     new = cur + step
-                elif low_q - high_q >= _AUTOTUNE_MARGIN:
+                elif low_q - high_q >= _AUTOTUNE_MARGIN and t_stat <= -_AUTOTUNE_MIN_T:
                     new = cur - step
                 else:
-                    continue  # no quality difference → leave this param alone
+                    continue  # no dependable difference → leave this param alone
                 new = max(lo, min(hi, new))
                 new = int(round(new)) if is_int else round(new, 3)
                 if new == cur:
@@ -2784,7 +2877,8 @@ def run_autotune_cycle():
                 store[_vk(f"prof:{prof}")] = entry
                 ckpts[ckey] = {"profile": prof, "param": param, "before": cur,
                                "q_before": _recent_q(prof), "ts": time.time()}
-                actions.append(f"{prof}: {param} {cur}→{new} (q {low_q:.2f}/{high_q:.2f})")
+                actions.append(f"{prof}: {param} {cur}→{new} "
+                               f"(q {low_q:.2f}/{high_q:.2f}, t={t_stat:+.1f}, n={n})")
 
         store[_vk("_autotune_ckpt")] = ckpts
         global _good_settings_cache

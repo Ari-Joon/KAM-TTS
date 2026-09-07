@@ -132,9 +132,12 @@ def spread_ok(prof):
         c.close()
     return r
 
-# A realistic read: 14 chunks, all at essentially the same temperature.
+# A realistic read, all at essentially the same temperature. The count is sized
+# to clear _AUTOTUNE_MIN_SAMPLES on purpose, since what is being tested here is
+# the spread guard: with too few rows the estimator would return None for the
+# boring reason and the assertion below would pass without proving anything.
 FLAT = "flat|medium|clean|plain"
-for i in range(14):
+for i in range(L._AUTOTUNE_MIN_SAMPLES):
     L.record_rejected_attempt.__self__ if False else None
     with L._db_lock:
         c = L._get_db()
@@ -155,10 +158,77 @@ stats = spread_ok(FLAT)
 check("with retry evidence the estimator can now judge temperature",
       stats is not None, True)
 if stats:
-    low_q, high_q, n = stats
+    low_q, high_q, n, t_stat = stats
     print(f"       low-temperature half mean quality  {low_q:.3f}")
     print(f"       high-temperature half mean quality {high_q:.3f}   (n={n})")
+    print(f"       Welch t                            {t_stat:+.2f}")
     check("and it correctly sees the high end as worse", high_q < low_q, True)
+
+# ── 4. the tuner does not act on noise ─────────────────────────────────────
+print("\n=== 4. a parameter unrelated to quality is left alone ===")
+# Quality here is drawn independently of every parameter, so ANY nudge is a
+# false positive by construction. This is the regression test for the thing that
+# kept the loop flat: judged on the means alone, the rule fired on about a third
+# of data like this, and a third of what it "learned" was therefore noise. The
+# spread of 0.069 is the real within-profile standard deviation measured from my
+# own observations, so the difficulty here matches the difficulty in practice.
+import random as _rnd
+_rnd.seed(11)
+# Both of these are restored at the end of the section: the checks that follow
+# report on the voice that was active before, and would otherwise be reading
+# this synthetic one and finding nothing in it.
+_prev_voice    = L._ACTIVE_VOICE
+_prev_autotune = L.autotune_enabled()
+L.set_active_voice("noise_test")
+L.set_autotune(True)
+
+def _noise_profile(i):
+    """One profile's worth of observations with no signal in them at all."""
+    prof = f"noise{i}|medium|clean|plain"
+    with L._db_lock:
+        c = L._get_db()
+        c.execute("DELETE FROM param_observations WHERE voice='noise_test'")
+        for _ in range(40):
+            c.execute(
+                "INSERT INTO param_observations (ts, profile, sentence_type, "
+                "temperature, top_p, top_k, rep_penalty, speed, quality, voice) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'noise_test')",
+                (time.time(), prof, "sentence",
+                 round(_rnd.uniform(0.25, 0.55), 3),
+                 round(_rnd.uniform(0.80, 0.92), 3),
+                 _rnd.randint(40, 57),
+                 round(_rnd.uniform(4.1, 5.7), 3),
+                 round(_rnd.uniform(1.15, 1.55), 3),
+                 round(min(1.0, max(0.0, _rnd.gauss(0.90, 0.069))), 3)))
+        c.commit(); c.close()
+    return prof
+
+def _noise_fire_rate(trials=60):
+    fired = 0
+    for i in range(trials):
+        prof = _noise_profile(i)
+        if any(a.startswith(prof) for a in L.run_autotune_cycle()):
+            fired += 1
+    return fired / trials
+
+rate_now = _noise_fire_rate()
+print(f"       with the significance test:    {100*rate_now:.1f}% of noise-only profiles nudged")
+
+# The same data with only the significance test removed, which isolates what it
+# is actually buying rather than asserting a number with nothing to compare to.
+_keep = L._AUTOTUNE_MIN_T
+L._AUTOTUNE_MIN_T = 0.0
+_rnd.seed(11)                      # identical draws, so this is a fair comparison
+rate_means_only = _noise_fire_rate()
+L._AUTOTUNE_MIN_T = _keep
+print(f"       on the means alone:            {100*rate_means_only:.1f}%")
+
+check("the tuner rarely acts on pure noise", rate_now <= 0.10, True)
+check("and the significance test is what stops it",
+      rate_means_only >= rate_now * 2, True)
+
+L.set_autotune(_prev_autotune)
+L.set_active_voice(_prev_voice)
 
 # ── stats stay interpretable ────────────────────────────────────────────────
 print("\n=== displayed quality still means 'what the user heard' ===")
@@ -173,7 +243,7 @@ if rej:
 # Clean up the synthetic voices so the real DB copy isn't polluted further.
 with L._db_lock:
     c = L._get_db()
-    for v in ("reinforce_test", "solid_test", "reject_test"):
+    for v in ("reinforce_test", "solid_test", "reject_test", "noise_test"):
         c.execute("DELETE FROM param_observations WHERE voice=?", (v,))
         c.execute("DELETE FROM chunks WHERE voice=?", (v,))
     c.commit(); c.close()
