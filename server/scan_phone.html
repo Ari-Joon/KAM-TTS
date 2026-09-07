@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>KAM TTS · Scan</title>
+<!--
+  The page the phone gets. Deliberately self-contained: no stylesheet, no script
+  and no image is fetched from anywhere, so the listener that serves it needs
+  exactly two routes and there is nothing else on that port to ask for.
+
+  It stays a camera. Straightening, cleaning up and reading the text all happen
+  on the computer, which has the power for it and is where the text is going
+  anyway, so nothing here has to be kept in step with the OCR.
+-->
+<style>
+  :root {
+    --bg:#101418; --card:#181f26; --line:#26313b; --ink:#e6edf3;
+    --dim:#8b9aa7; --accent:#3fb4c2; --ok:#55b98c; --err:#e37a70;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f5f7f8; --card:#fff; --line:#dde4e9; --ink:#141c22;
+            --dim:#5d6c78; --accent:#0d6e79; }
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    padding:env(safe-area-inset-top) 16px calc(96px + env(safe-area-inset-bottom));
+  }
+  header { padding:22px 0 14px; }
+  h1 { margin:0; font-size:1.25rem; letter-spacing:-.01em; }
+  .sub { color:var(--dim); font-size:.9rem; margin-top:4px; }
+  #status {
+    margin:14px 0; padding:11px 14px; border-radius:10px; font-size:.9rem;
+    background:var(--card); border:1px solid var(--line);
+  }
+  #status.ok  { border-color:var(--ok);  color:var(--ok); }
+  #status.err { border-color:var(--err); color:var(--err); }
+  .row { display:flex; gap:10px; }
+  button, label.btn {
+    flex:1; display:flex; align-items:center; justify-content:center; gap:8px;
+    padding:16px; font-size:1rem; font-weight:600; font-family:inherit;
+    border-radius:12px; border:1px solid var(--line); background:var(--card);
+    color:var(--ink); cursor:pointer;
+  }
+  button:active, label.btn:active { transform:scale(.985); }
+  button:disabled { opacity:.45; }
+  .primary { background:var(--accent); border-color:var(--accent); color:#04121a; }
+  input[type=file] { display:none; }
+  #shots { display:grid; grid-template-columns:repeat(auto-fill,minmax(96px,1fr)); gap:8px; margin-top:18px; }
+  .shot { position:relative; border-radius:10px; overflow:hidden; border:1px solid var(--line); aspect-ratio:3/4; }
+  .shot img { width:100%; height:100%; object-fit:cover; display:block; }
+  .shot .n {
+    position:absolute; left:5px; top:5px; background:rgba(0,0,0,.66); color:#fff;
+    font-size:.7rem; padding:1px 6px; border-radius:5px;
+  }
+  .shot .x {
+    position:absolute; right:4px; top:4px; width:26px; height:26px; border-radius:50%;
+    background:rgba(0,0,0,.66); color:#fff; border:0; font-size:1rem; padding:0;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .shot.sent { opacity:.4; }
+  .shot.sent::after {
+    content:"✓"; position:absolute; inset:0; display:flex; align-items:center;
+    justify-content:center; font-size:2rem; color:var(--ok);
+  }
+  #bar {
+    position:fixed; left:0; right:0; bottom:0; padding:12px 16px calc(12px + env(safe-area-inset-bottom));
+    background:var(--bg); border-top:1px solid var(--line);
+  }
+  #prog { height:3px; background:var(--line); border-radius:2px; overflow:hidden; margin-bottom:10px; display:none; }
+  #prog > i { display:block; height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .hint { color:var(--dim); font-size:.82rem; margin-top:16px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>KAM TTS · Scan</h1>
+  <div class="sub">Photograph a page. It goes to your computer, which reads the text off it.</div>
+</header>
+
+<div id="status">Checking the link…</div>
+
+<div class="row">
+  <label class="btn primary" for="cam">📷 Take photo</label>
+  <label class="btn" for="gal">🖼 Gallery</label>
+</div>
+<input id="cam" type="file" accept="image/*" capture="environment" multiple>
+<input id="gal" type="file" accept="image/*" multiple>
+
+<div id="shots"></div>
+
+<p class="hint">
+  Fill the frame with the page and keep it flat. Even light beats bright light: a
+  hard shadow across the middle costs more than a dim room does. Your computer
+  straightens and cleans the photo before reading it.
+</p>
+
+<div id="bar">
+  <div id="prog"><i></i></div>
+  <div class="row">
+    <button id="send" class="primary" disabled>Send to computer</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+// The session key arrives in the URL from the QR code. Kept in sessionStorage so
+// a reload or a trip to the camera app does not lose it, and never in
+// localStorage: it dies with the session anyway and should not outlive the tab.
+const KEY = (() => {
+  const u = new URL(location.href);
+  const k = u.searchParams.get("k");
+  if (k) { try { sessionStorage.setItem("kam-scan-key", k); } catch (e) {} return k; }
+  try { return sessionStorage.getItem("kam-scan-key") || ""; } catch (e) { return ""; }
+})();
+
+const $ = s => document.querySelector(s);
+const shots = [];              // { blob, url, sent }
+
+function say(msg, cls) {
+  const el = $("#status");
+  el.textContent = msg;
+  el.className = cls || "";
+}
+
+// A phone camera gives 8-12 megapixels, which is several megabytes of mostly
+// nothing useful: Tesseract wants roughly 300dpi on the text and no more. So the
+// long edge is capped before sending, which cuts a typical page to a few hundred
+// kilobytes without touching the legibility of the words.
+const MAX_EDGE = 2200;
+
+function prepare(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, MAX_EDGE / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width  = Math.max(1, Math.round(img.width  * scale));
+      c.height = Math.max(1, Math.round(img.height * scale));
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(img.src);
+      c.toBlob(b => b ? resolve(b) : reject(new Error("could not read that photo")),
+               "image/jpeg", 0.9);
+    };
+    img.onerror = () => { URL.revokeObjectURL(img.src); reject(new Error("could not open that photo")); };
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+function render() {
+  const box = $("#shots");
+  box.innerHTML = "";
+  shots.forEach((s, i) => {
+    const d = document.createElement("div");
+    d.className = "shot" + (s.sent ? " sent" : "");
+    const im = document.createElement("img"); im.src = s.url; im.alt = "page " + (i + 1);
+    const n  = document.createElement("span"); n.className = "n"; n.textContent = i + 1;
+    d.appendChild(im); d.appendChild(n);
+    if (!s.sent) {
+      const x = document.createElement("button");
+      x.className = "x"; x.textContent = "×"; x.setAttribute("aria-label", "Remove page " + (i + 1));
+      x.onclick = () => { URL.revokeObjectURL(s.url); shots.splice(i, 1); render(); };
+      d.appendChild(x);
+    }
+    box.appendChild(d);
+  });
+  const waiting = shots.filter(s => !s.sent).length;
+  $("#send").disabled = !waiting || !KEY;
+  $("#send").textContent = waiting
+    ? `Send ${waiting} page${waiting > 1 ? "s" : ""} to computer`
+    : "Send to computer";
+}
+
+async function add(files) {
+  if (!files || !files.length) return;
+  say(`Preparing ${files.length} photo${files.length > 1 ? "s" : ""}…`);
+  for (const f of files) {
+    try {
+      const blob = await prepare(f);
+      shots.push({ blob, url: URL.createObjectURL(blob), sent: false });
+    } catch (e) {
+      say(e.message, "err");
+    }
+  }
+  render();
+  say(`${shots.filter(s => !s.sent).length} page(s) ready to send`, "ok");
+}
+
+$("#cam").addEventListener("change", e => { add([...e.target.files]); e.target.value = ""; });
+$("#gal").addEventListener("change", e => { add([...e.target.files]); e.target.value = ""; });
+
+$("#send").addEventListener("click", async () => {
+  const todo = shots.filter(s => !s.sent);
+  if (!todo.length) return;
+  $("#send").disabled = true;
+  const prog = $("#prog");
+  prog.style.display = "block";
+  let done = 0;
+  for (const s of todo) {
+    say(`Sending ${done + 1} of ${todo.length}…`);
+    try {
+      const res = await fetch("/upload", {
+        method: "POST",
+        headers: { "Content-Type": "image/jpeg", "X-KAM-Scan": KEY },
+        body: s.blob,
+      });
+      if (!res.ok) {
+        const why = res.status === 403 ? "the computer no longer recognises this link"
+                  : res.status === 410 ? "the scan panel was closed on the computer"
+                  : res.status === 413 ? "that photo was too large"
+                  : `the computer said ${res.status}`;
+        say("Stopped: " + why + ". Reopen Scan on the computer and scan the code again.", "err");
+        break;
+      }
+      s.sent = true;
+    } catch (e) {
+      say("Lost the connection to the computer. Same wifi as the computer?", "err");
+      break;
+    }
+    done++;
+    prog.firstElementChild.style.width = Math.round(done / todo.length * 100) + "%";
+    render();
+  }
+  if (done === todo.length) {
+    say(`Sent ${done} page${done > 1 ? "s" : ""}. The computer is reading them now.`, "ok");
+  }
+  setTimeout(() => { prog.style.display = "none"; prog.firstElementChild.style.width = "0"; }, 700);
+  render();
+});
+
+if (!KEY) {
+  say("This link is missing its session key. Scan the QR code on your computer again.", "err");
+} else {
+  say("Linked to your computer. Take a photo of a page.", "ok");
+}
+render();
+</script>
+</body>
+</html>

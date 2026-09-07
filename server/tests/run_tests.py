@@ -40,6 +40,8 @@ SUITES = [
     ("audio",         "test_audio.py",        "gain staging and clipping"),
     ("feed",          "test_feed.mjs",        "dashboard live-feed pause"),
     ("markers",       "test_markers.mjs",     "page structure from walker to position hint"),
+    ("scan_host",     "test_scan_host.py",    "what the phone listener refuses"),
+    ("scan_text",     "test_scan_text.mjs",   "turning OCR output into speakable text"),
     ("recorder",      "test_recorder.mjs",    "WAV encoding and take trimming"),
     ("voiceclips",    "test_voiceclips.py",   "recording, transcripts, clip slots"),
 ]

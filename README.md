@@ -322,6 +322,38 @@ Six good clips make a solid voice, and 12 to 20 is the sweet spot. Press
 **Use this voice** when you are done, which rebuilds the speaker embedding
 without restarting the server.
 
+## Scanning a page with your phone
+
+Press **📷 Scan** in the dashboard and point your phone's camera at the code. The
+phone gets a page for taking photos; each one comes back here, gets straightened
+and read, and the text lands in **Custom Text** in the popup where you can edit
+it before it speaks.
+
+Tell it how many columns the page has before you scan. Tesseract can work columns
+out for itself until it gets it wrong, and when it does it interleaves them line
+by line into something that reads smoothly and means nothing, so the setting is
+explicit rather than guessed.
+
+It also strips what you would not want read aloud: page numbers, running heads,
+the superscript letters that mark footnotes, and verse numbers. Verse numbers are
+the awkward one, because "40" in a verse marker and "40" in a sentence are the
+same two characters. They are told apart by counting: markers run in sequence
+down a page and a quantity does not, so a number is only dropped when it is the
+one the sequence expects.
+
+**How the phone reaches the computer.** The server normally listens on
+`127.0.0.1` and nothing else, which is why a phone cannot see it. Opening a scan
+session starts a second listener on this machine's wifi address, and closing the
+panel stops it. That listener serves its own two routes and nothing more, so the
+rest of the API is not on the network even for as long as a session is open, and
+the phone is given a random per-session key rather than your API token. Sessions
+close themselves after twenty minutes. The photos are deleted once their text has
+been read; nothing is uploaded anywhere and the recogniser runs in the browser.
+
+Both devices need to be on the same wifi. If the computer is on a wired network
+the phone cannot reach it and the panel will say so rather than showing a code
+that will not work.
+
 ## Voice profiles
 
 Switching is instant once a voice's latents are cached, and **each voice learns
@@ -353,7 +385,12 @@ currently being spoken cannot be deleted until you switch away from it.
   Store extension works; the private key signs `.crx` builds and is not needed
   to run KAM.
 - The server binds to `127.0.0.1` only; CORS restricts callers to the extension
-  origin.
+  origin. The one exception is a scan session, which starts a second listener on
+  this machine's wifi address so a phone can reach it. That listener exists only
+  while the Scan panel has a session open, serves two routes and nothing else, is
+  a separate app from the main API rather than the same one behind a filter, and
+  takes a random per-session key that is not the API token. It closes itself
+  after twenty minutes. See **Scanning a page with your phone** above.
 - Override with the `KAM_TOKEN` or `KAM_EXTENSION_ID` environment variables for
   custom setups.
 

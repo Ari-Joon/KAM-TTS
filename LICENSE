@@ -12,6 +12,9 @@ furnished to do so, subject to the following conditions:
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
 
+NOTE: Bundled third-party libraries in extension/lib/ are under their own
+licences; see THIRD-PARTY-NOTICES.md.
+
 NOTE: This licence covers the KAM TTS source code only. The XTTS-v2 model
 weights are licensed separately (Coqui Public Model License — non-commercial);
 verify the licence of the exact weights you download before any commercial use.

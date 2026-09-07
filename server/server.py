@@ -172,6 +172,7 @@ import pos_prosody as _pos_prosody  # POS-informed prosody (NLP layer)
 import device as _device            # cross-platform backend selection
 import audio_quality as _aq         # reference-clip gate + output validation
 import benchmark as _bench          # shared, streamable speed measurement
+import scan_host as _scan           # the short-lived LAN listener a phone can reach
 from flask_cors import CORS  # type: ignore
 print("[BOOT] importing TTS + torch (this is the slow one)…", flush=True)
 # Speed up the transformers import: skip the optional integrations and the
@@ -4852,6 +4853,51 @@ def voice_passages():
     return jsonify({"passages": [
         {"n": i + 1, "title": t, "text": x} for i, (t, x) in enumerate(VOICE_PASSAGES)
     ]})
+
+
+# =============================================================================
+# PHONE SCANNING
+# =============================================================================
+#
+# Every route here is on the loopback API, so it is the dashboard talking, not
+# the phone. The phone gets its own listener on its own port with two routes and
+# nothing else, which lives in scan_host.py and only exists while a session is
+# open. Nothing below is reachable from the network.
+
+@app.route("/scan/open", methods=["POST"])
+def scan_open():
+    """Open a scan session and start the listener the phone can reach."""
+    res = _scan.open_session()
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+
+@app.route("/scan/close", methods=["POST"])
+def scan_close():
+    """Close the session, stop the listener, and delete the photos."""
+    return jsonify(_scan.close_session())
+
+
+@app.route("/scan/status", methods=["GET"])
+def scan_status():
+    """Polled by the dashboard: open or not, the pairing code, pages so far."""
+    return jsonify(_scan.session_status())
+
+
+@app.route("/scan/page/<int:index>", methods=["GET"])
+def scan_page(index):
+    """One received photo, for the dashboard to run OCR over in the browser."""
+    data = _scan.read_page(index)
+    if data is None:
+        return jsonify({"ok": False, "error": "no such page"}), 404
+    return send_file(io.BytesIO(data), mimetype="image/jpeg", as_attachment=False)
+
+
+@app.route("/scan/page/<int:index>/done", methods=["POST"])
+def scan_page_done(index):
+    """Forget a photo once its text has been read off it, since the text is the
+    point and the photo is not worth keeping around after that."""
+    res = _scan.drop_page(index)
+    return jsonify(res), (200 if res.get("ok") else 404)
 
 
 @app.route("/standby", methods=["GET"])

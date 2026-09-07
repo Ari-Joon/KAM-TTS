@@ -571,6 +571,30 @@ function setMode(mode) {
     document.getElementById(`tab-${m}`).classList.toggle("active", m === mode);
   });
   document.getElementById("custom-text-area").style.display = mode === "custom" ? "block" : "none";
+  if (mode === "custom") loadScannedText();
+}
+
+// Text read off a photo in the dashboard's Scan panel is handed over through
+// storage rather than spoken from there, so it arrives here to be read over and
+// edited before it is played, the same as anything typed in.
+//
+// It only fills an empty box, since quietly overwriting something half-typed
+// would be worse than making you press the tab again, and it is cleared once
+// taken so the same page does not reappear on the next visit.
+function loadScannedText() {
+  const box = document.getElementById("custom-input");
+  if (!box || box.value.trim()) return;
+  try {
+    chrome.storage.local.get("kamScanText", d => {
+      if (chrome.runtime.lastError) return;
+      const text = d && d.kamScanText;
+      if (!text) return;
+      box.value = text;
+      chrome.storage.local.remove("kamScanText");
+      const info = document.getElementById("status-step");
+      if (info) { info.style.display = "block"; info.textContent = "Scanned text loaded"; }
+    });
+  } catch (e) { /* storage unavailable — the box just stays empty */ }
 }
 
 function updateSpeed(val, skipPost) {

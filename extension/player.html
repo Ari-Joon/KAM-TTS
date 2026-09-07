@@ -960,6 +960,54 @@
       <div id="voice-status" style="font-size:9px;color:var(--dim);margin-top:6px"></div>
     </div>
   </div>
+  <!-- Scan a page with the phone. The listener the phone reaches only exists
+       while this panel has a session open; closing it takes the port down. -->
+  <div id="scan-wrap" style="position:relative;display:inline-block;margin-left:8px">
+    <button id="scan-pill" title="Read a page from a photo taken on your phone"
+      style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;color:var(--subtext);cursor:pointer;font-family:var(--font);font-size:10px;padding:3px 10px">📷 Scan ▾</button>
+    <div id="scan-panel" style="display:none;position:absolute;top:26px;left:0;z-index:50;width:330px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.5);padding:10px">
+      <div style="font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Scan from phone</div>
+
+      <div id="scan-pair" style="display:none">
+        <div style="display:flex;gap:10px;align-items:flex-start">
+          <div id="scan-qr" style="background:#fff;padding:6px;border-radius:6px;line-height:0;flex-shrink:0"></div>
+          <div style="min-width:0;flex:1">
+            <div style="font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px">Or type this in</div>
+            <div id="scan-url" style="font-family:var(--mono,monospace);font-size:10px;color:var(--text);word-break:break-all;margin-top:3px;user-select:all"></div>
+            <div id="scan-expiry" style="font-size:9px;color:var(--dim);margin-top:6px"></div>
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--subtext);margin-top:8px;line-height:1.5">
+          Point your phone's camera at the code. The phone must be on the same
+          wifi as this computer.
+        </div>
+      </div>
+
+      <div style="display:flex;gap:6px;align-items:center;margin-top:8px">
+        <button id="scan-start" style="flex:1;background:var(--indigo);border:1px solid var(--indigo);color:#000;font-weight:600;border-radius:5px;padding:6px;cursor:pointer;font-family:var(--font);font-size:10px">📷 Open a session</button>
+        <button id="scan-stop" style="display:none;flex:1;background:transparent;border:1px solid var(--border);color:var(--subtext);border-radius:5px;padding:6px;cursor:pointer;font-family:var(--font);font-size:10px">Close session</button>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;font-size:10px;color:var(--subtext)">
+        <span>Columns on the page</span>
+        <select id="scan-cols" style="background:var(--bg3);border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:var(--font);font-size:10px;padding:2px 4px">
+          <option value="1">1</option>
+          <option value="2">2</option>
+        </select>
+        <span id="scan-cols-hint" style="color:var(--dim);font-size:9px">a Bible page is usually 2</span>
+      </div>
+
+      <div id="scan-status" style="font-size:9px;color:var(--dim);margin-top:8px;min-height:12px"></div>
+
+      <textarea id="scan-text" placeholder="Text read off your photos appears here. Edit it before speaking if the recogniser slipped."
+        style="display:none;width:100%;height:120px;margin-top:8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--text);font-family:var(--font);font-size:11px;padding:6px;resize:vertical"></textarea>
+
+      <div id="scan-actions" style="display:none;gap:6px;margin-top:6px">
+        <button id="scan-send" style="flex:1;background:var(--indigo);border:1px solid var(--indigo);color:#000;font-weight:600;border-radius:5px;padding:6px;cursor:pointer;font-family:var(--font);font-size:10px">Send to Custom Text</button>
+        <button id="scan-clear" style="background:transparent;border:1px solid var(--border);color:var(--subtext);border-radius:5px;padding:6px 10px;cursor:pointer;font-family:var(--font);font-size:10px">Clear</button>
+      </div>
+    </div>
+  </div>
   <button id="rec-open" type="button" title="Record voice clips"
     style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;color:var(--subtext);cursor:pointer;font-family:var(--font);font-size:10px;margin-left:6px;padding:3px 10px">● Record</button>
   <div id="topbar-right">
@@ -1833,6 +1881,14 @@
 <script src="recorder.js"></script>
 <script src="recorder-ui.js"></script>
 <script src="dashboard.js"></script>
+<!-- Scanning: the QR generator and the image maths are vendored in lib/ and
+     scan-core.js, so nothing here reaches a CDN. Tesseract itself is loaded on
+     demand by ocr.js, since it is nine megabytes and most sessions never scan. -->
+<script src="lib/qrcode.min.js"></script>
+<script src="scan-core.js"></script>
+<script src="scan-text.js"></script>
+<script src="ocr.js"></script>
+<script src="scan-ui.js"></script>
 
 </body>
 </html>
