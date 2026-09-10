@@ -744,26 +744,21 @@ async function speak() {
 // =============================================================================
 // ADAPTIVE CHUNKING
 //
-// Philosophy:
-//   Every chunk should be a natural spoken unit, so consistent in length,
-//   coherent in context, and matched to how that content type is actually
-//   spoken aloud. The system has four layers:
+// Every chunk should be a natural spoken unit: consistent in length, coherent,
+// and never cut mid-phrase. Two things do that work.
 //
-//   1. Segment classification. classifySegment() reads each |BREAK| segment and
-//      works out its type: narrative, technical, list, heading or callout.
-//      This drives all downstream packing decisions.
+//   1. One sentence per chunk. Text is split on block boundaries, then into
+//      sentences, and each sentence is its own chunk, so N sentences always give
+//      N chunks and nothing is ever packed across a sentence end.
 //
-//   2. Content-aware targets. targetFor() returns the ideal chunk length for a
-//      piece of text based on what's in it, so questions, emphasis,
-//      definitions, list items). Pre-compiled regexes, no repeated construction.
+//   2. The safety net. A sentence over the cap is split on clause boundaries,
+//      and anything still too long is hard-split at a word. Undersized pieces are
+//      glued to a neighbour rather than dropped or spoken alone.
 //
-//   3. The greedy packer, which groups sentences into chunks while respecting
-//      the targets and the segment type. Narrative prose packs aggressively and
-//      technical content
-//      stays tighter; list items never merge across items.
-//
-//   4. The safety net, where oversized chunks split on clause boundaries and
-//      anything still too long gets hard-split at word boundaries.
+// An earlier design had two more layers in front of these, a segment classifier
+// and a content-aware target length, and this comment described all four. They
+// were never called, so they and the regexes only they read are gone; the
+// comment now describes the code that runs.
 // =============================================================================
 
 const TARGET_CHARS = 90;    // target chunk length — keeps XTTS inference fast
@@ -776,89 +771,10 @@ const MIN_CHARS    = 6;     // discard anything shorter
 
 const _RX_QUESTION    = /[?]/;
 const _RX_EMPHASIS    = /[|](BOLD|ITALIC)[|]/;
-const _RX_COLON       = /:\s*\S/;
 const _RX_EXCLAIM_END = /[!]$/;
-const _RX_MAIN_VERB   = /\b(is|are|was|were|has|have|will|can|should|does|did|provides|allows|enables|supports|requires|returns|creates|defines|makes|gives|takes|uses|runs|works|helps|lets|gets|sets|puts|adds|removes|handles|manages|controls|builds|shows|displays|describes|explains|represents|refers|means|indicates)\b/i;
-const _RX_LETTERS     = /[a-zA-Z]/;
 const _RX_WHITESPACE  = /\s+/;
 
-// Transition words, since these sentences should attach to what follows them
-const _RX_TRANSITION  = /^(however|therefore|furthermore|additionally|consequently|nevertheless|in addition|in contrast|on the other hand|as a result|for example|for instance|in other words|that is|specifically|notably|importantly|finally|first|second|third|next|then|lastly|in summary|to summarise|to conclude)\b/i;
 
-// List item starters, which signal an enumeration context
-const _RX_LIST_START  = /^(\d+[.)]\s|\*\s|[-•]\s|[a-z][.)]\s)/;
-
-// Heading-like patterns, so short, title-cased and with no verb
-const _RX_HEADING_EXCL = /\b(is|are|was|were|has|have|will|can|could|should|do|does|did|what|when|where|which|who|why|how)\b/i;
-
-
-// ---------------------------------------------------------------------------
-// Segment classifier
-// ---------------------------------------------------------------------------
-// Reads the opening of a |BREAK| segment and classifies its intent.
-// Called once per segment, and it drives the packing strategy for that segment.
-//
-// The types are:
-//   'heading'    short title-like text with no main verb
-//   'list'       a segment holding several short itemised sentences
-//   'callout'    a note, warning or tip block
-//   'technical'  contains code markers, abbreviations or definitions
-//   'narrative'  flowing prose where the sentences build on each other
-//   'default'    the fallback
-
-function classifySegment(seg) {
-  const words = seg.trim().split(_RX_WHITESPACE);
-  const hasSentenceBreak = /[.!?]\s+[A-Z]/.test(seg);
-  const hasAbbrev        = /\b[A-Z]{2,}\b/.test(seg);
-
-  // Heading: whole segment short, no internal sentence breaks, no abbreviations
-  if (words.length <= 10 && !hasSentenceBreak && !hasAbbrev &&
-      !_RX_HEADING_EXCL.test(seg.substring(0, 60))) {
-    const cap = words.filter(w => w && w[0] === w[0].toUpperCase() && w[0] !== w[0].toLowerCase()).length;
-    if (words.length > 0 && cap / words.length >= 0.55) return 'heading';
-  }
-
-  // Callout
-  if (/^\s*(note|warning|tip|important|caution|example|info|danger|hint)\b/i.test(seg))
-    return 'callout';
-
-  // List: multiple sentences, mostly short and verbless
-  const sentences = seg.split(/[.!?]+\s+/).filter(s => s.trim());
-  if (sentences.length >= 2) {
-    const shortCount  = sentences.filter(s => s.split(_RX_WHITESPACE).length <= 12).length;
-    const verblessCnt = sentences.filter(s => !_RX_MAIN_VERB.test(s)).length;
-    if (shortCount  / sentences.length >= 0.7 &&
-        verblessCnt / sentences.length >= 0.5) return 'list';
-  }
-
-  // Technical: emphasis markers or abbreviation + definition pattern
-  if (_RX_EMPHASIS.test(seg) || /[|]CODE[|]/.test(seg)) return 'technical';
-  if (hasAbbrev && _RX_COLON.test(seg))                  return 'technical';
-
-  // Narrative is flowing prose, so 6 or more words a sentence across several
-  if (sentences.length >= 2 && words.length / sentences.length >= 6)
-    return 'narrative';
-
-  return 'default';
-}
-
-
-
-// ---------------------------------------------------------------------------
-// Content-aware target sizing
-// ---------------------------------------------------------------------------
-
-function targetFor(text) {
-  if (_RX_QUESTION.test(text))   return MAX_CHARS;  // never split questions
-  if (_RX_EMPHASIS.test(text))   return MAX_CHARS;  // keep emphasis whole
-  if (_RX_COLON.test(text))      return TARGET_CHARS; // definitions need context
-
-  const wordCount = text.trim().split(_RX_WHITESPACE).length;
-  if (wordCount <= 12 && !_RX_MAIN_VERB.test(text)) return 85; // list item
-  if (_RX_EXCLAIM_END.test(text.trim()))              return 90; // exclamation
-
-  return TARGET_CHARS;
-}
 
 
 // ---------------------------------------------------------------------------

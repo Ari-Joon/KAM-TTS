@@ -304,7 +304,9 @@ def register(ext_id, python_exe=None):
             json.dump(json.load(open(MANIFEST_PATH)), f, indent=2)
         print(f"[OK] Registered for extension {ext_id}")
         print(f"     Manifest: {target}")
-    print("Restart Chrome, then use the power button in the KAM TTS dashboard.")
+    # No restart: Chrome reads the registry value and the manifest afresh on
+    # every connectNative, so the next press of the button picks this up.
+    print("Done. Press the power button in the KAM TTS popup or dashboard.")
     return True
 
 
