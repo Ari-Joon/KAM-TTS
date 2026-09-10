@@ -35,6 +35,7 @@ SUITES = [
     ("startup",       "test_startup.py",      "startup across CUDA/ROCm/MPS/XPU/CPU"),
     ("reinforcement", "test_reinforcement.py","what the learning loop reinforces"),
     ("extension_id",  "test_extension_id.py", "which extension origin the server trusts"),
+    ("register_host", "test_register_host.py","the compiled native-host launcher"),
     ("facets",        "test_facets.py",       "content-facet labelling accuracy"),
     ("maths",         "test_maths.py",        "LaTeX, unicode maths, list markers"),
     ("audio",         "test_audio.py",        "gain staging and clipping"),

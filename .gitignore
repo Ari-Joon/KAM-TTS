@@ -10,6 +10,10 @@ kam_token.txt
 com.kam.tts.json
 com_kam_tts.json
 kam_host.bat
+# The launcher Chrome actually runs, compiled per install by register_host.py
+# from the .cs beside it, which is kept so anyone can read what was built.
+kam_host.exe
+kam_host_launcher.cs
 
 # Measured per machine by hardware_profile.py, or auto-detected on first boot.
 hardware_profile.json

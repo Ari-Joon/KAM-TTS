@@ -186,6 +186,14 @@ leaves torch unpinned for this reason. KAM adapts to whichever you installed.
    ```
    Only the dashboard power button depends on this. Without it everything else
    still works, you just start the server yourself with `python server.py`.
+
+   On Windows this compiles a small `kam_host.exe` launcher using the C#
+   compiler that ships with every Windows install, and pings it before
+   registering anything. It has to be an executable: Chrome 113 and later
+   invoke native hosts directly rather than through `cmd.exe`, and a `.bat`
+   fails with "Specified native messaging host not found". Run it with the
+   same Python you installed the requirements into, since that interpreter is
+   baked into the launcher.
 </details>
 
 Then **load the extension**: `chrome://extensions` → Developer mode → Load
@@ -421,6 +429,15 @@ key in `manifest.json`, but it will if you edited or removed that key. The
 server prints which origin it trusts on every boot, so compare the first few
 console lines against the ID at `chrome://extensions`. If they differ, run
 `python register_host.py <YOUR_EXTENSION_ID>` and restart the server.
+
+**The power button says "Specified native messaging host not found".** Chrome
+could not use the launcher it was pointed at. The common causes, in order: the
+project folder moved since registration, so the paths in `com.kam.tts.json`
+and `kam_host.exe` are stale; the launcher is a `.bat` from an older version,
+which Chrome 113 and later refuse; or `register_host.py` was never run on this
+machine. All three have the same fix: run `python register_host.py` again with
+the Python you use for the server, then press the button again. No Chrome
+restart is needed, since Chrome re-reads the manifest each time it connects.
 
 **It says "No GPU in use" but I have one.** The console prints which backends it
 found and why one was rejected. Usually it's a PyTorch build that doesn't match
