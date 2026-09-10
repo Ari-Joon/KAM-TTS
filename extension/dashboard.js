@@ -34,6 +34,12 @@ let _feedSelectMode = false;  // live-feed mass-select mode
 let _chunkCount    = 0;
 let _aiLastCount   = -1;   // tracks chunk count to auto-refresh AI feed on change
 let _aiPollTick    = 0;    // periodic AI refresh so async analysis appears live
+// A fingerprint of what the AI panel last drew. The panel rebuilds two blocks
+// of innerHTML, one of them up to two hundred rows, and the poll called it
+// every six seconds whether or not a single value had changed. Rebuilding that
+// much markup on a timer is what made the dashboard feel heavy, so a polled
+// refresh that would draw the same thing now stops before touching the DOM.
+let _aiLastSig     = '';
 let _logLines      = [];
 let _lastLoggedRaw = null;   // suppress consecutive duplicate console lines
 let _logSince      = 0;
@@ -235,6 +241,10 @@ function clearConsole() {
   // Also reset stats DB so the stats page starts from zero
   api('/report/stats/reset','POST').then(()=>{
     _chunkCount=0; _allChunks=[];
+    // The AI panel's fingerprint describes markup that has just been thrown
+    // away, so it is forgotten too rather than left to decide that a redraw is
+    // unnecessary.
+    _aiLastSig='';
     const ctr=document.getElementById('chunk-counter'); if(ctr) ctr.textContent='0 chunks';
     const cb=document.getElementById('chunks-body'); if(cb) cb.innerHTML='';
     const bb=document.getElementById('browser-body'); if(bb) bb.innerHTML='';
@@ -1142,6 +1152,19 @@ function refreshAI(silent) {
     const baseline   =stats.baseline||{};
     const c          =stats.chunks||{};
 
+    // A polled refresh that would draw exactly what is already on screen stops
+    // here. Only the fields that actually reach the markup go into the
+    // fingerprint, so a chunk whose analysis landed still redraws, while an
+    // idle panel costs one comparison instead of two hundred rows of layout.
+    // A manual refresh always redraws, since pressing the button and seeing
+    // nothing happen is worse than the work.
+    const sig = JSON.stringify([
+      (rules || []).length, c, baseline,
+      flagged.map(r => [r.chunk_id, r.quality_score, r.quality_flags, r.user_feedback]),
+    ]);
+    if (silent && sig === _aiLastSig) return;
+    _aiLastSig = sig;
+
     // Group flags
     const flagCounts={};
     flagged.forEach(ch=>{
@@ -1217,6 +1240,11 @@ function refreshAI(silent) {
   }).catch((err)=>{
     const el=document.getElementById('ai-body');
     if(el) el.innerHTML=`<div class="ai-empty" style="color:var(--red)">Load error: ${err.message||'unknown'}</div>`;
+    // The panel is now showing an error rather than the data the fingerprint
+    // describes, so forget it. Otherwise the next poll returning the same data
+    // as before the failure would match, skip the redraw, and leave the error
+    // on screen for as long as nothing happened to change.
+    _aiLastSig = '';
   });
 }
 
