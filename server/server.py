@@ -1316,6 +1316,19 @@ def _run_startup():
     global _model_state, _last_synth_ts
     _load_idle_timeout()
     _restore_active_voice()
+
+    # The power button depends on a registration that holds absolute paths, and
+    # absolute paths do not follow a folder that gets moved or renamed. The
+    # server is the one thing that always knows where it lives and which
+    # interpreter it is running under, so it corrects the registration here
+    # rather than leaving a dead button and an instruction to run a script.
+    # Cheap when nothing has changed, and never fatal: a broken button must not
+    # stop the server from serving.
+    try:
+        import register_host as _reg
+        _reg.ensure_registered(python_exe=sys.executable)
+    except Exception as _e:
+        print(f"[HOST] Registration check skipped ({_e}).")
     try:
         global _ANALYSIS_EVERY
         _ANALYSIS_EVERY = int(_learner.get_setting("analysis_every", 1))

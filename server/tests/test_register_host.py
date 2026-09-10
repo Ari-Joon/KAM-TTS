@@ -1,17 +1,21 @@
-"""The native-host launcher: what gets built, that it relays, and what remove()
-takes with it.
+"""The native-host registration: what it installs, and that it repairs itself.
 
-This exists because of a bug that hid for three weeks. After the folder moved I
-re-registered the host, every file and registry key checked out, and Chrome
-still said "Specified native messaging host not found". The cause was Chrome
-itself: from 113 it invokes native hosts as executables directly rather than via
-cmd.exe, so the .bat that had always worked was being refused at the manifest
-level. The fix is a compiled launcher, and the point of these tests is that the
-launcher is proven to relay the protocol rather than assumed to.
+This suite exists because of a bug that took an afternoon and had three layers.
+Chrome 113 and later refuse a .bat native host, so the launcher has to be a real
+executable. .NET's Process class then cannot hand that executable's pipes to
+Python, so the launcher has to call CreateProcess itself. And the registration
+holds absolute paths, so moving the project silently killed the power button
+with everything still looking correct from outside.
 
-Nothing here touches the real registration. The registry write is never called,
-the registry delete is stubbed to the "no key" path, and every generated file
-goes to a temp directory.
+The important test here is the self-test: a launcher that builds but cannot
+relay a message is worse than one that fails to build, since the failure only
+appears later as a button that does nothing. The version of that check which
+sent a single ping passed against a launcher that was completely broken, because
+the reply arrived at shutdown rather than live, so this insists on an answer
+while the pipe is still open.
+
+Nothing here touches the real registration: the install directory is redirected
+to a temp folder and the registry is never written.
 """
 import os
 import pathlib
@@ -37,88 +41,92 @@ def check(label, got, want):
 
 
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="kam_register_test_"))
-# Point every generated artefact at the temp directory, so a test run can never
-# overwrite the launcher a real registration depends on.
-R.LAUNCHER_EXE  = str(TMP / "kam_host.exe")
-R.LAUNCHER_SRC  = str(TMP / "kam_host_launcher.cs")
-R.LAUNCHER_BAT  = str(TMP / "kam_host.bat")
-R.MANIFEST_PATH = str(TMP / "com.kam.tts.json")
+R.install_dir = lambda: str(TMP)          # everything generated lands here
 
-print("\n=== quoting a path into C# ===")
-check("a plain path is a verbatim string", R._cs_verbatim(r"C:\x\y.exe"), r'@"C:\x\y.exe"')
-check("backslashes are left alone, which is what verbatim means",
-      "\\\\" in R._cs_verbatim(r"C:\a\b"), False)
-check("a quote is doubled, the only escape verbatim strings have",
-      R._cs_verbatim('C:\\odd"name'), '@"C:\\odd""name"')
+print("\n=== the install location is outside the project, on purpose ===")
+# The whole bug was that a registration holding absolute paths does not follow a
+# folder you move. Keeping the launcher out of the project is half the fix.
+real_dir = pathlib.Path(os.environ.get("LOCALAPPDATA", "~")) / "KAMTTS"
+check("it lives under LOCALAPPDATA", "KAMTTS" in str(real_dir), True)
+check("and not inside the project",
+      str(SERVER_DIR).lower() in str(real_dir).lower(), False)
+check("with no spaces to quote wrongly", " " in real_dir.name, False)
 
-print("\n=== the generated launcher source ===")
-src = R._launcher_source(r"C:\py\python.exe")
-check("bakes in the interpreter",  r'@"C:\py\python.exe"' in src, True)
-check("bakes in the host script",  R._cs_verbatim(R.HOST_SCRIPT) in src, True)
-check("relays rather than inherits", "RedirectStandardInput = true" in src
-      and "RedirectStandardOutput = true" in src, True)
-check("passes the interpreter on to the host",
-      'EnvironmentVariables["KAM_PYTHON"]' in src, True)
-check("never shows a window", "CreateNoWindow = true" in src, True)
+print("\n=== the config the launcher reads at run time ===")
+R.write_config(r"C:\py\python.exe", r"C:\proj\kam_host.py")
+cfg = R.read_config()
+check("interpreter round-trips", cfg["python"], r"C:\py\python.exe")
+check("host script round-trips",  cfg["host"],   r"C:\proj\kam_host.py")
+raw = open(R.config_path(), encoding="utf-8").read()
+check("comments are ignored, not parsed as keys", "#" in raw and "python" in cfg, True)
+# A path with spaces has to survive, since most people's projects have one.
+R.write_config(r"C:\Program Files\Py\python.exe", r"C:\My Project\kam_host.py")
+check("a path with spaces survives", R.read_config()["host"], r"C:\My Project\kam_host.py")
 
-print("\n=== the .bat fallback ===")
-# The old writer opened the file in text mode and wrote \r\n by hand, so every
-# line ended \r\r\n. cmd tolerated it, which is why nobody noticed.
-bat = R._write_launcher_bat(r"C:\py\python.exe")
-raw = open(bat, "rb").read()
-check("ends lines with exactly CRLF", b"\r\r\n" in raw, False)
-check("and has CRLF at all",         b"\r\n" in raw, True)
-check("runs the host with the chosen interpreter",
-      b'"C:\\py\\python.exe" "' in raw and b"kam_host.py" in raw, True)
+print("\n=== the generated launcher hardcodes nothing about the project ===")
+src = R._launcher_source()
+check("no interpreter baked in",  "python.exe" in src, False)
+check("no project path baked in", "kam_host.py\"" in src, False)
+check("it reads its own config",  "kam_host.cfg" in src, True)
+# The two things .NET's Process class cannot do, which is why this is P/Invoke.
+check("it calls CreateProcess itself", "CreateProcess" in src, True)
+check("with handle inheritance",       "bInheritHandles" in src or "inherit," in src, True)
+check("and marks the pipes inheritable", "SetHandleInformation" in src, True)
+check("passing our own std handles",    "STARTF_USESTDHANDLES" in src, True)
 
-print("\n=== finding the compiler ===")
-csc = R._find_csc()
-check("returns an existing file or None",
-      csc is None or os.path.exists(csc), True)
-if os.name == "nt":
-    check("on Windows the framework compiler is there", csc is not None, True)
-
-print("\n=== a launcher that fails its self-test is never registered ===")
-_real = R._write_launcher_windows
-R._write_launcher_windows = lambda python_exe=None: None
-try:
-    if os.name == "nt":
-        ok = R.register(R.PINNED_EXTENSION_ID)
-        check("register() reports failure", ok, False)
-        check("and writes no manifest", os.path.exists(R.MANIFEST_PATH), False)
-    else:
-        print("  (skipped: the launcher path is Windows-only)")
-finally:
-    R._write_launcher_windows = _real
-
-print("\n=== the real thing: build it and make it answer ===")
-# The one test that matters. It bakes in the Python running this suite, since
-# kam_host.py needs only the standard library to answer a ping, then sends the
-# framed ping Chrome would send and expects the framed pong back. On a machine
-# with no compiler it is skipped rather than faked.
-if os.name == "nt" and csc:
-    exe = R._write_launcher_windows(sys.executable)
-    check("the launcher is an .exe, not a .bat", bool(exe) and exe.endswith(".exe"), True)
-    check("built where it was told to",          exe, R.LAUNCHER_EXE)
-    check("the source is kept beside it",        os.path.exists(R.LAUNCHER_SRC), True)
-    check("it relays a framed ping to the host and back",
-          R._self_test(exe) if exe else False, True)
+print("\n=== build it and make it answer a live message ===")
+if os.name == "nt" and R._find_csc():
+    # Point the config at this interpreter: kam_host.py needs only the standard
+    # library to answer status and ping.
+    R.write_config(sys.executable, str(SERVER_DIR / "kam_host.py"))
+    exe = R.build_launcher()
+    check("the launcher builds", bool(exe) and exe.endswith(".exe"), True)
+    check("it answers two messages while the pipe is open", R.self_test(exe), True)
     import struct
     d = open(exe, "rb").read()
     pe = struct.unpack_from("<I", d, 0x3C)[0]
-    check("it is a console-subsystem exe, so it has standard handles to relay",
+    check("it is a console exe, so it has std handles to pass on",
           struct.unpack_from("<H", d, pe + 24 + 68)[0], 3)
+
+    print("\n=== a launcher whose config points nowhere fails, and says so ===")
+    R.write_config(r"C:\nope\python.exe", str(SERVER_DIR / "kam_host.py"))
+    check("a missing interpreter is caught by the self-test", R.self_test(exe, timeout=6), False)
+    log = pathlib.Path(R.launcher_log())
+    check("and the launcher wrote down why",
+          log.exists() and "missing" in log.read_text(encoding="utf-8", errors="replace").lower(), True)
 else:
     print("  (skipped: needs Windows and the .NET Framework compiler)")
 
-print("\n=== remove() takes every generated piece with it ===")
-for p in (R.LAUNCHER_EXE, R.LAUNCHER_SRC, R.LAUNCHER_BAT, R.MANIFEST_PATH):
-    pathlib.Path(p).write_bytes(b"x")
+print("\n=== moving the project only rewrites the config ===")
+# The point of the whole redesign: a move must not need a recompile, and must
+# not need the user to know that register_host.py exists.
+if os.name == "nt" and pathlib.Path(R.launcher_path()).exists():
+    before = pathlib.Path(R.launcher_path()).read_bytes()
+    R.write_config(sys.executable, r"D:\somewhere\else\kam_host.py")
+    after = pathlib.Path(R.launcher_path()).read_bytes()
+    check("the launcher binary is untouched by a move", before == after, True)
+    check("but the config now points at the new place",
+          R.read_config()["host"], r"D:\somewhere\else\kam_host.py")
+
+print("\n=== ensure_registered() never raises, whatever it finds ===")
+# server.py calls this on every boot. A broken power button must never stop the
+# server from serving, so this returns a verdict instead of throwing.
+for label, prep in (("with a good config", lambda: R.write_config(sys.executable, str(SERVER_DIR / "kam_host.py"))),
+                    ("with no config at all", lambda: os.path.exists(R.config_path()) and os.remove(R.config_path()))):
+    prep()
+    try:
+        R.ensure_registered(python_exe=sys.executable, verbose=False)
+        check(f"survives {label}", True, True)
+    except Exception as e:
+        check(f"survives {label}", f"raised {e!r}", True)
+
+print("\n=== remove() takes every generated piece ===")
+R.write_config(sys.executable, str(SERVER_DIR / "kam_host.py"))
+R.write_manifest(R.PINNED_EXTENSION_ID, R.launcher_path())
 if os.name == "nt":
     import winreg
     _del = winreg.DeleteKey
-    # The real key must survive this suite, so the delete is routed to the
-    # "nothing there" branch rather than allowed to run.
+    # Routed to the "nothing there" branch so the real key survives this suite.
     winreg.DeleteKey = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError())
     try:
         R.remove(R.PINNED_EXTENSION_ID)
@@ -126,9 +134,9 @@ if os.name == "nt":
         winreg.DeleteKey = _del
 else:
     R.remove(R.PINNED_EXTENSION_ID)
-for p in (R.LAUNCHER_EXE, R.LAUNCHER_SRC, R.LAUNCHER_BAT, R.MANIFEST_PATH):
+for p in (R.manifest_path(), R.launcher_path(), R.launcher_src(), R.config_path()):
     check(f"{os.path.basename(p)} is gone", os.path.exists(p), False)
 
 shutil.rmtree(TMP, ignore_errors=True)
-print(f"\n{'='*62}\n  {PASS} passed, {FAIL} failed\n{'='*62}")
+print(f"\n{'='*64}\n  {PASS} passed, {FAIL} failed\n{'='*64}")
 sys.exit(1 if FAIL else 0)

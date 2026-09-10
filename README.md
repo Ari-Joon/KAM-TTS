@@ -187,13 +187,18 @@ leaves torch unpinned for this reason. KAM adapts to whichever you installed.
    Only the dashboard power button depends on this. Without it everything else
    still works, you just start the server yourself with `python server.py`.
 
-   On Windows this compiles a small `kam_host.exe` launcher using the C#
-   compiler that ships with every Windows install, and pings it before
-   registering anything. It has to be an executable: Chrome 113 and later
-   invoke native hosts directly rather than through `cmd.exe`, and a `.bat`
-   fails with "Specified native messaging host not found". Run it with the
-   same Python you installed the requirements into, since that interpreter is
-   baked into the launcher.
+   You normally never need this: the server checks its own registration on
+   every boot and repairs it, so installing once and later moving the project
+   is fine. Start the server and it fixes itself.
+
+   What it installs, on Windows, is a small `kam_host.exe` into
+   `%LOCALAPPDATA%\KAMTTS` — deliberately outside the project, since the
+   registry stores absolute paths and those do not follow a folder you move.
+   The launcher has nothing about your machine compiled into it; it reads
+   `kam_host.cfg` beside it at run time, so a move rewrites two lines rather
+   than rebuilding anything. It has to be a real executable because Chrome 113
+   and later invoke native hosts directly instead of through `cmd.exe`, and it
+   is sent a real message and required to answer before anything is registered.
 </details>
 
 Then **load the extension**: `chrome://extensions` → Developer mode → Load
@@ -431,13 +436,22 @@ console lines against the ID at `chrome://extensions`. If they differ, run
 `python register_host.py <YOUR_EXTENSION_ID>` and restart the server.
 
 **The power button says "Specified native messaging host not found".** Chrome
-could not use the launcher it was pointed at. The common causes, in order: the
-project folder moved since registration, so the paths in `com.kam.tts.json`
-and `kam_host.exe` are stale; the launcher is a `.bat` from an older version,
-which Chrome 113 and later refuse; or `register_host.py` was never run on this
-machine. All three have the same fix: run `python register_host.py` again with
-the Python you use for the server, then press the button again. No Chrome
-restart is needed, since Chrome re-reads the manifest each time it connects.
+could not use the launcher it was pointed at. Start the server once by any other
+means — `Start KAM TTS.bat`, or `python server.py` — and it repairs its own
+registration on boot, which covers the usual causes: the project folder moved,
+the interpreter changed, or the launcher is a `.bat` from a version before
+Chrome 113 started refusing those.
+
+Then **quit Chrome completely** and reopen it. This is the part that catches
+people out: Chrome caches the native-host lookup for the life of the browser
+process, and closing every window does not end that process when "Continue
+running background apps" is on. Check the Chrome icon in the system tray, or
+`chrome://settings/system`. Until Chrome actually restarts you will keep seeing
+the old error no matter how correct the registration is.
+
+If it still fails, `%LOCALAPPDATA%\KAMTTS\host.log` says whether Chrome launched
+the launcher at all, which separates "Chrome would not start it" from "it
+started and something went wrong afterwards".
 
 **It says "No GPU in use" but I have one.** The console prints which backends it
 found and why one was rejected. Usually it's a PyTorch build that doesn't match
