@@ -370,6 +370,22 @@ def _registry_value():
         return None
 
 
+def _delete_registry():
+    """Remove the key. Every registry touch goes through one of these three
+    functions and nothing else calls winreg, so a test can replace all three and
+    be certain it cannot reach the real registration. That is not hypothetical
+    tidiness: the first version of the suite redirected the install directory
+    but left the write going to the real key, so running the tests pointed
+    Chrome at a temp folder and then deleted it."""
+    import winreg
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                         rf"Software\Google\Chrome\NativeMessagingHosts\{HOST_NAME}")
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def register(ext_id, python_exe=None, quiet=False):
     """Install or repair everything. Returns True when Chrome can use it."""
     py = python_exe or _python_exe()
@@ -459,13 +475,8 @@ def ensure_registered(python_exe=None, verbose=True):
 def remove(ext_id):
     """Uninstall: registry key, manifest, launcher, config and log."""
     if os.name == "nt":
-        import winreg
-        try:
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                             rf"Software\Google\Chrome\NativeMessagingHosts\{HOST_NAME}")
-            print("[OK] Registry key removed.")
-        except FileNotFoundError:
-            print("[--] No registry key found.")
+        print("[OK] Registry key removed." if _delete_registry()
+              else "[--] No registry key found.")
     else:
         for base in ("~/Library/Application Support/Google/Chrome/NativeMessagingHosts",
                      "~/.config/google-chrome/NativeMessagingHosts"):

@@ -14,8 +14,13 @@ sent a single ping passed against a launcher that was completely broken, because
 the reply arrived at shutdown rather than live, so this insists on an answer
 while the pipe is still open.
 
-Nothing here touches the real registration: the install directory is redirected
-to a temp folder and the registry is never written.
+Nothing here touches the real registration, and that is enforced rather than
+intended. The first version of this suite redirected the install directory but
+left the registry write going to the real key, so running the tests pointed
+Chrome at a temp folder that the suite then deleted, and the power button broke
+hours later for reasons that looked nothing like a test. So all three registry
+functions are replaced with an in-memory dictionary, and the real key is read
+before and after and asserted unchanged.
 """
 import os
 import pathlib
@@ -42,6 +47,18 @@ def check(label, got, want):
 
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="kam_register_test_"))
 R.install_dir = lambda: str(TMP)          # everything generated lands here
+
+# What the real registration says before this suite runs a single line. Read
+# through the untouched module, and compared again at the very end.
+_REAL_BEFORE = R._registry_value() if os.name == "nt" else None
+
+# Every registry touch in register_host goes through these three, so replacing
+# them makes it impossible for the suite to reach the real key however the code
+# under test decides to repair itself.
+_FAKE_REGISTRY = {}
+R._write_registry  = lambda: _FAKE_REGISTRY.__setitem__("value", R.manifest_path())
+R._registry_value  = lambda: _FAKE_REGISTRY.get("value")
+R._delete_registry = lambda: _FAKE_REGISTRY.pop("value", None) is not None
 
 print("\n=== the install location is outside the project, on purpose ===")
 # The whole bug was that a registration holding absolute paths does not follow a
@@ -123,19 +140,24 @@ for label, prep in (("with a good config", lambda: R.write_config(sys.executable
 print("\n=== remove() takes every generated piece ===")
 R.write_config(sys.executable, str(SERVER_DIR / "kam_host.py"))
 R.write_manifest(R.PINNED_EXTENSION_ID, R.launcher_path())
-if os.name == "nt":
-    import winreg
-    _del = winreg.DeleteKey
-    # Routed to the "nothing there" branch so the real key survives this suite.
-    winreg.DeleteKey = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError())
-    try:
-        R.remove(R.PINNED_EXTENSION_ID)
-    finally:
-        winreg.DeleteKey = _del
-else:
-    R.remove(R.PINNED_EXTENSION_ID)
+R._write_registry()
+check("the key was set before removing", R._registry_value() is not None, True)
+R.remove(R.PINNED_EXTENSION_ID)
 for p in (R.manifest_path(), R.launcher_path(), R.launcher_src(), R.config_path()):
     check(f"{os.path.basename(p)} is gone", os.path.exists(p), False)
+check("and the key went with them", R._registry_value(), None)
+
+print("\n=== and none of that reached the real registration ===")
+# The check that would have caught the bug this suite once caused. Read through
+# a clean import, since the module under test has had its registry functions
+# replaced above.
+if os.name == "nt":
+    import importlib
+    _clean = importlib.reload(importlib.import_module("register_host"))
+    after = _clean._registry_value()
+    check("the real registry key is exactly as we found it", after, _REAL_BEFORE)
+    check("and does not point into a temp directory",
+          bool(after) and "kam_register_test" in str(after), False)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\n{'='*64}\n  {PASS} passed, {FAIL} failed\n{'='*64}")
