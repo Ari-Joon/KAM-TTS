@@ -7,7 +7,7 @@ tts_quality.db, because these tests write rules, reports and observations. If a
 database exists next to the server it gets copied so the migrations run against
 realistic data; otherwise learner builds an empty one and the tests still pass.
 """
-import sys, pathlib, sqlite3, json, shutil, tempfile
+import sys, pathlib, sqlite3, json, shutil, tempfile, time
 
 SERVER_DIR = pathlib.Path(__file__).resolve().parent.parent
 HERE = pathlib.Path(tempfile.mkdtemp(prefix="kam_learner_test_"))
@@ -116,6 +116,46 @@ other = L.get_preferred_param("sentence", "repetition_penalty", 4.1, 1.0, 10.0)
 L.set_active_voice("default")
 check("default voice uses its learned value", base != 4.1, True)
 check("other voice does NOT inherit it", other, 4.1)
+
+print("\n=== the live feed carries the user's own judgements ===")
+# The dashboard rebuilds every card from what this returns, on every poll. When
+# the verdict and the reports were missing from it, rating a chunk worked and
+# was then erased three seconds later by a row that said nothing about it, and a
+# reported chunk had no way to show that it had been reported at all.
+_fc = sqlite3.connect(str(L.DB_PATH))
+with _fc:
+    _fc.execute("INSERT INTO chunks (id, ts, text, voice, quality_score, user_feedback) "
+                "VALUES (?,?,?,?,?,?)",
+                ("feed-rated", time.time(), "A chunk I rated.", "feed_test", 0.9, "positive"))
+    _fc.execute("INSERT INTO chunks (id, ts, text, voice, quality_score) VALUES (?,?,?,?,?)",
+                ("feed-reported", time.time(), "A chunk I reported.", "feed_test", 0.8))
+    _fc.execute("INSERT INTO chunks (id, ts, text, voice, quality_score) VALUES (?,?,?,?,?)",
+                ("feed-plain", time.time(), "A chunk I left alone.", "feed_test", 0.95))
+    for issue in ("pronunciation", "hallucination"):
+        _fc.execute("INSERT INTO reports (ts, chunk_id, chunk_text, issue) VALUES (?,?,?,?)",
+                    (time.time(), "feed-reported", "A chunk I reported.", issue))
+_fc.close()
+
+feed = {r["chunk_id"]: r for r in L.get_chunk_feed(50)}
+check("a rated chunk reports its verdict",
+      feed.get("feed-rated", {}).get("user_feedback"), "positive")
+check("a reported chunk is counted as reported",
+      feed.get("feed-reported", {}).get("report_count"), 2)
+check("and names the most recent issue",
+      feed.get("feed-reported", {}).get("report_issue"), "hallucination")
+check("an untouched chunk claims neither",
+      (feed.get("feed-plain", {}).get("user_feedback"),
+       feed.get("feed-plain", {}).get("report_count")), (None, 0))
+# Two reports on one chunk must not produce two cards, which is why those are
+# subqueries rather than a join.
+check("several reports still give exactly one row",
+      sum(1 for r in L.get_chunk_feed(50) if r["chunk_id"] == "feed-reported"), 1)
+
+_fc = sqlite3.connect(str(L.DB_PATH))
+with _fc:
+    _fc.execute("DELETE FROM chunks WHERE voice='feed_test'")
+    _fc.execute("DELETE FROM reports WHERE chunk_id LIKE 'feed-%'")
+_fc.close()
 
 print("\n=== renaming a voice carries its learning with it ===")
 # A voice's name is the key on every row and on every learned setting, so a

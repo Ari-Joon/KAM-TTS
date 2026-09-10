@@ -3997,16 +3997,33 @@ print(f"[LEARNER] librosa: {'available' if _LIBROSA_OK else 'not installed (pip 
 def get_chunk_feed(limit=20):
     """Return recent chunks with quality metrics for the dashboard feed.
     Each chunk carries a global chronological seq (1 = oldest, total = newest)
-    so the UI can label "chunk 24/108" consistently everywhere."""
+    so the UI can label "chunk 24/108" consistently everywhere.
+
+    user_feedback and the report columns are here because the feed draws each
+    card's verdict from what this returns, on every poll. They were missing for
+    a long time, and the effect was subtle rather than obviously broken: rating
+    a chunk worked, and then three seconds later the next poll rebuilt the card
+    from a row that said nothing about the rating and quietly erased it. A
+    reported chunk had the same problem with no way to see it at all, since
+    nothing here mentioned the reports table.
+
+    The report columns are correlated subqueries rather than a join, so a chunk
+    with several reports still produces exactly one row and the feed cannot
+    silently duplicate cards."""
     with _db_lock:
         conn = _get_db()
         total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         rows = conn.execute("""
-            SELECT id as chunk_id, text as chunk_text, sentence_type, silence_ms,
-                   char_count, success, skipped, quality_score, quality_flags,
-                   whisper_accuracy, pitch_variance, energy_tail, voice_consistency,
-                   has_math, primary_facet, facet_count, ts
-            FROM chunks ORDER BY ts DESC LIMIT ?
+            SELECT c.id as chunk_id, c.text as chunk_text, c.sentence_type, c.silence_ms,
+                   c.char_count, c.success, c.skipped, c.quality_score, c.quality_flags,
+                   c.whisper_accuracy, c.pitch_variance, c.energy_tail, c.voice_consistency,
+                   c.has_math, c.primary_facet, c.facet_count, c.ts,
+                   c.user_feedback, c.user_verdict,
+                   (SELECT COUNT(*) FROM reports r WHERE r.chunk_id = c.id)
+                       AS report_count,
+                   (SELECT r.issue FROM reports r WHERE r.chunk_id = c.id
+                        ORDER BY r.ts DESC LIMIT 1) AS report_issue
+            FROM chunks c ORDER BY c.ts DESC LIMIT ?
         """, (limit,)).fetchall()
         conn.close()
     out = []

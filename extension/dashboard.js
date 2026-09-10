@@ -330,9 +330,33 @@ function _wireAutotune() {
 // This version instead makes the DOM match the server response every poll:
 // one card per returned chunk, in timestamp order, updated in place when the
 // data changes. It's idempotent, so it can't drift however the polls interleave.
-function _chunkCardHTML(row, q) {
-  const fbUp   = row.user_feedback === 'positive' ? ' confirmed' : '';
-  const fbDown = row.user_feedback === 'negative' ? ' rejected'  : '';
+// Verdicts clicked here that the server has not confirmed yet.
+//
+// The renderer rebuilds every card's classes from the polled row each time, so
+// anything set optimistically on click is erased by the next poll unless the
+// server has already caught up. That is a 3s window in which a rating silently
+// vanished, which read as "the button sometimes does nothing". Holding the
+// click here until the server agrees closes it.
+const _pendingVerdict = new Map();   // chunk_id -> 'up' | 'down' | null
+
+// What to draw for a chunk: what the user just clicked if that is still
+// outstanding, otherwise what the server has recorded.
+function _effectiveVerdict(row) {
+  const fromServer = row.user_feedback === 'positive' ? 'up'
+                   : row.user_feedback === 'negative' ? 'down' : null;
+  const id = row.chunk_id;
+  if (id && _pendingVerdict.has(id)) {
+    const pending = _pendingVerdict.get(id);
+    // Once the server reports the same thing, the local copy has done its job.
+    if (pending === fromServer) { _pendingVerdict.delete(id); return fromServer; }
+    return pending;
+  }
+  return fromServer;
+}
+
+function _chunkCardHTML(row, q, verdict) {
+  const fbUp   = verdict === 'up'   ? ' confirmed' : '';
+  const fbDown = verdict === 'down' ? ' rejected'  : '';
   return `<div class="chunk-meta">`
     +(row.seq?`<span class="chunk-badge chunk-num">chunk ${row.seq}/${row.total}</span>`:'')
     +`<span class="chunk-badge type-${row.sentence_type||''}">${row.sentence_type||'?'}</span>`
@@ -355,6 +379,9 @@ function _chunkCardHTML(row, q) {
 // state is 'up', 'down', or null to clear.
 function _setCardRated(card, state) {
   if (!card) return;
+  // Remembered so the next poll does not undo it. Cleared in
+  // _effectiveVerdict once the server reports the same verdict back.
+  if (card.dataset.id) _pendingVerdict.set(card.dataset.id, state || null);
   card.classList.remove('rated-up', 'rated-down', 'just-rated');
   if (!state) return;
   card.classList.add(state === 'up' ? 'rated-up' : 'rated-down');
@@ -465,6 +492,12 @@ function _renderChunkFeed(rows) {
   const desiredTopDown = [];   // newest → oldest, i.e. final DOM order
   for (let i = ordered.length - 1; i >= 0; i--) desiredTopDown.push(ordered[i]);
 
+  // Walked with a cursor so a card is only moved when it is genuinely out of
+  // place. The previous version appended all forty every poll, which re-ordered
+  // the whole list in the DOM every three seconds whether or not anything had
+  // changed, and that churn is what made the feed feel heavy.
+  let cursor = body.firstElementChild;
+
   desiredTopDown.forEach(row => {
     const q = row.quality_score;
     const cls = q==null ? '' : q>=0.75 ? 'quality-high' : q>=0.5 ? 'quality-mid' : 'quality-low';
@@ -475,25 +508,40 @@ function _renderChunkFeed(rows) {
       card.title = 'Click chunk text to report. Thumbs-up confirms good quality.';
       card.dataset.sig = '';
     }
+    const verdict  = _effectiveVerdict(row);
+    const reported = (row.report_count || 0) > 0;
     // Rebuild the inner markup only when something actually changed, so we
-    // never clobber hover/selection state on every 3s poll.
-    const sig = [row.ts, q, row.quality_flags, row.user_feedback,
+    // never clobber hover/selection state on every 3s poll. The verdict is in
+    // the signature rather than the raw row value, so a click that the server
+    // has not yet confirmed still redraws the buttons.
+    const sig = [row.ts, q, row.quality_flags, verdict, reported, row.report_issue,
                  row.whisper_accuracy, row.seq, row.total].join('|');
     if (card.dataset.sig !== sig) {
-      card.innerHTML = _chunkCardHTML(row, q);
+      card.innerHTML = _chunkCardHTML(row, q, verdict);
       card.dataset.sig = sig;
     }
     card.dataset.text = row.chunk_text || '';
     // Preserve the pinned marker; refresh only the quality classes.
-    // The rated marker comes from the server's stored verdict, so a rating
-    // survives a refresh, a restart and the 3s reconcile. Only an explicit
-    // thumbs counts here: 'solid' means the chunk was auto-digested as
-    // heard-and-fine, which is not the same as the user having judged it.
+    // The rated marker prefers a click that is still in flight and otherwise
+    // comes from the server's stored verdict, so a rating survives both the 3s
+    // reconcile and a reload. Only an explicit thumbs counts: 'solid' means the
+    // chunk was auto-digested as heard-and-fine, which is not a user judgement.
     const pinned = card.classList.contains('pinned');
-    const rated = row.user_feedback === 'positive' ? ' rated-up'
-                : row.user_feedback === 'negative' ? ' rated-down' : '';
-    card.className = 'chunk-card ' + cls + (pinned ? ' pinned' : '') + rated;
-    body.appendChild(card);          // appending in top-down order sorts them
+    const rated = verdict === 'up' ? ' rated-up' : verdict === 'down' ? ' rated-down' : '';
+    // Anything reported is marked whatever its measured quality was, since a
+    // report is the user saying it was wrong and that outranks the score.
+    const want = 'chunk-card ' + cls + (pinned ? ' pinned' : '') + rated
+               + (reported ? ' reported' : '');
+    if (card.className !== want) card.className = want;
+    if (reported && row.report_issue) {
+      card.title = `Reported: ${row.report_issue}. Click the text to report again.`;
+    }
+
+    if (card === cursor) {
+      cursor = cursor.nextElementSibling;   // already in the right place
+    } else {
+      body.insertBefore(card, cursor);      // only moves what actually moved
+    }
     existing.delete(row.chunk_id);
   });
 
