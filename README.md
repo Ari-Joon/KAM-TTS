@@ -196,9 +196,10 @@ leaves torch unpinned for this reason. KAM adapts to whichever you installed.
    registry stores absolute paths and those do not follow a folder you move.
    The launcher has nothing about your machine compiled into it; it reads
    `kam_host.cfg` beside it at run time, so a move rewrites two lines rather
-   than rebuilding anything. It has to be a real executable because Chrome 113
-   and later invoke native hosts directly instead of through `cmd.exe`, and it
-   is sent a real message and required to answer before anything is registered.
+   than rebuilding anything. Each new build is sent a real message and has to
+   answer before it replaces the installed one, and a server that finds an
+   older launcher installed rebuilds it on boot, so fixes to the launcher reach
+   existing installs without anyone re-running this.
 </details>
 
 Then **load the extension**: `chrome://extensions` → Developer mode → Load
@@ -439,19 +440,22 @@ console lines against the ID at `chrome://extensions`. If they differ, run
 could not use the launcher it was pointed at. Start the server once by any other
 means — `Start KAM TTS.bat`, or `python server.py` — and it repairs its own
 registration on boot, which covers the usual causes: the project folder moved,
-the interpreter changed, or the launcher is a `.bat` from a version before
-Chrome 113 started refusing those.
+the interpreter changed, or the launcher was built from older code.
 
-Then **quit Chrome completely** and reopen it. This is the part that catches
-people out: Chrome caches the native-host lookup for the life of the browser
-process, and closing every window does not end that process when "Continue
-running background apps" is on. Check the Chrome icon in the system tray, or
-`chrome://settings/system`. Until Chrome actually restarts you will keep seeing
-the old error no matter how correct the registration is.
+Then **quit Chrome completely** and reopen it. Closing every window is not the
+same: while "Continue running background apps" is on, Chrome keeps running in
+the tray, so check the Chrome icon there or `chrome://settings/system`. A full
+quit has cleared this error every time it has been seen with a registration
+that was otherwise correct.
 
-If it still fails, `%LOCALAPPDATA%\KAMTTS\host.log` says whether Chrome launched
-the launcher at all, which separates "Chrome would not start it" from "it
-started and something went wrong afterwards".
+If it still fails, `%LOCALAPPDATA%\KAMTTS\host.log` records every launch, so it
+says whether Chrome started the launcher at all, which separates "Chrome would
+not start it" from "it started and something went wrong afterwards".
+
+Chrome starts the launcher through `cmd.exe`, so a Windows username containing
+`&`, `%`, `^` or brackets can break the path on the way in. Registration writes
+the short 8.3 form of such a path, and warns if the drive has short names turned
+off.
 
 **It says "No GPU in use" but I have one.** The console prints which backends it
 found and why one was rejected. Usually it's a PyTorch build that doesn't match

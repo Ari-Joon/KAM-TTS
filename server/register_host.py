@@ -21,12 +21,16 @@ the server and it fixes itself. See ensure_registered().
     python register_host.py --remove   uninstall
     python register_host.py <ID>       only if you replaced the key in manifest.json
 
-Three things learned the hard way, all of which cost an afternoon:
+Things learned the hard way, all of which cost an afternoon:
 
-  * Chrome 113 and later invoke native hosts as executables directly instead of
-    through cmd.exe, so the .bat this used to write is refused at manifest level
-    with "Specified native messaging host not found" even when every path is
-    perfect. It has to be a real .exe.
+  * Chrome starts the host through cmd.exe. The process tree of a working launch
+    on Chrome 153 reads chrome.exe -> cmd.exe /d /s /c "...kam_host.exe" ->
+    kam_host.exe. An earlier version of this file claimed Chrome had stopped
+    using cmd.exe and so refused .bat hosts; the process tree shows that was
+    wrong, and the .exe is kept because it works, not because a .bat cannot.
+    What going through cmd.exe does mean is that a path containing & | < > ^ %
+    or parentheses can be mangled on the way in, and every per-user path holds
+    the username, so the manifest records the short 8.3 form of any such path.
 
   * .NET's Process class cannot give a child the parent's pipes. With
     RedirectStandardInput it inserts a buffer that never reaches the pipe, and
@@ -35,10 +39,13 @@ Three things learned the hard way, all of which cost an afternoon:
     CreateProcess itself with STARTF_USESTDHANDLES and bInheritHandles=true,
     which is exactly what cmd.exe used to do for us.
 
-  * Chrome caches the host lookup for the life of the browser process, and
-    closing every window does not end that process when background apps are on.
-    A registration change needs Chrome fully quit, not just closed.
+  * When the button reports "host not found" with a registration that checks
+    out, fully quitting Chrome has cleared it every time it has been seen,
+    including its background processes, which closing the windows leaves
+    running. Why is not established. The launcher writes every launch to
+    host.log, so the next occurrence can say whether Chrome started it at all.
 """
+import hashlib
 import json
 import os
 import re
@@ -87,10 +94,60 @@ def install_dir():
 
 
 def launcher_path():   return os.path.join(install_dir(), "kam_host.exe")
+def launcher_staged(): return os.path.join(install_dir(), "kam_host.new.exe")
+def launcher_old():    return os.path.join(install_dir(), "kam_host.exe.old")
 def launcher_src():    return os.path.join(install_dir(), "kam_host_launcher.cs")
 def config_path():     return os.path.join(install_dir(), "kam_host.cfg")
 def manifest_path():   return os.path.join(install_dir(), f"{HOST_NAME}.json")
 def launcher_log():    return os.path.join(install_dir(), "host.log")
+
+
+def launcher_sha():
+    """A fingerprint of the launcher source this file would build.
+
+    Recorded in kam_host.cfg when a launcher is installed, so ensure_registered
+    can tell an installed launcher is older than the code. Without it a fix to
+    the launcher never reaches a machine that is already registered, because
+    nothing rebuilds a launcher that exists. A hash rather than a version number
+    so there is nothing to remember to bump."""
+    return hashlib.sha256(_launcher_source().encode("utf-8")).hexdigest()[:16]
+
+
+# --- Paths that survive cmd.exe ---------------------------------------------
+# Chrome hands the manifest's path to cmd.exe /d /s /c, and cmd treats these as
+# operators, escapes or variable markers. Spaces are fine, since Chrome quotes
+# the path. Every per-user path contains the username, so someone called
+# "Smith & Jones" or "Test (2)" gets a launcher path cmd will cut in half.
+
+_CMD_UNSAFE = set('&|<>^%()')
+
+
+def _short_path(path):
+    """The 8.3 form of an existing path, or the path unchanged if Windows has
+    short names turned off for that volume or the call fails."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        fn = ctypes.windll.kernel32.GetShortPathNameW
+        fn.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        fn.restype = wintypes.DWORD
+        need = fn(path, None, 0)
+        if not need:
+            return path
+        buf = ctypes.create_unicode_buffer(need)
+        return buf.value if fn(path, buf, need) else path
+    except Exception:
+        return path
+
+
+def cmd_safe_path(path):
+    """path, or its short form when the long one has characters cmd.exe would
+    interpret. Returns the long path when no safe form exists, and the caller
+    warns, since a path that might break is better than no registration."""
+    if not any(ch in _CMD_UNSAFE for ch in path):
+        return path
+    short = _short_path(path)
+    return short if not any(ch in _CMD_UNSAFE for ch in short) else path
 
 
 def _python_exe():
@@ -123,14 +180,21 @@ def read_config():
     return out
 
 
-def write_config(python_exe, host_script):
+def write_config(python_exe, host_script, launcher_sha=None):
+    """Write the two paths the launcher needs. launcher_sha records which build
+    of the launcher is installed; left as None it keeps whatever was recorded,
+    so rewriting the paths after a move cannot make a stale launcher look
+    current, or a current one look stale."""
+    if launcher_sha is None:
+        launcher_sha = read_config().get("launcher_sha", "")
     os.makedirs(install_dir(), exist_ok=True)
     with open(config_path(), "w", encoding="utf-8", newline="\n") as f:
         f.write("# Written by register_host.py and kept current by server.py.\n")
         f.write("# The launcher reads this at run time, so moving the project\n")
-        f.write("# only changes these two lines and never needs a recompile.\n")
+        f.write("# only changes these lines and never needs a recompile.\n")
         f.write(f"python={python_exe}\n")
         f.write(f"host={host_script}\n")
+        f.write(f"launcher_sha={launcher_sha}\n")
     return config_path()
 
 
@@ -187,11 +251,18 @@ class KamHostLauncher {
 
     static string Dir { get { return Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location); } }
 
-    // Kept small and always overwritten: it exists to answer "did Chrome even
-    // launch this", which is otherwise invisible from outside.
+    // Answers "did Chrome even launch this", which is otherwise invisible from
+    // outside. Every launch is written, not only failures: a log that only
+    // records errors reads exactly like "never launched" when everything is
+    // working, which is how a healthy launcher once looked broken for hours.
+    // Started afresh past 64KB so it never grows without bound.
     static void Note(string s) {
-        try { File.AppendAllText(Path.Combine(Dir, "host.log"),
-              DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + s + Environment.NewLine); }
+        try {
+            var path = Path.Combine(Dir, "host.log");
+            var line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + s + Environment.NewLine;
+            if (File.Exists(path) && new FileInfo(path).Length > 64 * 1024) File.WriteAllText(path, line);
+            else File.AppendAllText(path, line);
+        }
         catch (Exception) { }
     }
 
@@ -208,6 +279,7 @@ class KamHostLauncher {
     }
 
     static int Main(string[] args) {
+        Note("launched " + string.Join(" ", args));
         string py, host;
         try {
             var cfg = ReadConfig();
@@ -251,7 +323,12 @@ class KamHostLauncher {
 
 
 def build_launcher():
-    """Compile the launcher. Returns its path, or None with a reason printed."""
+    """Compile the launcher to a staging name beside the real one.
+
+    Never straight over the installed launcher: that one may be running right
+    now, since the server that calls ensure_registered on boot was usually
+    started through it, and a failed build must leave a working button behind.
+    Returns the staged path, or None with a reason printed."""
     csc = _find_csc()
     if not csc:
         print("[ERROR] No C# compiler found under %WINDIR%\\Microsoft.NET.")
@@ -260,14 +337,54 @@ def build_launcher():
     os.makedirs(install_dir(), exist_ok=True)
     with open(launcher_src(), "w", encoding="utf-8") as f:
         f.write(_launcher_source())
+    staged = launcher_staged()
+    try:
+        os.remove(staged)
+    except OSError:
+        pass
     r = subprocess.run([csc, "-nologo", "-optimize+", "-target:exe",
-                        "-out:" + launcher_path(), launcher_src()],
+                        "-out:" + staged, launcher_src()],
                        capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.exists(launcher_path()):
+    if r.returncode != 0 or not os.path.exists(staged):
         print("[ERROR] The launcher did not compile:")
         print((r.stdout + r.stderr).strip())
         return None
-    return launcher_path()
+    return staged
+
+
+def install_built(staged):
+    """Move a staged, already-tested launcher into place.
+
+    Windows will not overwrite or delete an executable that is running, but it
+    will rename one, and the running process carries on from the renamed file.
+    So the current launcher is moved aside to .old first and the new one takes
+    its name. If the second step fails the first is undone, so there is never a
+    moment where the registered path points at nothing. The .old from a previous
+    swap is cleared when it is no longer running. Returns True on success."""
+    target, old = launcher_path(), launcher_old()
+    try:
+        os.remove(old)
+    except OSError:
+        pass
+    moved_aside = False
+    if os.path.exists(target):
+        try:
+            os.replace(target, old)
+            moved_aside = True
+        except OSError as e:
+            print(f"[ERROR] Could not move the current launcher aside: {e}")
+            return False
+    try:
+        os.replace(staged, target)
+        return True
+    except OSError as e:
+        print(f"[ERROR] Could not put the new launcher in place: {e}")
+        if moved_aside:
+            try:
+                os.replace(old, target)
+            except OSError:
+                pass
+        return False
 
 
 def self_test(exe, timeout=15):
@@ -405,15 +522,34 @@ def register(ext_id, python_exe=None, quiet=False):
             print(f"[OK] Registered for extension {ext_id}")
         return True
 
+    # Paths first, since the self-test runs the staged launcher and it reads
+    # these. The build fingerprint is only recorded once the new launcher is
+    # actually in place.
     write_config(py, HOST_SCRIPT)
-    if not build_launcher():
+    staged = build_launcher()
+    if not staged:
         return False
-    if not self_test(launcher_path()):
+    if not self_test(staged):
         print("[ERROR] The launcher was built but did not answer a message.")
         print(f"        Interpreter: {py}")
         print("        Check that it can run kam_host.py by hand before registering.")
+        print("        The launcher that was already installed has been left alone.")
+        try:
+            os.remove(staged)
+        except OSError:
+            pass
         return False
-    write_manifest(ext_id, launcher_path())
+    if not install_built(staged):
+        return False
+    write_config(py, HOST_SCRIPT, launcher_sha=launcher_sha())
+
+    exec_path = cmd_safe_path(launcher_path())
+    if any(ch in _CMD_UNSAFE for ch in exec_path) and not quiet:
+        print("[WARN] The launcher path contains characters cmd.exe treats specially,")
+        print("       and Windows has no short name for it on this drive, so Chrome")
+        print("       may fail to start it. Setting LOCALAPPDATA to a simpler path")
+        print("       and re-running this is the fix if the power button fails.")
+    write_manifest(ext_id, exec_path)
     _write_registry()
     if not quiet:
         print(f"[OK] Registered and tested for extension {ext_id}")
@@ -422,9 +558,9 @@ def register(ext_id, python_exe=None, quiet=False):
         print(f"     Python:   {py}")
         print()
         print("If the power button was already failing, QUIT CHROME COMPLETELY and")
-        print("reopen it. Chrome caches this lookup for the life of the browser, and")
-        print("closing every window does not end it when background apps stay on:")
-        print("check chrome://settings/system, or the Chrome icon in the tray.")
+        print("reopen it. Closing the windows is not enough while background apps")
+        print("stay on: check chrome://settings/system, or the Chrome icon in the")
+        print("tray. host.log beside the launcher records every launch.")
     return True
 
 
@@ -443,20 +579,35 @@ def ensure_registered(python_exe=None, verbose=True):
         py = python_exe or _python_exe()
         cfg = read_config()
         stale = (cfg.get("python") != py or cfg.get("host") != HOST_SCRIPT)
+        outdated = cfg.get("launcher_sha") != launcher_sha()
+        manifest_exec = None
+        try:
+            with open(manifest_path(), encoding="utf-8") as f:
+                manifest_exec = json.load(f).get("path")
+        except (OSError, ValueError):
+            pass
         missing = (not os.path.exists(launcher_path())
-                   or not os.path.exists(manifest_path())
+                   or manifest_exec != cmd_safe_path(launcher_path())
                    or _registry_value() != manifest_path())
 
-        if not stale and not missing:
+        # Clear the launcher a previous upgrade moved aside, once it has
+        # stopped running. Harmless if it is still in use: that just fails.
+        try:
+            os.remove(launcher_old())
+        except OSError:
+            pass
+
+        if not stale and not missing and not outdated:
             return True
 
-        if missing:
+        if missing or outdated:
             if verbose:
-                print("[HOST] Native-messaging registration is missing or points elsewhere; "
-                      "rebuilding it.")
+                why = ("is missing or points elsewhere" if missing
+                       else "was built from older code")
+                print(f"[HOST] Native-messaging launcher {why}; rebuilding it.")
             ok = register(PINNED_EXTENSION_ID, py, quiet=not verbose)
             if verbose and ok:
-                print("[HOST] Repaired. Fully quit Chrome once for it to take effect.")
+                print("[HOST] Repaired. Fully quit Chrome once if the power button was failing.")
             return ok
 
         # Only the paths moved, so the existing launcher is fine and the config
@@ -484,9 +635,13 @@ def remove(ext_id):
             if os.path.exists(p):
                 os.remove(p)
                 print(f"[OK] Removed {p}")
-    for p in (manifest_path(), launcher_path(), launcher_src(), config_path(), launcher_log()):
+    for p in (manifest_path(), launcher_path(), launcher_staged(), launcher_old(),
+              launcher_src(), config_path(), launcher_log()):
         if os.path.exists(p):
-            os.remove(p)
+            try:
+                os.remove(p)
+            except OSError:
+                pass   # still running; it goes on the next remove
 
 
 def _parse_ext_id(raw):

@@ -1324,9 +1324,16 @@ def _run_startup():
     # rather than leaving a dead button and an instruction to run a script.
     # Cheap when nothing has changed, and never fatal: a broken button must not
     # stop the server from serving.
+    #
+    # sys is imported locally because this module only ever imports it under
+    # aliases. The first version of this called sys.executable, the NameError
+    # was swallowed by the except below, and the repair silently never ran: the
+    # log said "Registration check skipped (name 'sys' is not defined)" on every
+    # boot. test_namecheck.py now fails on any undefined name in server code.
     try:
+        import sys as _sys_reg
         import register_host as _reg
-        _reg.ensure_registered(python_exe=sys.executable)
+        _reg.ensure_registered(python_exe=_sys_reg.executable)
     except Exception as _e:
         print(f"[HOST] Registration check skipped ({_e}).")
     try:
