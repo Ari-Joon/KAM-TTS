@@ -1840,7 +1840,17 @@ document.addEventListener('DOMContentLoaded',()=>{
   function _onHostEvent(msg) {
     if (!msg) return;
     if (msg.type === 'log')    addLog(msg.line || '');
-    else if (msg.type === 'stage') { _setStageProgress(msg.stage); }
+    else if (msg.type === 'stage') {
+      // A boot started from the popup reaches here as stages alone, so the
+      // ring has to start itself rather than wait for this page's own click.
+      if (!_serverReady) { _midToggle = true; _setPower('loading'); }
+      _setStageProgress(msg.stage);
+    }
+    else if (msg.type === 'stopping') {
+      // Asked over HTTP, so no exit message follows; the console poll turns
+      // the button off once the server stops answering.
+      _midToggle = false;
+    }
     else if (msg.type === 'status') {
       if (msg.running) {
         if (!_serverReady) _setPower('loading');

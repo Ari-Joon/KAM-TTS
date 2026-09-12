@@ -418,7 +418,9 @@ function openDashboard() {
   });
 }
 
+let _checkTimer = null;
 async function checkServer() {
+  clearTimeout(_checkTimer);
   // The fetch verdict is computed FIRST and every DOM update is null-safe.
   // A previous version updated elements inside the try block, so a missing
   // or renamed element, which happened after theme edits to popup.html, threw
@@ -443,7 +445,12 @@ async function checkServer() {
   }
   _serverOnline = online;
   paintStatus();
-  if (!online) setTimeout(checkServer, 3000);   // retry every 3 seconds
+  // Every 3 seconds while the popup is open, online or not. Polling only while
+  // offline meant a server stopped with the popup open went on reading
+  // "online", and there was nothing to offer a stop from. One timer at a time,
+  // since a ready event also calls this and each call would otherwise add one.
+  clearTimeout(_checkTimer);
+  _checkTimer = setTimeout(checkServer, 3000);
 }
 
 // =============================================================================
@@ -478,7 +485,17 @@ const BOOT_ASIDES = {
 };
 
 let _serverOnline = false;
-let _hostState    = { connected: false, running: false, ready: false, stage: "", error: "" };
+let _hostState    = { connected: false, running: false, ready: false, stage: "", error: "", startedAt: 0 };
+// What this popup asked for, and when. The worker's state is what the host
+// reported; these cover the gaps either side of it: the moment before the first
+// stage arrives, and a stop, which nothing narrates when the server was not the
+// host's own. `note` is a short-lived line for a stop that failed.
+let _asked = { startAt: 0, stopAt: 0, note: "", noteAt: 0 };
+
+// A boot that has not answered within five minutes is not booting any more, it
+// is a stage left behind by a server that died without saying so. Five, not
+// one, because a first boot measures synthesis speed and can take a while.
+const START_GRACE_MS = 300000, STOP_GRACE_MS = 30000, NOTE_MS = 8000;
 
 function _stepFor(stage) {
   const i = BOOT_STEPS.findIndex(s => s[0] === stage);
@@ -487,45 +504,72 @@ function _stepFor(stage) {
   return stage ? { label: stage, pct: null } : null;
 }
 
+// Everything the status bar shows, worked out from what is known. Kept pure so
+// it can be tested without a popup; paintStatus only copies it onto elements.
+function statusView(online, host, asked, now) {
+  host = host || {}; asked = asked || {};
+  const note = asked.note && now - asked.noteAt < NOTE_MS ? asked.note : "";
+
+  if (online) {
+    if (asked.stopAt && now - asked.stopAt < STOP_GRACE_MS) {
+      return { dot: "busy", text: "Stopping the server…", step: "", pct: null,
+               button: "stop", disabled: true, title: "Stopping…" };
+    }
+    return { dot: "online", text: "Server online", step: note, pct: null,
+             button: "stop", disabled: false, title: "Stop the KAM TTS server" };
+  }
+
+  // Booting: this popup just asked, or the host is connected and started a boot
+  // recently. The click counts on its own so "Starting up" shows at once rather
+  // than after the first stage, which is what made the progress look absent.
+  const clicked  = asked.startAt && now - asked.startAt < START_GRACE_MS;
+  const hostBoot = host.connected && host.stage && host.startedAt
+                   && now - host.startedAt < START_GRACE_MS;
+  if (!host.error && (clicked || hostBoot)) {
+    // Ready but not yet answering is the model warming up, the last few seconds.
+    const info = host.ready || host.stage === "ready"
+      ? { label: "Warming up the voice model", pct: 100 }
+      : _stepFor(host.stage || "process-started");
+    return { dot: "busy", text: "Starting the server…", step: info ? info.label : "",
+             pct: info ? info.pct : null, button: "start", disabled: true, title: "Starting…" };
+  }
+
+  return { dot: "offline", text: host.error || "Server offline",
+           step: note && note !== host.error ? note : "", pct: null,
+           button: "start", disabled: false, title: "Start the KAM TTS server" };
+}
+
 function paintStatus() {
   const dot  = document.getElementById("status-dot");
   const txt  = document.getElementById("status-text");
   const step = document.getElementById("status-step");
   const prog = document.getElementById("status-prog");
-  const start= document.getElementById("status-start");
+  const btn  = document.getElementById("status-start");
   const speak= document.getElementById("speak-btn");
   if (!dot || !txt) return;
 
-  // Booting means the host has told us a stage and the health check has not yet
-  // seen the server answer. Once it answers, the stage line has nothing to add.
-  const booting = !_serverOnline && !!_hostState.stage && !_hostState.error;
-  const info    = booting ? _stepFor(_hostState.stage) : null;
+  const v = statusView(_serverOnline, _hostState, _asked, Date.now());
+  // A request is finished once the health check agrees with it.
+  if (_serverOnline) _asked.startAt = 0;
+  else _asked.stopAt = 0;
 
-  dot.className = _serverOnline ? "status-dot online"
-                : booting       ? "status-dot"          // amber-neutral while it works
-                                : "status-dot offline";
-
-  if (_serverOnline)            txt.textContent = "Server online";
-  else if (_hostState.error)    txt.textContent = _hostState.error;
-  else if (booting)             txt.textContent = "Starting the server…";
-  else                          txt.textContent = "Server offline";
-
+  dot.className = "status-dot" + (v.dot === "online" ? " online" : v.dot === "offline" ? " offline" : "");
+  txt.textContent = v.text;
   if (step) {
-    const show = booting && info;
-    step.style.display = show ? "block" : "none";
-    step.textContent   = show ? info.label : "";
+    step.style.display = v.step ? "block" : "none";
+    step.textContent   = v.step;
   }
   if (prog) {
-    const show = booting && info && info.pct !== null;
+    const show = v.pct !== null && v.pct !== undefined;
     prog.style.display = show ? "block" : "none";
-    if (show) prog.firstElementChild.style.width = info.pct + "%";
+    if (show) prog.firstElementChild.style.width = v.pct + "%";
   }
-  if (start) {
-    // Offered whenever the server is not up, including after a failure, since
-    // "try again" is the obvious next move and hiding the button hides it.
-    start.classList.toggle("show", !_serverOnline);
-    start.disabled = booting;
-    start.title = booting ? "Starting…" : "Start the KAM TTS server";
+  if (btn) {
+    btn.classList.add("show");
+    btn.classList.toggle("stop", v.button === "stop");
+    btn.textContent = v.button === "stop" ? "■" : "⏻";
+    btn.disabled = v.disabled;
+    btn.title = v.title;
   }
   if (speak) speak.disabled = !_serverOnline;
 }
@@ -541,21 +585,42 @@ try {
   chrome.runtime.onMessage.addListener(msg => {
     if (msg && msg.action === "hostEvent" && msg.state) {
       _hostState = msg.state;
+      const ev = msg.event;
+      if (ev && ev.type === "error") {
+        // A failed start or stop ends the wait for it and says why.
+        _asked.startAt = 0; _asked.stopAt = 0;
+        _asked.note = ev.message || ""; _asked.noteAt = Date.now();
+      }
       paintStatus();
-      if (_hostState.ready) checkServer();   // confirm with a real health check
+      // Confirm with a real health check rather than waiting for the next poll.
+      if (_hostState.ready || (ev && (ev.type === "exit" || ev.type === "stopping"))) checkServer();
     }
   });
 } catch (e) { /* worker not up yet; the health check still drives the dot */ }
 
 document.addEventListener("DOMContentLoaded", () => {
-  const start = document.getElementById("status-start");
-  if (!start) return;
-  start.addEventListener("click", () => {
-    _hostState = { connected: false, running: false, ready: false,
-                   stage: "process-started", error: "" };
+  const btn = document.getElementById("status-start");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    if (_serverOnline) {
+      _asked.stopAt = Date.now(); _asked.note = "";
+      paintStatus();
+      chrome.runtime.sendMessage({ action: "hostStop" }, () => {
+        if (chrome.runtime.lastError) {
+          _asked.stopAt = 0;
+          _asked.note = "Could not reach the extension worker. Reload the extension.";
+          _asked.noteAt = Date.now();
+        }
+        paintStatus();
+      });
+      return;
+    }
+    _asked.startAt = Date.now(); _asked.note = "";
+    _hostState = Object.assign({}, _hostState, { error: "", ready: false, stage: "" });
     paintStatus();
     chrome.runtime.sendMessage({ action: "hostStart" }, s => {
       if (chrome.runtime.lastError) {
+        _asked.startAt = 0;
         _hostState.error = "Could not reach the extension worker. Reload the extension.";
       } else if (s) {
         _hostState = s;

@@ -296,7 +296,7 @@ const HOST_MISSING = "Native host not found. Start the server once with Start KA
                      "(it repairs the registration), then quit and reopen Chrome.";
 let _hostPort  = null;
 let _hostState = { connected: false, running: false, ready: false,
-                   stage: "", error: "", startedAt: 0 };
+                   stage: "", error: "", startedAt: 0, pid: null };
 
 function hostSnapshot() {
   return Object.assign({}, _hostState);
@@ -330,9 +330,11 @@ function _hostConnect() {
     if (!m || m.type === "pong") return;
     if (m.type === "stage")  _hostState.stage = m.stage || "";
     if (m.type === "ready")  { _hostState.ready = true; _hostState.running = true; _hostState.stage = "ready"; }
-    if (m.type === "status") _hostState.running = !!m.running;
+    // A pid arrives only with a server the host launched itself, which is the
+    // only kind it can stop. See hostStop.
+    if (m.type === "status") { _hostState.running = !!m.running; _hostState.pid = m.running ? (m.pid || null) : null; }
     if (m.type === "error")  _hostState.error = m.message || "host error";
-    if (m.type === "exit")   { _hostState.running = false; _hostState.ready = false; _hostState.stage = ""; }
+    if (m.type === "exit")   { _hostState.running = false; _hostState.ready = false; _hostState.stage = ""; _hostState.pid = null; }
     _hostBroadcast(m);
   });
   port.onDisconnect.addListener(() => {
@@ -351,6 +353,7 @@ function hostStart() {
   if (!_hostConnect()) return;
   _hostState.ready = false;
   _hostState.error = "";
+  _hostState.pid = null;
   _hostState.stage = "process-started";
   _hostState.startedAt = Date.now();
   _hostBroadcast();
@@ -360,16 +363,31 @@ function hostStart() {
   }
 }
 
-// kam_host.py can only stop a server it launched, and with no port open this
-// worker launched nothing, so opening a port just to send stop would do nothing
-// and say nothing. Say why instead.
-function hostStop() {
-  if (!_hostPort) {
-    _hostBroadcast({ type: "error", message:
-      "This server was not started from Chrome, so Chrome cannot stop it. Close its window instead." });
+// Two ways to stop. A server this worker's host launched is stopped through the
+// host, which lets synthesis finish and reports the exit. Anything else, started
+// with Start KAM TTS.bat or found already running when the host was asked to
+// start, the host cannot stop, since it only stops its own child. So the server
+// is asked directly; /shutdown is token-guarded like every other route.
+async function hostStop() {
+  if (_hostPort && _hostState.pid) {
+    try { _hostPort.postMessage({ cmd: "stop" }); return; } catch (e) { /* port gone; ask directly */ }
+  }
+  let res = null;
+  try {
+    res = await kamFetch(SERVER + "/shutdown", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: "{}" });
+  } catch (e) { res = null; }
+  if (res && res.ok) {
+    _hostState.running = false; _hostState.ready = false;
+    _hostState.stage = ""; _hostState.pid = null;
+    _hostBroadcast({ type: "log", line: "[HOST] Asked the server to shut down." });
+    _hostBroadcast({ type: "stopping" });
     return;
   }
-  try { _hostPort.postMessage({ cmd: "stop" }); } catch (e) { /* already gone */ }
+  const message = res && res.status === 403
+    ? "The server refused to stop: its token does not match this extension. Close its window instead."
+    : "Could not reach the server to stop it. If it is still running, close its window.";
+  _hostBroadcast({ type: "error", message });
 }
 
 // Asking never opens a port, since a port opened only to ask is a host process

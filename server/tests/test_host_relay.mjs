@@ -14,8 +14,9 @@ const check=(l,g,w)=>{ const ok=JSON.stringify(g)===JSON.stringify(w);
   ok?(PASS++,console.log('  ok   '+l)):(FAIL++,console.log(`  FAIL ${l}\n         got ${JSON.stringify(g)} want ${JSON.stringify(w)}`)); };
 
 const grab = (src, name) => {
-  const i = src.indexOf(`function ${name}(`);
+  let i = src.indexOf(`function ${name}(`);
   if (i < 0) throw new Error(`function ${name} not found`);
+  if (src.slice(Math.max(0, i - 6), i) === 'async ') i -= 6;   // keep it async
   let d=0, j=i;
   for (; j<src.length; j++){ if(src[j]==='{')d++; else if(src[j]==='}'){d--; if(!d){j++;break;} } }
   return src.slice(i,j);
@@ -44,7 +45,10 @@ function fakeChrome({ refuse = false } = {}) {
   return c;
 }
 
-function loadWorker(c) {
+const SERVER_URL = 'http://127.0.0.1:5050';
+const noFetch = async () => { throw new Error('unexpected HTTP call'); };
+
+function loadWorker(c, kamFetch = noFetch) {
   const consts = bg.slice(bg.indexOf('const HOST_NAME'), bg.indexOf('function hostSnapshot('));
   const code = `
     ${consts}
@@ -55,7 +59,7 @@ function loadWorker(c) {
     ${grab(bg, 'hostStop')}
     ${grab(bg, 'hostStatus')}
     return { hostStart, hostStop, hostStatus, hostSnapshot, get port(){ return _hostPort; } };`;
-  return new Function('chrome', code)({ runtime: c.runtime });
+  return new Function('chrome', 'kamFetch', 'SERVER', code)({ runtime: c.runtime }, kamFetch, SERVER_URL);
 }
 
 const events = c => c.broadcasts.filter(b => b.event).map(b => b.event.type);
@@ -92,16 +96,51 @@ console.log('\n=== start, boot, ready: every host message is relayed ===');
 
 console.log('\n=== stop ===');
 {
-  const c = fakeChrome(), w = loadWorker(c);
-  w.hostStop();
-  check('stop with no port opens nothing', c.connects, 0);
-  check('and says why', events(c), ['error']);
-  check('the reason names what to do', /Close its window/.test(c.broadcasts[0].event.message), true);
+  const calls = [];
+  const ok = async (url, opts) => { calls.push([url, opts.method, opts.headers['Content-Type']]); return { ok: true, status: 200 }; };
+  const c = fakeChrome(), w = loadWorker(c, ok);
+  await w.hostStop();
+  check('stop with no port opens no host', c.connects, 0);
+  check('it asks the server directly', calls, [[SERVER_URL + '/shutdown', 'POST', 'application/json']]);
+  check('and tells the pages', events(c), ['log', 'stopping']);
+}
+{
+  const calls = [];
+  const ok = async url => { calls.push(url); return { ok: true, status: 200 }; };
+  const c = fakeChrome(), w = loadWorker(c, ok);
   w.hostStart();
-  w.hostStop();
-  check('stop goes over the worker port', c.sent, ['start', 'stop']);
+  c.port.say({ type: 'status', running: true, pid: 42 });
+  check('the pid of a launched server is kept', w.hostSnapshot().pid, 42);
+  await w.hostStop();
+  check('a server the host launched is stopped through the host', c.sent, ['start', 'stop']);
+  check('without an HTTP call', calls, []);
   c.port.say({ type: 'exit', code: 0 });
   check('exit clears running', w.hostSnapshot().running, false);
+  check('and the pid', w.hostSnapshot().pid, null);
+}
+{
+  const calls = [];
+  const ok = async url => { calls.push(url); return { ok: true, status: 200 }; };
+  const c = fakeChrome(), w = loadWorker(c, ok);
+  w.hostStart();
+  c.port.say({ type: 'log', line: '[HOST] A server is already running on 5050 — using it.' });
+  c.port.say({ type: 'ready' });
+  await w.hostStop();
+  check('a server the host only found is asked directly', calls, [SERVER_URL + '/shutdown']);
+  check('the host is not sent a stop it cannot carry out', c.sent, ['start']);
+  check('state no longer says ready', [w.hostSnapshot().ready, w.hostSnapshot().stage], [false, '']);
+}
+{
+  const c = fakeChrome(), w = loadWorker(c, async () => ({ ok: false, status: 403 }));
+  await w.hostStop();
+  check('a refused stop is an error', events(c), ['error']);
+  check('which says the token is why', /token/.test(c.broadcasts.at(-1).event.message), true);
+}
+{
+  const c = fakeChrome(), w = loadWorker(c, async () => { throw new TypeError('Failed to fetch'); });
+  await w.hostStop();
+  check('an unreachable server is an error too', events(c), ['error']);
+  check('which says what to do', /close its window/.test(c.broadcasts.at(-1).event.message), true);
 }
 
 console.log('\n=== host missing or dropped ===');
@@ -143,9 +182,14 @@ check('dashboard.js never calls connectNative', /connectNative\s*\(/.test(dash),
   d.on({ type: 'log', line: 'hello' });
   d.on({ type: 'stage', stage: 'model-loading' });
   d.on({ type: 'ready' });
-  check('log line printed, stage drawn, ready turns it on', [log, power],
-        [['hello', '[HOST] ✓ Model Ready'], ['stage:model-loading', 'on']]);
+  check('log line printed, a stage starts the ring and draws, ready turns it on', [log, power],
+        [['hello', '[HOST] ✓ Model Ready'], ['loading', 'stage:model-loading', 'on']]);
   check('ready means running', d.running, true);
+  power.length = 0;
+  d.on({ type: 'stage', stage: 'standby' });
+  check('a stage after ready leaves the button alone', power, ['stage:standby']);
+  d.on({ type: 'stopping' });
+  check('stopping ends the toggle so the poll can turn it off', d.mid, false);
   log.length = 0; power.length = 0;
   d.on({ type: 'error', message: 'This server was not started from Chrome' });
   check('error while serving is logged but leaves the button alone', [log.length, power], [1, []]);
