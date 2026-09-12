@@ -233,6 +233,16 @@ for label, prep in (("with a good config", lambda: R.write_config(sys.executable
     except Exception as e:
         check(f"survives {label}", f"raised {e!r}", True)
 
+print("\n=== a packaged app's private copy is noticed ===")
+fake_local = TMP / "fake_localappdata"
+check("no Packages folder means nothing found", R.redirected_copies(str(fake_local)), [])
+(fake_local / "Packages" / "SomeOther_abc" / "LocalCache" / "Local").mkdir(parents=True)
+check("a package without our folder is ignored", R.redirected_copies(str(fake_local)), [])
+copy = fake_local / "Packages" / "Claude_xyz" / "LocalCache" / "Local" / "KAMTTS"
+copy.mkdir(parents=True)
+check("our folder inside a package is reported",
+      R.redirected_copies(str(fake_local)), [str(copy)])
+
 print("\n=== remove() takes every generated piece ===")
 R.write_config(sys.executable, HOST)
 R.write_manifest(R.PINNED_EXTENSION_ID, R.launcher_path())

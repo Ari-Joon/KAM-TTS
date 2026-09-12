@@ -564,6 +564,29 @@ def register(ext_id, python_exe=None, quiet=False):
     return True
 
 
+# --- Packaged-app redirection ---
+# A process started from inside a packaged Windows app (MSIX, such as the Claude
+# desktop app's terminal) has its writes to %LOCALAPPDATA% and HKCU\Software
+# quietly redirected into that package's private copy. It reads its own writes
+# back, so every check passes, while Chrome started from Explorer sees none of
+# it. This cost the move from OneDrive two days on 10 to 12 Sep: the real
+# registry still pointed at the old folder. The copy is left on disk, so its
+# presence is the tell.
+def redirected_copies(local_appdata=None):
+    base = local_appdata or os.environ.get("LOCALAPPDATA") or ""
+    packages = os.path.join(base, "Packages")
+    found = []
+    try:
+        names = os.listdir(packages)
+    except OSError:
+        return found
+    for name in names:
+        copy = os.path.join(packages, name, "LocalCache", "Local", "KAMTTS")
+        if os.path.isdir(copy):
+            found.append(copy)
+    return found
+
+
 def ensure_registered(python_exe=None, verbose=True):
     """Check the registration and repair it if it has gone stale.
 
@@ -576,6 +599,11 @@ def ensure_registered(python_exe=None, verbose=True):
     if os.name != "nt":
         return True
     try:
+        if verbose:
+            for copy in redirected_copies():
+                print(f"[HOST] Warning: a packaged app holds a private copy of this registration "
+                      f"({copy}). If this server was started from inside that app, Chrome cannot "
+                      f"see what it repairs. Start it from Explorer with Start KAM TTS.bat instead.")
         py = python_exe or _python_exe()
         cfg = read_config()
         stale = (cfg.get("python") != py or cfg.get("host") != HOST_SCRIPT)

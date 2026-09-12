@@ -468,9 +468,13 @@ function pollChunks() {
       }
       _renderChunkFeed(rows);
     }).catch(err => {
-      // Never swallow silently: a render error here empties the feed and looks
-      // exactly like "the server sent nothing", which is what hid a scope bug
-      // through two rounds of debugging.
+      // A server that is simply off is not an error, and logging it as one
+      // filled chrome://extensions with "Failed to fetch" every three seconds.
+      // The power button already shows it is off.
+      if (/Failed to fetch|NetworkError/i.test(String(err))) return;
+      // Anything else, never swallow silently: a render error here empties the
+      // feed and looks exactly like "the server sent nothing", which is what
+      // hid a scope bug through two rounds of debugging.
       console.error('[KAM] live feed render failed:', err);
       const ctr = document.getElementById('chunk-counter');
       if (ctr) ctr.textContent = 'feed error — see console';
