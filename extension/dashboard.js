@@ -1754,12 +1754,11 @@ document.addEventListener('DOMContentLoaded',()=>{
   _updateActionPreview();
 
   // --- Server power button (native messaging) ---
-  // The dashboard talks to a small native host (kam_host.py) that launches and
-  // stops server.py and streams its stdout here. Requires one-time setup via
-  // register_host.py. If the host isn't registered, connectNative fails and we
-  // explain how to set it up rather than silently doing nothing.
-  const HOST_NAME = 'com.kam.tts';
-  let _hostPort = null;
+  // A small native host (kam_host.py) launches and stops server.py and streams
+  // its output. The service worker holds that connection, not this page: the
+  // host stops the server when its port closes, and a port held here closed
+  // with the tab, so closing the dashboard used to take the server with it.
+  // The worker relays every host message back as a hostEvent.
   let _serverRunning = false;
   let _serverReady = false;
 
@@ -1834,55 +1833,60 @@ document.addEventListener('DOMContentLoaded',()=>{
     }
   }
 
-  function _connectHost() {
-    try {
-      _hostPort = chrome.runtime.connectNative(HOST_NAME);
-    } catch (e) {
-      addLog('[HOST] Native host unavailable — run register_host.py once to enable the power button.');
-      return null;
+  function _onHostEvent(msg) {
+    if (!msg) return;
+    if (msg.type === 'log')    addLog(msg.line || '');
+    else if (msg.type === 'stage') { _setStageProgress(msg.stage); }
+    else if (msg.type === 'status') {
+      if (msg.running) {
+        if (!_serverReady) _setPower('loading');
+      }
+      _serverRunning = !!msg.running;
     }
-    _hostPort.onMessage.addListener(msg => {
-      if (!msg) return;
-      if (msg.type === 'log')    addLog(msg.line || '');
-      else if (msg.type === 'stage') { _setStageProgress(msg.stage); }
-      else if (msg.type === 'status') {
-        if (msg.running) {
-          if (!_serverReady) _setPower('loading');
-        }
-        _serverRunning = !!msg.running;
-      }
-      else if (msg.type === 'ready') {
-        addLog('[HOST] ✓ Model Ready');
-        _serverReady = true; _serverRunning = true; _midToggle = false;
-        _completePower();   // fill to 100% + completion animation → solid green
-      }
-      else if (msg.type === 'exit') {
-        addLog(`[HOST] Server exited (code ${msg.code})`);
-        _serverReady = false; _serverRunning = false; _midToggle = false;
-        _setPower('off');
-      }
-      else if (msg.type === 'error') {
-        addLog('[HOST] ' + (msg.message || 'error'));
-        // A real failure ends the loading state so the ring doesn't spin forever.
-        _midToggle = false;
-      }
-    });
-    _hostPort.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError;
-      addLog('[HOST] Disconnected' + (err ? ': ' + err.message : '') +
-             '. If the power button does nothing, run register_host.py and restart Chrome.');
-      _hostPort = null;
-      _serverReady = false; _midToggle = false;
+    else if (msg.type === 'ready') {
+      addLog('[HOST] ✓ Model Ready');
+      _serverReady = true; _serverRunning = true; _midToggle = false;
+      _completePower();   // fill to 100% + completion animation → solid green
+    }
+    else if (msg.type === 'exit') {
+      addLog(`[HOST] Server exited (code ${msg.code})`);
+      _serverReady = false; _serverRunning = false; _midToggle = false;
       _setPower('off');
-    });
-    return _hostPort;
+    }
+    else if (msg.type === 'error') {
+      addLog('[HOST] ' + (msg.message || 'error'));
+      // A real failure ends the loading state so the ring doesn't spin forever.
+      // The console poll puts it back to green if the server is in fact up.
+      _midToggle = false;
+      if (!_serverReady) _setPower('off');
+    }
+    else if (msg.type === 'disconnect') {
+      // Only worth a line when Chrome gave a reason. A quiet close is the host
+      // exiting after a stop, which the exit message has already reported.
+      if (msg.message) addLog('[HOST] Disconnected: ' + msg.message);
+      _midToggle = false;
+    }
   }
 
-  function _hostSend(cmd) {
-    if (!_hostPort && !_connectHost()) return;
-    try { _hostPort.postMessage({ cmd }); }
-    catch (e) { addLog('[HOST] send failed: ' + e.message); }
+  function _hostSend(action) {
+    try {
+      chrome.runtime.sendMessage({ action }, () => {
+        if (chrome.runtime.lastError) {
+          _onHostEvent({ type: 'error', message:
+            'Could not reach the extension worker. Reload the extension at chrome://extensions.' });
+        }
+      });
+    } catch (e) {
+      _onHostEvent({ type: 'error', message: 'send failed: ' + e.message });
+    }
   }
+
+  try {
+    chrome.runtime.onMessage.addListener(req => {
+      if (req && req.action === 'hostEvent' && req.event) _onHostEvent(req.event);
+      return false;
+    });
+  } catch (e) { /* no runtime; the console poll still drives the button */ }
 
   const powerBtn = document.getElementById('power-btn');
   if (powerBtn) {
@@ -1892,19 +1896,28 @@ document.addEventListener('DOMContentLoaded',()=>{
         addLog('[HOST] Stopping server…');
         _midToggle = true;
         _setPower('loading');   // animate during shutdown too
-        _hostSend('stop');
+        _hostSend('hostStop');
       } else {
         addLog('[HOST] Starting server…');
         _serverReady = false;
         _midToggle = true;       // hold the ring until the server answers
         _resetProgress();        // empty the green arc; it fills per stage
         _setPower('loading');
-        if (!_hostPort) _connectHost();
-        _hostSend('start');
+        _hostSend('hostStart');
       }
     });
-    // Ask the host for current status on load (also establishes the port).
-    setTimeout(() => _hostSend('status'), 300);
+    // A dashboard opened mid-boot (from the popup's start, say) picks up the
+    // ring where the boot is, rather than showing off until the next stage.
+    try {
+      chrome.runtime.sendMessage({ action: 'hostState' }, s => {
+        if (chrome.runtime.lastError || !s) return;
+        if (s.connected && s.stage && s.stage !== 'ready' && !s.error) {
+          _serverReady = false; _midToggle = true;
+          _setPower('loading');
+          _setStageProgress(s.stage);
+        }
+      });
+    } catch (e) { /* worker not up yet */ }
   }
 
   // --- Settings cog + theme picker ---

@@ -285,9 +285,15 @@ function stripMarkersForDisplay(text) {
 // So the worker holds the port instead. It outlives the popup, the existing
 // keepAlive alarm pings the host every 24 seconds so neither the port nor the
 // worker goes idle, and the server therefore stays up for as long as Chrome
-// does. The dashboard keeps its own connection and is untouched; a second host
-// process just finds the server already on 5050 and reports it as running.
+// does.
+//
+// The dashboard used to hold a port of its own, so a server started from the
+// dashboard died when its tab closed (seen 12 Sep). It now goes through here
+// too, and each host message is relayed to it whole, log lines included, so
+// the dashboard console reads exactly as it did.
 const HOST_NAME = "com.kam.tts";
+const HOST_MISSING = "Native host not found. Start the server once with Start KAM TTS.bat " +
+                     "(it repairs the registration), then quit and reopen Chrome.";
 let _hostPort  = null;
 let _hostState = { connected: false, running: false, ready: false,
                    stage: "", error: "", startedAt: 0 };
@@ -296,61 +302,82 @@ function hostSnapshot() {
   return Object.assign({}, _hostState);
 }
 
-// Tell anyone listening (the popup, mostly) that something moved. Wrapped
-// because with no popup open there is no receiver and that rejects.
-function _hostBroadcast() {
+// Tell anyone listening (the popup and the dashboard) that something moved.
+// `event` is the host message that caused it, when there was one. Wrapped
+// because with no page open there is no receiver and that rejects.
+function _hostBroadcast(event) {
+  const msg = { action: "hostEvent", state: hostSnapshot() };
+  if (event) msg.event = event;
   try {
-    chrome.runtime.sendMessage({ action: "hostEvent", state: hostSnapshot() })
-      .catch(() => {});
+    chrome.runtime.sendMessage(msg).catch(() => {});
   } catch (e) { /* nobody listening */ }
 }
 
-function hostStart() {
-  if (!_hostPort) {
-    try {
-      _hostPort = chrome.runtime.connectNative(HOST_NAME);
-    } catch (e) {
-      _hostState.error = "Native host unavailable. Run register_host.py once, then restart Chrome.";
-      _hostBroadcast();
-      return;
-    }
-    _hostState.connected = true;
-    _hostState.error = "";
-    _hostPort.onMessage.addListener(m => {
-      if (!m) return;
-      if (m.type === "stage")  _hostState.stage = m.stage || "";
-      if (m.type === "ready")  { _hostState.ready = true; _hostState.running = true; _hostState.stage = "ready"; }
-      if (m.type === "status") _hostState.running = !!m.running;
-      if (m.type === "error")  _hostState.error = m.message || "host error";
-      if (m.type === "exit")   { _hostState.running = false; _hostState.ready = false; _hostState.stage = ""; }
-      if (m.type === "stage" || m.type === "ready" || m.type === "status"
-          || m.type === "error" || m.type === "exit") _hostBroadcast();
-    });
-    _hostPort.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError;
-      _hostPort = null;
-      _hostState.connected = false;
-      // Not cleared: whether the server is up is now a question for the health
-      // check, since the host going away does not by itself say it stopped.
-      if (err && !_hostState.error) {
-        _hostState.error = "Native host unavailable. Run register_host.py once, then restart Chrome.";
-      }
-      _hostBroadcast();
-    });
+function _hostConnect() {
+  if (_hostPort) return _hostPort;
+  try {
+    _hostPort = chrome.runtime.connectNative(HOST_NAME);
+  } catch (e) {
+    _hostPort = null;
+    _hostState.error = HOST_MISSING;
+    _hostBroadcast({ type: "error", message: HOST_MISSING });
+    return null;
   }
+  _hostState.connected = true;
+  _hostState.error = "";
+  const port = _hostPort;
+  port.onMessage.addListener(m => {
+    if (!m || m.type === "pong") return;
+    if (m.type === "stage")  _hostState.stage = m.stage || "";
+    if (m.type === "ready")  { _hostState.ready = true; _hostState.running = true; _hostState.stage = "ready"; }
+    if (m.type === "status") _hostState.running = !!m.running;
+    if (m.type === "error")  _hostState.error = m.message || "host error";
+    if (m.type === "exit")   { _hostState.running = false; _hostState.ready = false; _hostState.stage = ""; }
+    _hostBroadcast(m);
+  });
+  port.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError;
+    if (_hostPort === port) _hostPort = null;
+    _hostState.connected = false;
+    // Not cleared: whether the server is up is now a question for the health
+    // check, since the host going away does not by itself say it stopped.
+    if (err && !_hostState.error) _hostState.error = HOST_MISSING;
+    _hostBroadcast({ type: "disconnect", message: err ? err.message : "" });
+  });
+  return port;
+}
+
+function hostStart() {
+  if (!_hostConnect()) return;
   _hostState.ready = false;
+  _hostState.error = "";
   _hostState.stage = "process-started";
   _hostState.startedAt = Date.now();
   _hostBroadcast();
   try { _hostPort.postMessage({ cmd: "start" }); } catch (e) {
     _hostState.error = String(e && e.message || e);
-    _hostBroadcast();
+    _hostBroadcast({ type: "error", message: _hostState.error });
   }
 }
 
+// kam_host.py can only stop a server it launched, and with no port open this
+// worker launched nothing, so opening a port just to send stop would do nothing
+// and say nothing. Say why instead.
 function hostStop() {
-  if (!_hostPort) return;
+  if (!_hostPort) {
+    _hostBroadcast({ type: "error", message:
+      "This server was not started from Chrome, so Chrome cannot stop it. Close its window instead." });
+    return;
+  }
   try { _hostPort.postMessage({ cmd: "stop" }); } catch (e) { /* already gone */ }
+}
+
+// Asking never opens a port, since a port opened only to ask is a host process
+// started for nothing. Pages that open mid-boot get the snapshot and then events.
+function hostStatus() {
+  if (_hostPort) {
+    try { _hostPort.postMessage({ cmd: "status" }); } catch (e) { /* already gone */ }
+  }
 }
 
 function _hostPing() {
@@ -493,7 +520,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // --- Starting the server from anywhere, not just the dashboard ---
   if (request.action === "hostStart") { hostStart(); sendResponse(hostSnapshot()); return true; }
   if (request.action === "hostStop")  { hostStop();  sendResponse(hostSnapshot()); return true; }
-  if (request.action === "hostState") { sendResponse(hostSnapshot()); return true; }
+  if (request.action === "hostState") { hostStatus(); sendResponse(hostSnapshot()); return true; }
 
   // The dashboard data proxy, since player.html routes its server fetches here
   if (request.action === "dashboardFetch") {

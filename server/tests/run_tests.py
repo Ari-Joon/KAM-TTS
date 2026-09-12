@@ -41,6 +41,7 @@ SUITES = [
     ("maths",         "test_maths.py",        "LaTeX, unicode maths, list markers"),
     ("audio",         "test_audio.py",        "gain staging and clipping"),
     ("feed",          "test_feed.mjs",        "dashboard live-feed pause"),
+    ("host_relay",    "test_host_relay.mjs",  "only the worker holds the host port"),
     ("markers",       "test_markers.mjs",     "page structure from walker to position hint"),
     ("scan_host",     "test_scan_host.py",    "what the phone listener refuses"),
     ("scan_text",     "test_scan_text.mjs",   "turning OCR output into speakable text"),

@@ -29,6 +29,7 @@ learner builds an empty one and the tests still pass.
 | `test_facets.py` | Content-facet labelling, especially that ordinary prose is not filed as a definition or code |
 | `test_audio.py` | Gain staging: level preserved against the old chain, nothing clipped |
 | `test_feed.mjs` | The dashboard live-feed pause and its pending count |
+| `test_host_relay.mjs` | That only the service worker opens the native-host port, so closing the dashboard cannot stop the server, and that every host message still reaches the dashboard |
 | `test_maths.py` | LaTeX and unicode maths, and list markers that prose only looks like |
 | `test_markers.mjs` | Structure from the page walkers through the chunker to the position hint: that a bullet is wrapped and a heading keeps its level, that every hint is one `_POSITION_TYPE` acts on, and that the marker grammar matches across the four files that strip it |
 | `test_recorder.mjs` | WAV encoding and where a take gets trimmed |
