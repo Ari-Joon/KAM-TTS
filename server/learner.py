@@ -4009,7 +4009,12 @@ def get_chunk_feed(limit=20):
 
     The report columns are correlated subqueries rather than a join, so a chunk
     with several reports still produces exactly one row and the feed cannot
-    silently duplicate cards."""
+    silently duplicate cards.
+
+    The most recent issue breaks timestamp ties on rowid. Two reports made in
+    quick succession can share a timestamp to the clock's resolution, and
+    ordering on ts alone then returns whichever SQLite happens to meet first,
+    which showed up as a test that passed on one run and failed on the next."""
     with _db_lock:
         conn = _get_db()
         total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
@@ -4022,7 +4027,7 @@ def get_chunk_feed(limit=20):
                    (SELECT COUNT(*) FROM reports r WHERE r.chunk_id = c.id)
                        AS report_count,
                    (SELECT r.issue FROM reports r WHERE r.chunk_id = c.id
-                        ORDER BY r.ts DESC LIMIT 1) AS report_issue
+                        ORDER BY r.ts DESC, r.rowid DESC LIMIT 1) AS report_issue
             FROM chunks c ORDER BY c.ts DESC LIMIT ?
         """, (limit,)).fetchall()
         conn.close()

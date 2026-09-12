@@ -131,9 +131,13 @@ with _fc:
                 ("feed-reported", time.time(), "A chunk I reported.", "feed_test", 0.8))
     _fc.execute("INSERT INTO chunks (id, ts, text, voice, quality_score) VALUES (?,?,?,?,?)",
                 ("feed-plain", time.time(), "A chunk I left alone.", "feed_test", 0.95))
+    # Both reports share one timestamp on purpose. Two reports a moment apart can
+    # land in the same clock tick, and "most recent" must still mean the one
+    # made second rather than whichever the database returns first.
+    _same_tick = time.time()
     for issue in ("pronunciation", "hallucination"):
         _fc.execute("INSERT INTO reports (ts, chunk_id, chunk_text, issue) VALUES (?,?,?,?)",
-                    (time.time(), "feed-reported", "A chunk I reported.", issue))
+                    (_same_tick, "feed-reported", "A chunk I reported.", issue))
 _fc.close()
 
 feed = {r["chunk_id"]: r for r in L.get_chunk_feed(50)}
