@@ -35,6 +35,8 @@ learner builds an empty one and the tests still pass.
 | `test_markers.mjs` | Structure from the page walkers through the chunker to the position hint: that a bullet is wrapped and a heading keeps its level, that every hint is one `_POSITION_TYPE` acts on, and that the marker grammar matches across the four files that strip it |
 | `test_recorder.mjs` | WAV encoding and where a take gets trimmed |
 | `test_voiceclips.py` | Clip slots, transcript sidecars, and what the recorder uploads |
+| `test_updater.py` | Installing a newer release: a zip refused unless its checksum and version are right, your pronunciations and recordings kept, a failed copy put back; a git clone fast-forwarded, or left alone when it would clash |
+| `test_update_ui.mjs` | The dashboard's update button and bar, and the worker bringing the server and dashboard back after the restart |
 | `test_register_host.py` | The native-host launcher: staged builds that must answer a live message before replacing a working one, upgrades while the old launcher is running, cmd-safe paths, and that the real registry key is never touched |
 | `test_namecheck.py` | No server module reads a name it never defines. A gate since a swallowed NameError silently disabled the boot-time registration repair |
 | `test_scan_host.py` | What the phone-scanning listener refuses: wrong or partial keys, oversized bodies, stale sessions, unknown paths |

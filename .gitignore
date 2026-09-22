@@ -67,3 +67,6 @@ my_voice.wav
 # --- Python ---
 __pycache__/
 *.pyc
+
+# Scratch space while an update is being installed
+.kam_update/

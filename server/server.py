@@ -173,6 +173,7 @@ import device as _device            # cross-platform backend selection
 import audio_quality as _aq         # reference-clip gate + output validation
 import benchmark as _bench          # shared, streamable speed measurement
 import scan_host as _scan           # the short-lived LAN listener a phone can reach
+import updater as _updater          # installs a newer release when the dashboard asks
 from flask_cors import CORS  # type: ignore
 print("[BOOT] importing TTS + torch (this is the slow one)…", flush=True)
 # Speed up the transformers import: skip the optional integrations and the
@@ -4230,6 +4231,33 @@ def shutdown_route():
         os._exit(0)
     _threading.Timer(0.3, _graceful_exit).start()
     return jsonify({"ok": True, "stopping": True})
+
+
+@app.route("/update/info", methods=["GET"])
+def update_info_route():
+    """What this copy is and how it would be updated, for the dashboard's update bar."""
+    try:
+        return jsonify({"version": _updater.current_version(), "how": _updater.install_mode()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/update/apply", methods=["POST"])
+def update_apply_route():
+    """Install GitHub's newest release over this copy (see updater.py). Blocks
+    until the files are in place; the extension then restarts everything. A
+    refusal is an answer, not a fault, so it comes back as ok: false."""
+    print(f"{C.WARN}[UPDATE] installing the newest release{C.RESET}")
+    try:
+        result = _updater.apply_latest()
+        print(f"{C.WARN}[UPDATE] {result['from']} -> {result['to']} ({result['how']}); restart to finish{C.RESET}")
+        return jsonify(result)
+    except _updater.UpdateError as e:
+        print(f"{C.WARN}[UPDATE] not installed: {e}{C.RESET}")
+        return jsonify({"ok": False, "reason": str(e)})
+    except Exception as e:
+        print(f"{C.WARN}[UPDATE] failed: {e}{C.RESET}")
+        return jsonify({"ok": False, "reason": f"The update failed ({e}). Nothing was changed."}), 500
 
 
 @app.route("/session/complete", methods=["POST"])

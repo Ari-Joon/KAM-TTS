@@ -405,6 +405,36 @@ function _hostPing() {
   try { _hostPort.postMessage({ cmd: "ping" }); } catch (e) { _hostPort = null; }
 }
 
+// --- Finishing an update ---
+// The server has put the new files in place, but the old code is still what is
+// running on both sides. Stop the server, wait for it to go (a new one would
+// meet the old one's lock), then reload the extension. The new worker picks up
+// where this left off in _resumeAfterUpdate.
+function _serverUp() {
+  return fetch(SERVER + "/health", { cache: "no-store" }).then(r => r.ok, () => false);
+}
+
+async function _updateRestart(req) {
+  try { await chrome.storage.local.set({ kamResume: { at: Date.now(), from: req.from, to: req.to } }); } catch (e) {}
+  await hostStop();
+  for (let i = 0; i < 40 && await _serverUp(); i++) await new Promise(r => setTimeout(r, 500));
+  chrome.runtime.reload();
+}
+
+// After the reload an update asked for: start the server again, bring the
+// dashboard back to the front, and leave it a note to say what changed.
+async function _resumeAfterUpdate() {
+  let saved = null;
+  try { saved = (await chrome.storage.local.get("kamResume")).kamResume; } catch (e) { return; }
+  if (!saved) return;
+  try { await chrome.storage.local.remove("kamResume"); } catch (e) {}
+  if (Date.now() - saved.at > 5 * 60 * 1000) return;   // not this restart
+  try { await chrome.storage.local.set({ kamUpdated: { at: Date.now(), from: saved.from, to: saved.to } }); } catch (e) {}
+  hostStart();
+  await ensureDashboardTab();
+  if (playerTabId) { try { await chrome.tabs.update(playerTabId, { active: true }); } catch (e) {} }
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Completion broadcast from offscreen, keyed by chunk seq. This is the single
@@ -539,6 +569,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "hostStart") { hostStart(); sendResponse(hostSnapshot()); return true; }
   if (request.action === "hostStop")  { hostStop();  sendResponse(hostSnapshot()); return true; }
   if (request.action === "hostState") { hostStatus(); sendResponse(hostSnapshot()); return true; }
+  if (request.action === "updateRestart") { _updateRestart(request); sendResponse({ ok: true }); return true; }
 
   // The dashboard data proxy, since player.html routes its server fetches here
   if (request.action === "dashboardFetch") {
@@ -873,3 +904,4 @@ try { chrome.runtime.onStartup.addListener(_warmStart); } catch (e) {}
 try { chrome.runtime.onInstalled.addListener(_warmStart); } catch (e) {}
 // Also run once now, for the case where the SW just woke on its own.
 _warmStart();
+_resumeAfterUpdate();

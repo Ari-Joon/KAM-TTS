@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag, the manifest and the zip's name must agree: the updater refuses
+      # a download that says it is a different version from its release.
+      - name: Check the version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(python3 -c "import json; print(json.load(open('extension/manifest.json'))['version'])")
+          if [ "$tag" != "$manifest" ]; then echo "tag is $tag but manifest.json says $manifest"; exit 1; fi
+
+      # Exactly the files in the repository at this tag, in a KAM TTS folder.
+      # Nothing personal is committed, so nothing personal ships.
+      - name: Package
+        run: |
+          git archive --format=zip --prefix="KAM TTS/" -o "KAM-TTS-${GITHUB_REF_NAME}.zip" "${GITHUB_REF_NAME}"
+          sha256sum "KAM-TTS-${GITHUB_REF_NAME}.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            KAM-TTS-${{ github.ref_name }}.zip
+            SHA256SUMS.txt
+          generate_release_notes: true

@@ -217,6 +217,31 @@ power button, or `python server.py`.
 
 ---
 
+## Updates
+
+The circular arrow at the right of the dashboard's top bar checks GitHub for a
+newer version, and the dashboard also checks by itself a few seconds after it
+opens and every six hours while it stays open. When there is one, the arrow
+becomes a gold **Update to x.y.z** button and a bar under the top bar says what
+changed, with **What's new**, **Not now** and **Update now**.
+
+**Update now** asks the server to install it, then restarts the server and the
+extension, and the dashboard comes back saying what it was updated from. What
+installing means depends on how you got KAM TTS:
+
+- **A release zip.** It downloads the new release, refuses it unless its SHA-256
+  matches the one GitHub publishes, and copies it over your copy. Your
+  pronunciations, corrections and voice recordings are never replaced, and if
+  anything fails part-way every file already replaced is put back.
+- **A git clone.** It fast-forwards to the branch you track. If that would clash
+  with your own edits or commits it stops, says which, and leaves the checkout
+  exactly as it was.
+
+Python packages an update needs are installed first, before any file changes,
+with torch and torchaudio held at the versions you installed for your hardware,
+so an update never swaps in a torch build that does not match your machine.
+**Not now** hides the bar for that version; the gold button stays.
+
 ## Recording good reference clips
 
 Clone quality is set almost entirely by the reference audio, so this matters
@@ -407,6 +432,10 @@ currently being spoken cannot be deleted until you switch away from it.
   after twenty minutes. See **Scanning a page with your phone** above.
 - Override with the `KAM_TOKEN` or `KAM_EXTENSION_ID` environment variables for
   custom setups.
+- The only request KAM TTS makes on its own account is the update check: the
+  dashboard asks GitHub's releases API which version is newest, sending nothing
+  about you, your voice or what you read. A download happens only after
+  **Update now**, and is refused unless its SHA-256 matches GitHub's.
 
 ---
 

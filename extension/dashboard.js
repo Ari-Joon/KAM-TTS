@@ -2926,3 +2926,148 @@ document.addEventListener('DOMContentLoaded',()=>{
   setInterval(doPoll,3000);
   addLog('[LEARNER] Dashboard connected — polling every 3s');
 });
+
+// =============================================================================
+// Updates. The dashboard asks GitHub itself, so it can answer with the server
+// off. Installing is the server's job (updater.py) and restarting is the
+// worker's: it stops the server, reloads the extension and starts both again.
+// =============================================================================
+const UPD_API = 'https://api.github.com/repos/Ari-Joon/KAM-TTS/releases/latest';
+const UPD_EVERY = 6 * 60 * 60 * 1000;
+let _updRelease = null;        // a newer release, once one is known
+let _updLabelTimer = null;
+
+// 0.10.0 is older than 0.9.0 if you compare the text, so compare number by number.
+function updIsNewer(a, b) {
+  const A = String(a).split('.'), B = String(b).split('.');
+  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+    const x = parseInt(A[i], 10) || 0, y = parseInt(B[i], 10) || 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+function updThisVersion() { return chrome.runtime.getManifest().version; }
+
+async function updLatest() {
+  const r = await fetch(UPD_API, { cache: 'no-store', headers: { Accept: 'application/vnd.github+json' } });
+  if (r.status === 404) return null;                    // nothing released yet
+  if (!r.ok) throw new Error('GitHub replied ' + r.status);
+  const j = await r.json();
+  const v = String(j.tag_name || '').replace(/^v/i, '');
+  if (j.draft || j.prerelease || !/^\d+\.\d+\.\d+$/.test(v)) return null;
+  return { version: v, url: j.html_url || 'https://github.com/Ari-Joon/KAM-TTS/releases/latest',
+           notes: String(j.name || '').replace(/^KAM TTS\s+v?[\d.]+\s*[-–—:]\s*/i, '') };
+}
+
+// The button in the top bar. 'said' shows an answer for a moment, then the quiet icon returns.
+function updButton(state, text) {
+  const b = document.getElementById('upd-btn'); if (!b) return;
+  clearTimeout(_updLabelTimer);
+  b.classList.toggle('checking', state === 'checking');
+  b.classList.toggle('available', state === 'available');
+  b.querySelector('.upd-label').textContent = state === 'available' ? 'Update to ' + _updRelease.version
+    : state === 'working' ? 'Updating…' : state === 'said' ? (text || '') : '';
+  const tip = state === 'available' ? 'KAM TTS ' + _updRelease.version + ' is available. Click for details.'
+    : 'Check for updates. You have ' + updThisVersion() + '.';
+  b.title = tip; b.setAttribute('aria-label', tip);
+  if (state === 'said') _updLabelTimer = setTimeout(() => updButton(_updRelease ? 'available' : 'idle'), 4000);
+}
+
+// The bar: 'offer' a waiting version, 'working' while it installs, 'problem' when it
+// did not, 'done' after a restart. No kind hides it.
+function updBar(kind, message) {
+  const bar = document.getElementById('upd-bar'); if (!bar) return;
+  if (!kind) { bar.hidden = true; return; }
+  bar.classList.toggle('problem', kind === 'problem');
+  bar.dataset.kind = kind;
+  document.getElementById('upd-msg').textContent = message;
+  document.getElementById('upd-progress').hidden = kind !== 'working';
+  const now = document.getElementById('upd-now'), later = document.getElementById('upd-later');
+  now.hidden = !(kind === 'offer' || kind === 'problem');
+  now.textContent = kind === 'problem' ? 'Try again' : 'Update now';
+  later.hidden = kind === 'working';
+  later.textContent = kind === 'done' ? 'Dismiss' : 'Not now';
+  if (_updRelease) document.getElementById('upd-notes').href = _updRelease.url;
+  bar.hidden = false;
+}
+
+function updOffer() {
+  const r = _updRelease;
+  updButton('available');
+  updBar('offer', 'KAM TTS ' + r.version + ' is available' + (r.notes ? ' — ' + r.notes : '') + '. It is free, as always.');
+}
+
+async function updCheck(manual) {
+  if (manual) updButton('checking');
+  try {
+    const latest = await updLatest();
+    try { localStorage.setItem('kam-upd-checked', String(Date.now())); } catch (e) {}
+    if (latest && updIsNewer(latest.version, updThisVersion())) {
+      _updRelease = latest;
+      let skipped = null; try { skipped = localStorage.getItem('kam-upd-skip'); } catch (e) {}
+      if (!manual && skipped === latest.version) { updButton('available'); return; }  // they said not now
+      updOffer();
+    } else {
+      _updRelease = null;
+      updButton(manual ? 'said' : 'idle', 'Up to date');
+      if (manual) showToast('You are on the latest version, ' + updThisVersion() + '.', 'info');
+    }
+  } catch (e) {
+    if (manual) { updButton('said', "Couldn't check"); showToast('Could not check for updates: ' + e.message); }
+  }
+}
+
+function updMaybe() {
+  let last = 0; try { last = parseInt(localStorage.getItem('kam-upd-checked'), 10) || 0; } catch (e) {}
+  if (Date.now() - last >= UPD_EVERY) updCheck(false);
+}
+
+async function updInstall() {
+  const r = _updRelease; if (!r) return;
+  if (!confirm('Updating stops anything being read, installs KAM TTS ' + r.version + ', and restarts the server ' +
+               'and this dashboard. Your voices, recordings and what KAM TTS has learned are kept.\n\nUpdate now?')) return;
+  updButton('working');
+  updBar('working', 'Installing KAM TTS ' + r.version + '…');
+  let res = null;
+  try { res = await api('/update/apply', 'POST', {}); }
+  catch (e) {
+    res = { ok: false, reason: 'The server is not running, and it is what installs the update. ' +
+                               'Start it with the power button, then try again.' };
+  }
+  if (!res || !res.ok) {
+    updButton('available');
+    updBar('problem', (res && (res.reason || res.error)) || 'The update did not finish. Nothing was changed.');
+    return;
+  }
+  updBar('working', 'Installed ' + res.to + '. Restarting KAM TTS…');
+  chrome.runtime.sendMessage({ action: 'updateRestart', from: res.from, to: res.to }, () => void chrome.runtime.lastError);
+}
+
+function updLater() {
+  const bar = document.getElementById('upd-bar');
+  if (_updRelease && bar.dataset.kind === 'offer') {
+    try { localStorage.setItem('kam-upd-skip', _updRelease.version); } catch (e) {}
+    showToast('Hidden until the next version. The gold update button at the top brings it back.', 'info');
+  }
+  updBar(null);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  updButton('idle');
+  document.getElementById('upd-btn').addEventListener('click', () => { if (_updRelease) updOffer(); else updCheck(true); });
+  document.getElementById('upd-now').addEventListener('click', updInstall);
+  document.getElementById('upd-later').addEventListener('click', updLater);
+
+  // Just restarted by an update: say so, once.
+  chrome.storage.local.get('kamUpdated', s => {
+    const u = s && s.kamUpdated;
+    if (!u) return;
+    chrome.storage.local.remove('kamUpdated');
+    if (Date.now() - u.at < 5 * 60 * 1000) updBar('done', 'KAM TTS is now ' + u.to + ', updated from ' + u.from + '.');
+  });
+
+  // A few seconds after opening, then every six hours for as long as it stays open.
+  setTimeout(updMaybe, 5000);
+  setInterval(updMaybe, 15 * 60 * 1000);
+});

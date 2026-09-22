@@ -48,6 +48,8 @@ SUITES = [
     ("scan_text",     "test_scan_text.mjs",   "turning OCR output into speakable text"),
     ("recorder",      "test_recorder.mjs",    "WAV encoding and take trimming"),
     ("voiceclips",    "test_voiceclips.py",   "recording, transcripts, clip slots"),
+    ("updater",       "test_updater.py",      "installing a newer release, and every refusal"),
+    ("update_ui",     "test_update_ui.mjs",   "the update button, bar and restart"),
 ]
 
 
