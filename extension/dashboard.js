@@ -2933,6 +2933,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 // worker's: it stops the server, reloads the extension and starts both again.
 // =============================================================================
 const UPD_API = 'https://api.github.com/repos/Ari-Joon/KAM-TTS/releases/latest';
+// Opened again within this long of a check, the dashboard does not ask at all.
 const UPD_EVERY = 6 * 60 * 60 * 1000;
 let _updRelease = null;        // a newer release, once one is known
 let _updLabelTimer = null;
@@ -3067,7 +3068,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (Date.now() - u.at < 5 * 60 * 1000) updBar('done', 'KAM TTS is now ' + u.to + ', updated from ' + u.from + '.');
   });
 
-  // A few seconds after opening, then every six hours for as long as it stays open.
+  // Once, a few seconds after the dashboard opens, and never while it stays open: an
+  // update matters, but not enough to keep going back to the network for it. The
+  // button still asks whenever it is clicked.
   setTimeout(updMaybe, 5000);
-  setInterval(updMaybe, 15 * 60 * 1000);
 });

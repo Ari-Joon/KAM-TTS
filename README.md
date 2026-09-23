@@ -220,8 +220,9 @@ power button, or `python server.py`.
 ## Updates
 
 The circular arrow at the right of the dashboard's top bar checks GitHub for a
-newer version, and the dashboard also checks by itself a few seconds after it
-opens and every six hours while it stays open. When there is one, the arrow
+newer version, and the dashboard also checks by itself once, a few seconds after
+it opens, and never while it stays open. Opened again within six hours of a
+check, it does not ask at all. When there is one, the arrow
 becomes a gold **Update to x.y.z** button and a bar under the top bar says what
 changed, with **What's new**, **Not now** and **Update now**.
 

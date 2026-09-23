@@ -24,7 +24,7 @@ function element(id) {
 function page({ release, stored = {}, api, confirmAnswer = true, version = '0.10.0' }) {
   const els = {}; for (const id of ['upd-btn', 'upd-bar', 'upd-msg', 'upd-progress', 'upd-notes', 'upd-now', 'upd-later']) els[id] = element(id);
   els.label = element('label'); els['upd-btn'].querySelector = () => els.label;
-  let ready = null; const sent = [], toasts = [], local = { ...stored }, ls = {};
+  let ready = null; const sent = [], toasts = [], local = { ...stored }, ls = {}, timers = { intervals: 0, timeouts: [] };
   const env = {
     document: { getElementById: id => els[id], addEventListener: (t, fn) => { if (t === 'DOMContentLoaded') ready = fn; } },
     chrome: { runtime: { getManifest: () => ({ version }), sendMessage: (m, cb) => { sent.push(m); cb && cb(); }, lastError: null },
@@ -34,14 +34,15 @@ function page({ release, stored = {}, api, confirmAnswer = true, version = '0.10
     showToast: (m, kind) => toasts.push([kind || 'error', m]),
     api: api || (async () => ({ ok: true, from: version, to: '0.11.0' })),
     confirm: () => confirmAnswer,
-    setTimeout: () => 0, setInterval: () => 0, clearTimeout: () => {},
+    setTimeout: (fn, ms) => { timers.timeouts.push(ms); return 0; },
+    setInterval: () => { timers.intervals++; return 0; }, clearTimeout: () => {},
   };
   const section = dash.slice(dash.indexOf('// Updates. The dashboard asks GitHub itself'));
   const fns = new Function(...Object.keys(env), `${section}
     return { updCheck, updInstall, updLater, updIsNewer };`)(...Object.values(env));
   ready();
   const bar = () => els['upd-bar'].hidden ? 'hidden' : els['upd-bar'].dataset.kind;
-  return { ...fns, els, sent, toasts, ls, local, bar, label: () => els.label.textContent, button: () => els['upd-btn'].classes };
+  return { ...fns, els, sent, toasts, ls, local, timers, bar, label: () => els.label.textContent, button: () => els['upd-btn'].classes };
 }
 const release = v => ({ tag_name: 'v' + v, name: `KAM TTS ${v} - a change`, html_url: 'https://example.invalid/rel', draft: false, prerelease: false });
 
@@ -49,6 +50,8 @@ console.log('\n=== the button ===');
 {
   const p = page({ release: release('0.10.0') });
   check('quiet while nothing newer is known', [p.button(), p.label(), p.bar()], [[], '', 'hidden']);
+  check('it asks once, five seconds after opening', p.timers.timeouts, [5000]);
+  check('and sets nothing to ask again while it stays open', p.timers.intervals, 0);
   await p.updCheck(true);
   check('a check you asked for answers on the button', p.label(), 'Up to date');
   check('and says so', p.toasts[0], ['info', 'You are on the latest version, 0.10.0.']);
