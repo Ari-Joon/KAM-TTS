@@ -41,6 +41,8 @@ learner builds an empty one and the tests still pass.
 | `test_namecheck.py` | No server module reads a name it never defines. A gate since a swallowed NameError silently disabled the boot-time registration repair |
 | `test_server_fixes.py` | Voice ids that could escape `voices/`, learned-state files written atomically, a re-synthesis keeping its verdict, skipped chunks staying silent, the saved voice restored before the model loads, the scan reaper |
 | `test_extension_fixes.mjs` | Stop aborting every in-flight request, a stale token refreshed once, finished audio released, one stored volume, the recorder timer, scan polling on reopen |
+| `test_learning_loop.py` | That every report category changes speech or says it did not: punctuation and split rules need the real words, a blacklist never strips a word that was in the source, corrected pronunciations replace old ones, thumbs-up reaches the settings synthesis reads, undo reverses only what was done, autotune speed is a trim, and the once-only retirement of dead rules |
+| `test_report_client.mjs` | Feedback names the chunk being heard, the popup hands the real chunk id over, the report form asks for the words a rule needs, and a mass thumbs-down steps each profile once |
 | `test_scan_host.py` | What the phone-scanning listener refuses: wrong or partial keys, oversized bodies, stale sessions, unknown paths |
 | `test_scan_text.mjs` | Turning OCR output into speakable text: page furniture, wrapped lines, verse numbers by sequence (including ones OCR read as symbols or glued to the next word), commas read as full stops, columns |
 

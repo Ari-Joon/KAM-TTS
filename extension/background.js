@@ -537,7 +537,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "getStatus") {
-    sendResponse({ isPlaying, isPaused, currentChunkIndex, chunks: allChunks, totalChunks: allChunks.length });
+    // chunkIds lets a popup opened mid-read report a chunk by its real id.
+    sendResponse({ isPlaying, isPaused, currentChunkIndex, chunks: allChunks, totalChunks: allChunks.length,
+                   chunkIds: Object.assign({}, chunkIdByIndex) });
     return true;
   }
 
@@ -776,13 +778,14 @@ async function fetchAudioBase64(text, idx, mySession) {
     });
     if (!res.ok) throw new Error(`Server ${res.status}`);
     if (!current()) return null;     // superseded read; its audio is no use now
-    // Forward chunk ID to popup for quality feedback, and record it against this
-    // chunk's index so the solid-digest can reference the exact server id.
+    // Record the server's id against this chunk's index, so the solid-digest
+    // and the feedback buttons can name the exact chunk. It is NOT announced
+    // here. This runs two or three chunks ahead of the one playing, and
+    // announcing it at fetch time is what made a thumbs-up or a report land
+    // on a chunk that had not been heard yet. announceChunk does it when the
+    // chunk starts to play.
     const chunkId = res.headers.get('X-Chunk-Id');
-    if (chunkId) {
-      if (idx != null) chunkIdByIndex[idx] = chunkId;
-      chrome.runtime.sendMessage({ action: 'chunkReady', chunkId, chunkText: text }).catch(() => {});
-    }
+    if (chunkId && idx != null) chunkIdByIndex[idx] = chunkId;
     const buf   = await res.arrayBuffer();
     const bytes = new Uint8Array(buf);
     // Built in chunks, which avoids a stack overflow on large WAV buffers
@@ -920,6 +923,10 @@ async function speakChunks(mySession) {
         continue;
       }
 
+      // The offscreen document has taken the chunk and is playing it, so this
+      // is the chunk the popup and dashboard should rate or report now.
+      announceChunk(currentChunkIndex);
+
       // Wait for the REAL end of this chunk's audio via the seq-keyed
       // chunkComplete broadcast. The safety timeout is a backstop only: audio
       // length (estSecs) plus a small slack for decode/dispatch. If the end
@@ -976,6 +983,16 @@ async function speakChunks(mySession) {
     // ahead are never counted.
     digestPlayedChunks();
   }
+}
+
+// Tell the popup and dashboard which chunk is now playing, with its server id,
+// so their feedback names the chunk being heard. Nothing is sent when the
+// server gave no id, since a report keyed on a guess is worse than none.
+function announceChunk(idx) {
+  const chunkId = chunkIdByIndex[idx];
+  if (!chunkId) return;
+  chrome.runtime.sendMessage({ action: 'chunkReady', chunkId, chunkText: allChunks[idx],
+                               index: idx }).catch(() => {});
 }
 
 // Send the texts of fully-played chunks to the server to be marked SOLID and

@@ -356,6 +356,7 @@ function checkIfPlaying() {
     if (response && response.isPlaying) {
       allChunks         = response.chunks || [];
       currentChunkIndex = response.currentChunkIndex || 0;
+      _chunkIds         = Object.assign({}, response.chunkIds || {});
       showPlayer(true);
       updatePlayerLabel(currentChunkIndex + 1, allChunks.length);
       updateProgressFill(currentChunkIndex + 1, allChunks.length);
@@ -392,6 +393,7 @@ chrome.runtime.onMessage.addListener((request) => {
   if (request.action === "chunkReady") {
     _lastChunkId   = request.chunkId   || null;
     _lastChunkText = request.chunkText || "";
+    if (request.index != null && request.chunkId) _chunkIds[request.index] = request.chunkId;
     _showFeedbackButtons();
   }
 });
@@ -400,6 +402,20 @@ chrome.runtime.onMessage.addListener((request) => {
 let _lastChunkId   = null;
 let _lastChunkText = "";
 let _feedbackOpen  = false;
+// The server's id for each chunk of the current read, by index, as the worker
+// announces them. A report has to carry the id, because the server can only
+// re-derive one by hashing the text it is given, and the text shown here is
+// the display text rather than the spoken text the id was made from, so the
+// two never match and the report reaches no chunk.
+let _chunkIds      = {};
+
+// The dashboard hand-off. The text goes first, as it always did, and the id
+// follows when one is known. encodeURIComponent turns any & in the text into
+// %26, so the id separator cannot be confused with the text.
+function reportHash(text, chunkId) {
+  return "#report:" + encodeURIComponent(text || "") +
+         (chunkId ? "&id=" + encodeURIComponent(chunkId) : "");
+}
 
 function _showFeedbackButtons() {
   const bar = document.getElementById("feedback-bar");
@@ -421,7 +437,7 @@ function thumbsUp() {
 }
 
 function thumbsDown() {
-  const url = chrome.runtime.getURL("player.html") + "#report:" + encodeURIComponent(_lastChunkText || "");
+  const url = chrome.runtime.getURL("player.html") + reportHash(_lastChunkText, _lastChunkId);
   chrome.tabs.query({ url: chrome.runtime.getURL("player.html") }, tabs => {
     if (tabs && tabs.length > 0) chrome.tabs.update(tabs[0].id, { url, active: true });
     else chrome.tabs.create({ url, active: true });
@@ -792,6 +808,7 @@ async function speak() {
     (_orphans.length > 0 ? " · ⚠ " + _orphans.length + " orphan(s)" : " · ✓ clean"));
 
   currentChunkIndex = 0;
+  _chunkIds = {};   // a new read, so the old read's ids name other chunks now
   const speed = parseFloat(document.getElementById("speed-slider").value);
 
   showPlayer(true);
@@ -1206,7 +1223,7 @@ function renderTextView(chunks, activeIndex) {
     flagBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       const base    = chrome.runtime.getURL("player.html");
-      const hash    = "#report:" + encodeURIComponent(text);
+      const hash    = reportHash(text, _chunkIds[i]);
       // Match player.html regardless of its current hash
       chrome.tabs.query({}, tabs => {
         const existing = tabs.find(t => t.url && t.url.startsWith(base));

@@ -11,15 +11,15 @@ const SERVER = 'http://127.0.0.1:5050';
 // for both the preview and submitReport, so they can never disagree.
 const ISSUE_ACTION_MAP = {
   PRONUNCIATION: { action: 'ADD_TO_STORE',     desc: 'Saves the correct pronunciation so this word is always read right from now on.' },
-  HALLUCINATION: { action: 'BLACKLIST',        desc: 'Blocks the extra word the voice invented so it stops adding it.' },
-  SKIP:          { action: 'ADJUST_CHUNK',     desc: 'Adjusts how this sentence is split so the dropped word is no longer skipped.' },
-  TOO_FAST:      { action: 'ADJUST_RATE_DOWN', desc: 'Slows the speaking rate slightly for this kind of sentence.' },
-  TOO_SLOW:      { action: 'ADJUST_RATE_UP',   desc: 'Speeds the speaking rate slightly for this kind of sentence.' },
+  HALLUCINATION: { action: 'BLACKLIST',        desc: 'With a word typed in, that word is blocked from every future read, so only type one the voice invented. With none, the temperature is lowered for this kind of sentence.' },
+  SKIP:          { action: 'ADJUST_CHUNK',     desc: 'Needs the word that was dropped. Without it the report is only filed as a flag. The reply below says what the server changed.' },
+  TOO_FAST:      { action: 'ADJUST_RATE_DOWN', desc: 'Slows the speaking rate slightly for this kind of sentence, unless it is already at the slowest, which the reply will say.' },
+  TOO_SLOW:      { action: 'ADJUST_RATE_UP',   desc: 'Speeds the speaking rate slightly for this kind of sentence, unless it is already at the fastest, which the reply will say.' },
   ROBOTIC:       { action: 'ADJUST_TEMP_UP',   desc: 'Raises expressiveness so the voice sounds less flat and monotone.' },
   VOICE:         { action: 'ADJUST_TEMP_DOWN', desc: 'Lowers variability so the voice stays steady and stops drifting.' },
   EQUATION:      { action: 'MATH_OVERRIDE',    desc: 'Teaches how this equation or symbol should be read aloud, used from now on.' },
-  PUNCT:         { action: 'PUNCT',            desc: 'Learns the correct pause or break for this punctuation.' },
-  CUTOFF:        { action: 'ADJUST_CHUNK',     desc: 'Splits this sentence shorter so it is no longer cut off early.' },
+  PUNCT:         { action: 'PUNCT',            desc: 'Needs the word the pause belongs after. Without it the report is only filed as a flag. The reply below says what the server changed.' },
+  CUTOFF:        { action: 'ADJUST_CHUNK',     desc: 'Needs the words that were cut off. Without them the report is only filed as a flag. The reply below says what the server changed.' },
   SUPPRESS:      { action: 'SUPPRESS',         desc: 'Marks this text to be skipped entirely in future reads.' },
   OTHER:         { action: 'FLAG_PATTERN',     desc: 'Flags this for review so a pattern can be spotted over time.' },
 };
@@ -211,14 +211,11 @@ function addLog(raw) {
       div.innerHTML = `<span class="log-time">${now}</span>`
         +`<span class="log-tag ${TAG_CLR[tag]||'tag-info'}">[${tag}]</span>`
         +`<span class="log-msg">${esc(m[2])}</span>`;
-      if (tag==='TTS' && !_reportLocked) {
-        const tm = m[2].match(/\((\d+)c\)\s*(.*)/);
-        if (tm) {
-          _lastChunkText = tm[2];
-          const pr = document.getElementById('report-preview');
-          if (pr) pr.textContent = _lastChunkText.substring(0,120);
-        }
-      }
+      // A [TTS] line used to set the report's chunk text too. That line is
+      // printed at synthesis, two or three chunks ahead of what is playing,
+      // and it carried no id, so the text came from one chunk and the id from
+      // another. The worker's chunkReady, sent when a chunk starts to play,
+      // now sets both together.
     } else {
       div.innerHTML = `<span class="log-time">${now}</span><span class="log-msg">${esc(raw)}</span>`;
     }
@@ -945,6 +942,128 @@ function refreshChunkSelector() {
 }
 function onChunkSelect() {}
 
+// --- Mass thumbs-down, one step per profile ---
+// The key a sounded_wrong step lands on, from /diagnose: the sentence type,
+// the stored fingerprint and whether it held maths, which is what the server's
+// profile keys are built from. Null when the chunk has no stored fingerprint.
+function profileKeyFromDiagnosis(d) {
+  const l = d && d.labelling;
+  if (!l || !l.profile) return null;
+  return `${String(l.sentence_type || 'sentence').toLowerCase()}|${l.profile}|${l.has_math ? 1 : 0}`;
+}
+
+// Which selected chunks to send. Items are {id, key, already}, where already
+// means the chunk is rejected on the server, so its profile has had its step.
+// A chunk with no known key stands alone, which is how it behaved before.
+function planMassRejection(items) {
+  const seen = new Set(), send = [], already = [], repeats = [];
+  for (const it of items) if (it.already && it.key) seen.add(it.key);
+  for (const it of items) {
+    if (it.already) { already.push(it.id); continue; }
+    const k = it.key || ('id:' + it.id);
+    if (seen.has(k)) { repeats.push(it.id); continue; }
+    seen.add(k);
+    send.push(it.id);
+  }
+  return { send, already, repeats };
+}
+
+function massRejectionSummary(sent, plan, recorded) {
+  let msg = `${sent} chunk${sent === 1 ? '' : 's'} marked hallucination, one per sentence profile`;
+  if (recorded) msg += `. ${recorded} more recorded as rejected without stepping the same profile again`;
+  else if (plan.repeats.length) msg += `. ${plan.repeats.length} left unrated, since their profile was already stepped down`;
+  if (plan.already.length) msg += `. ${plan.already.length} already rejected, so not sent again`;
+  return msg + '.';
+}
+
+// --- Report hand-off and form ---
+// The popup opens this page at #report:<text>, with &id=<chunk id> after it
+// when the id is known. The text is encoded, so an & inside it arrives as %26
+// and cannot be mistaken for the separator. An older hash with no id still
+// parses, with id null.
+function parseReportHash(hash) {
+  if (!hash || !hash.startsWith('#report:')) return null;
+  const body = hash.slice(8);
+  const at = body.indexOf('&id=');
+  const dec = v => { try { return decodeURIComponent(v); } catch (e) { return v; } };
+  const text = dec(at < 0 ? body : body.slice(0, at));
+  const id = at < 0 ? '' : dec(body.slice(at + 4));
+  return { text, id: id || null };
+}
+
+// What the token box is for, per issue. It used to be one "problem token" box
+// whatever the issue, pre-filled with the first word in capitals, and with a
+// hallucination report a token means "block this word", which is how a real
+// word ended up blacklisted. SKIP, CUTOFF and PUNCT need a word to make a rule
+// at all, since without one the server files the report as a flag, so they
+// ask for it and say what to type.
+const REPORT_FIELDS = {
+  PRONUNCIATION: { label: 'Problem token (word / abbreviation)', placeholder: 'e.g.  API', required: true,
+                   hint: 'The word as it is written. Put how it should sound below.' },
+  SKIP:          { label: 'Word that was dropped', placeholder: 'e.g.  the word you did not hear', required: true,
+                   hint: 'Required. Type the missing word exactly as it is written in the text.' },
+  CUTOFF:        { label: 'Words that were cut off', placeholder: 'e.g.  the first words you did not hear', required: true,
+                   hint: 'Required. Type the first few words that went unspoken at the end.' },
+  PUNCT:         { label: 'Word the pause belongs after', placeholder: 'e.g.  however', required: true,
+                   hint: 'Required. Type the word just before the missing or wrong pause, and the punctuation it needs (, or .) under "Should sound like".' },
+  HALLUCINATION: { label: 'Invented word (optional)', placeholder: 'only a word the voice added', required: false,
+                   hint: 'Leave empty unless the voice added one particular word. A word typed here is blocked from every future read.' },
+};
+const REPORT_FIELD_DEFAULT = { label: 'Problem token (optional)', placeholder: 'e.g.  a word in the chunk', required: false, hint: '' };
+function reportFieldSpec(issue) { return REPORT_FIELDS[issue] || REPORT_FIELD_DEFAULT; }
+
+// The token to suggest for a chunk. Only a pronunciation report gets one,
+// since that is the only issue where a word in capitals is a fair guess at
+// what went wrong; for any other issue a token changes what the report does.
+function suggestedToken(issue, text) {
+  if (issue !== 'PRONUNCIATION') return '';
+  const m = String(text || '').match(/\b([A-Z][A-Z0-9]{1,})\b/);
+  return m ? m[1] : '';
+}
+
+// What to show after a report is sent: the server's own words, rather than a
+// claim made up here. The server marks every acted-on report applied, even
+// one that changed nothing ("no_action") or failed ("error: ..."), so those
+// are said plainly instead of as "Applied".
+function reportReplyText(d) {
+  if (!d) return 'Report submitted.';
+  if (d.ok === false) return d.error || d.message || 'Report rejected.';
+  if (d.pending) {
+    return d.message || d.reason ||
+           `Logged. Needs more matching reports before it applies (${d.agreement||0} of ${d.needed||2}).`;
+  }
+  const said = String(d.message || d.result || '').trim();
+  if (said === 'no_action') return 'Logged. Nothing was changed for this report.';
+  if (/^error:/i.test(said)) return 'Logged, but the server could not act on it (' + said.replace(/^error:\s*/i, '') + ').';
+  if (d.applied && said) return (d.applied_via ? `Applied (${d.applied_via}). ` : '') + said;
+  return said || 'Report submitted.';
+}
+
+// Bring the token box in line with the chosen issue: label, placeholder and
+// hint, and the suggested token. A suggestion this page made is cleared when
+// the issue moves away from PRONUNCIATION, but anything the user typed stays.
+function _syncReportForm(opts) {
+  const o = opts || {};
+  const issueEl = document.getElementById('r-issue');
+  const tokenEl = document.getElementById('r-token');
+  const issue = issueEl ? issueEl.value : 'OTHER';
+  const spec = reportFieldSpec(issue);
+  const label = document.getElementById('r-token-label');
+  const hint  = document.getElementById('r-token-hint');
+  if (label) label.textContent = spec.label;
+  if (hint) { hint.textContent = spec.hint; hint.style.display = spec.hint ? 'block' : 'none'; }
+  if (!tokenEl) return;
+  tokenEl.placeholder = spec.placeholder;
+  if (tokenEl.dataset.auto === '1' && (o.fromHash || issue !== 'PRONUNCIATION')) {
+    tokenEl.value = '';
+    delete tokenEl.dataset.auto;
+  }
+  if (!tokenEl.value) {
+    const t = suggestedToken(issue, _lastChunkText);
+    if (t) { tokenEl.value = t; tokenEl.dataset.auto = '1'; }
+  }
+}
+
 // --- Report submit ---
 function submitReport() {
   const get = id => {
@@ -969,30 +1088,25 @@ function submitReport() {
     action,
     confidence: get('r-confidence') || 'HIGH',
   };
-  // A client-side pre-check, since pronunciation reports need a token before
-  // there's any point hitting the server.
-  if (issue === 'PRONUNCIATION' && !body.token) {
-    showToast('Pronunciation report needs a problem token.');
+  // A client-side pre-check, since these reports need a token before there is
+  // any point asking the server, and without one SKIP, CUTOFF and PUNCT would
+  // only be filed as a flag.
+  const spec = reportFieldSpec(issue);
+  if (spec.required && !body.token) {
+    showToast(issue === 'PRONUNCIATION' ? 'Pronunciation report needs a problem token.'
+                                        : `${spec.label}: ${spec.hint.replace(/^Required\.\s*/, '')}`);
     return;
   }
   api('/report', 'POST', body)
     .then(d => {
       // Server may have rejected the submission (e.g. no-op or empty essentials).
       if (d && d.ok === false) {
-        showToast(d.error || 'Report rejected.');
+        showToast(reportReplyText(d));
         return;
       }
       const el = document.getElementById('submit-result');
       if (el) {
-        let msg;
-        if (d && d.applied) {
-          msg = (d.applied_via ? `Applied (${d.applied_via}). ` : 'Applied. ') + (d.result || '');
-        } else if (d && d.pending) {
-          msg = d.reason || `Logged. Needs more matching reports before it applies (${d.agreement||0} of ${d.needed||2}).`;
-        } else {
-          msg = (d && d.result) ? d.result : 'Report submitted.';
-        }
-        el.textContent = msg;
+        el.textContent = reportReplyText(d);
         el.style.display = 'block';
       }
       addLog(`[LEARNER] Report: ${issue}. ${body.token || body.chunk_text.substring(0, 30)}`);
@@ -1009,6 +1123,7 @@ function submitReport() {
 function clearReport() {
   _reportLocked = false;  // release the report selection lock
   ['r-token','r-expected','r-heard'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+  const tok=document.getElementById('r-token'); if(tok) delete tok.dataset.auto;
   const el=document.getElementById('submit-result'); if(el) el.style.display='none';
 }
 
@@ -1049,49 +1164,70 @@ document.addEventListener('click', e => {
   if (head) toggleAiSection(head.dataset.aiToggle);
 });
 
+// Explain one analysed chunk: what the analysis found, and what KAM does about
+// it. The second half used to promise fixes the server never makes, such as
+// "Temperature nudged down" for a hallucination, which is only noted in the
+// log, and a split adjustment for a cut-off, which nothing does. So each line
+// now says only what the learner really does, and under which conditions, as
+// read from learner.py's analysis worker: a chunk under 60% overall with
+// Whisper under 80% twice running lowers its profile's temperature by 0.02; an
+// accurate but flat chunk between 55% and 60% raises it by 0.02. Anything else
+// is not fixed automatically and says so. Where the server has recorded what it did
+// for this chunk (applied_action, from a rating), its words come first.
 function _explainChunk(r) {
   const flags  = (r.quality_flags || '').split('|').filter(Boolean);
   const wa     = r.whisper_accuracy;
   const pv     = r.pitch_variance;
   const vc     = r.voice_consistency;
   const q      = r.quality_score;
+  const poor   = q != null && q < 0.6;
   const parts  = [];
   const fixes  = [];
+
+  if (r.applied_action) fixes.push(`What KAM did after your rating: ${esc(r.applied_action)}`);
 
   // What went wrong
   if (flags.some(f=>f.startsWith('WHISPER_SKIP'))) {
     const skipped = flags.find(f=>f.startsWith('WHISPER_SKIP')).replace('WHISPER_SKIP:','');
     parts.push(`Whisper detected skipped words: <em>${esc(skipped)}</em>. XTTS failed to vocalise these tokens.`);
-    fixes.push(`Auto-corrected: skipped abbreviation(s) added to pronunciation store with letter-by-letter spelling.`);
+    // The learner has a spell-it-out rule for skipped abbreviations, but it
+    // needs the word in capitals, and the words in this flag arrive lower-cased
+    // and longer than three letters, so it does not fire from here. I say so
+    // rather than promise it.
+    fixes.push(`Not fixed automatically. Report it as a dropped word, with the word, to teach it.`);
   }
   if (flags.includes('HALLUCINATION')) {
-    parts.push(`Whisper found words in the audio that weren't in the source text — hallucination detected.`);
-    fixes.push(`Pattern flagged. Temperature nudged down to improve precision on similar chunks.`);
+    parts.push(`Whisper found words in the audio that weren't in the source text, a hallucination.`);
+    fixes.push(`Not fixed automatically, only noted in the log. A 👎 or a Hallucinations report lowers the temperature for this kind of sentence.`);
   }
   if (flags.includes('CUTOFF')) {
-    parts.push(`Audio energy dropped sharply at the end — the chunk was cut off before finishing.`);
-    fixes.push(`Chunk pattern flagged for split-point adjustment.`);
+    parts.push(`Audio energy dropped sharply at the end, so the chunk was cut off before finishing.`);
+    fixes.push(`Not fixed automatically. Report it as cut off early, with the words that went missing.`);
   }
   if (flags.includes('VOICE_DRIFT')) {
-    parts.push(`Voice characteristics deviated from your baseline profile — drift detected.`);
-    fixes.push(`Flagged for monitoring. If recurring, adjust temperature slider up slightly.`);
+    parts.push(`Voice characteristics deviated from your baseline profile, so the voice drifted.`);
+    fixes.push(`Not fixed automatically. If it keeps happening, report it as an unstable voice.`);
   }
   if (wa != null && wa < 0.75) {
-    parts.push(`Whisper word accuracy was ${(wa*100).toFixed(0)}% — significantly below target.`);
-    fixes.push(`Temperature auto-tuned down by 0.02 to increase pronunciation precision.`);
+    parts.push(`Whisper word accuracy was ${(wa*100).toFixed(0)}%, well below target.`);
+    if (poor) {
+      fixes.push(`When two analysed chunks in a row score like this, KAM lowers the temperature for this chunk's sentence profile by 0.02. Your temperature slider is not changed.`);
+    }
   }
   if (pv != null && pv < 5) {
-    parts.push(`Pitch variance was ${pv.toFixed(1)} Hz — delivery was flat and robotic.`);
-    fixes.push(`Temperature auto-tuned up by 0.02 to add natural expressiveness.`);
+    parts.push(`Pitch variance was ${pv.toFixed(1)} Hz, so the delivery was flat and robotic.`);
+    if (poor && q > 0.55 && (wa == null || wa >= 0.8)) {
+      fixes.push(`KAM raised the temperature for this chunk's sentence profile by 0.02, since it was accurate but flat. Your temperature slider is not changed.`);
+    }
   }
   if (vc != null && vc < 0.5) {
-    parts.push(`Voice consistency score was ${(vc*100).toFixed(0)}% — voice sounded different from your cloned baseline.`);
+    parts.push(`Voice consistency score was ${(vc*100).toFixed(0)}%, so the voice sounded different from your cloned baseline.`);
   }
   if (!parts.length) {
-    if (q != null) parts.push(`Quality score ${(q*100).toFixed(0)}% — below threshold but no specific flags detected.`);
+    if (q != null) parts.push(`Quality score ${(q*100).toFixed(0)}%, below threshold but with no specific flags.`);
     else parts.push('Chunk flagged but no analysis data available yet.');
   }
-  if (!fixes.length) fixes.push('No automatic fix applied — submit a report if you heard an issue.');
+  if (!fixes.length) fixes.push('No automatic fix. Submit a report if you heard an issue.');
 
   return { what: parts.join(' '), fix: fixes.join(' ') };
 }
@@ -1790,6 +1926,12 @@ document.addEventListener('DOMContentLoaded',()=>{
   if (_rIssue)  _rIssue.addEventListener('change', _updateActionPreview);
   if (_rAction) _rAction.addEventListener('change', _updateActionPreview);
   _updateActionPreview();
+  // The token box follows the issue too, and once the user types in it the
+  // value is theirs, so it is never cleared as a suggestion.
+  if (_rIssue) _rIssue.addEventListener('change', () => _syncReportForm());
+  const _rToken = document.getElementById('r-token');
+  if (_rToken) _rToken.addEventListener('input', () => { delete _rToken.dataset.auto; });
+  _syncReportForm();
 
   // --- Server power button (native messaging) ---
   // A small native host (kam_host.py) launches and stops server.py and streams
@@ -2712,7 +2854,7 @@ document.addEventListener('DOMContentLoaded',()=>{
         _setCardRated(card, 'down');
         api('/chunk/verdict','POST',{ chunk_id: chunkId, verdict: 'sounded_wrong',
               chunk_text: (card && card.dataset.text) || '' })
-          .then(r=>{ showToast('👎 ' + (r && r.applied_text || 'Hallucination logged — voice steadied for similar chunks')); refreshStats(); })
+          .then(r=>{ showToast('👎 ' + (r && r.applied_text || 'Hallucination logged.')); refreshStats(); })
           .catch(()=>{ thumb.classList.remove('rejected'); _setCardRated(card, null);
                        showToast('Feedback failed — try again'); });
         return;
@@ -2787,6 +2929,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   function _massVerdict(verdict) {
     const items = _selectedCards().map(c => ({ card: c, id: c.dataset.id })).filter(x => x.id);
     if (!items.length) { showToast('No chunks selected'); return; }
+    if (verdict === 'sounded_wrong') { _massReject(items); return; }
     Promise.all(items.map(({card,id}) =>
       api('/chunk/verdict','POST',{ chunk_id:id, verdict, chunk_text:(card.dataset.text||'') })
         .then(()=>_paintCardVerdict(card, verdict))
@@ -2797,6 +2940,39 @@ document.addEventListener('DOMContentLoaded',()=>{
       refreshStats();
       _clearSelection();   // keep select mode on so the marks stay visible
     });
+  }
+
+  // A mass thumbs-down. Each sounded_wrong lowers the temperature of the
+  // chunk's sentence profile by 0.03, and a run of selected chunks is mostly
+  // one or two profiles, so twenty rejected chunks used to move one profile
+  // twenty steps, and a chunk already rejected took another step when it was
+  // selected again. So each chunk's stored profile is looked up first and only
+  // one chunk per profile is sent. The rest are left unrated, since the server
+  // has no way to record a thumbs-down without the step, and the toast says so.
+  async function _massReject(items) {
+    const keys = await Promise.all(items.map(({ id }) =>
+      api('/diagnose/' + encodeURIComponent(id)).then(profileKeyFromDiagnosis).catch(() => null)));
+    const plan = planMassRejection(items.map(({ card, id }, i) => {
+      const dn = card.querySelector('.chunk-thumb-down');
+      return { id, key: keys[i], already: !!(dn && dn.classList.contains('rejected')) };
+    }));
+    const byId = new Map(items.map(it => [it.id, it.card]));
+    let sent = 0, recorded = 0;
+    // The rest of each profile's chunks are recorded as rejected without a
+    // step, since the server takes that step once per profile above. Leaving
+    // them unrated meant the end-of-session digest could mark them solid.
+    const verdict = (id, recordOnly) =>
+      api('/chunk/verdict','POST',{ chunk_id:id, verdict:'sounded_wrong', record_only:recordOnly,
+                                    chunk_text:(byId.get(id).dataset.text||'') });
+    await Promise.all([
+      ...plan.send.map(id => verdict(id, false)
+        .then(()=>{ sent++; _paintCardVerdict(byId.get(id), 'sounded_wrong'); }).catch(()=>null)),
+      ...plan.repeats.map(id => verdict(id, true)
+        .then(()=>{ recorded++; _paintCardVerdict(byId.get(id), 'sounded_wrong'); }).catch(()=>null)),
+    ]);
+    showToast(massRejectionSummary(sent, plan, recorded));
+    refreshStats();
+    _clearSelection();   // keep select mode on so the marks stay visible
   }
 
   // Click-and-drag rubber-band selection over the feed.
@@ -2858,21 +3034,22 @@ document.addEventListener('DOMContentLoaded',()=>{
   // --- Hash routing from popup ⚑ button ---
   function _handleReportHash() {
     const hash = window.location.hash;
-    if (!hash.startsWith('#report:')) return false;
-    const txt = decodeURIComponent(hash.slice(8));
-    // Set this unconditionally so it overrides whatever came before
+    const parsed = parseReportHash(hash);
+    if (!parsed) return false;
+    const txt = parsed.text;
+    // Set this unconditionally so it overrides whatever came before. The id
+    // comes with it now: it used to be dropped here, so the server hashed the
+    // display text, which never matches the id of the spoken text, and the
+    // report reached no chunk at all.
     _lastChunkText = txt;
-    _lastChunkId   = null;  // popup chunks don't have DB IDs yet
+    _lastChunkId   = parsed.id;
     _reportLocked  = true;  // pin; live playback must not overwrite
     const pr = document.getElementById('report-preview');
     if (pr) {
       pr.textContent = txt;
       pr.style.borderLeftColor = 'var(--indigo)';
     }
-    // Pre-fill token field with first all-caps word if present
-    const capMatch = txt.match(/\b([A-Z][A-Z0-9]{1,})\b/);
-    const tokenEl  = document.getElementById('r-token');
-    if (tokenEl && capMatch) tokenEl.value = capMatch[1];
+    _syncReportForm({ fromHash: true });
     showTab('report');
     // Clear hash without triggering another hashchange
     history.replaceState(null, '', window.location.pathname);

@@ -242,7 +242,9 @@ await section('a superseded request cannot write into the next read', async () =
     release(reply);
     check('the current read still gets its audio', await run, 'QUI=');
     check('and records its id', w.ids, { 3: 'srv-7' });
-    check('and announces it', bcast.filter(m => m.action === 'chunkReady').length, 1);
+    // Announcing happens when the chunk starts to play, not at fetch time,
+    // which test_report_client.mjs covers.
+    check('but does not announce it yet', bcast.filter(m => m.action === 'chunkReady').length, 0);
   }
 });
 
