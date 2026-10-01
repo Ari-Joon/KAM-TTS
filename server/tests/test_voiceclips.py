@@ -198,6 +198,10 @@ vns.update({
 })
 fake = _FakeLearner()
 vns["_learner"] = fake
+# Both handlers check the requested id with _checked_voice_id before touching
+# the disk, so the real helper is lifted too, pointed at the temp voices folder.
+vns["VOICES_DIR"] = str(VOICES)
+exec(_extract("_RE_BAD_VOICE_CHARS =", "def _list_voices("), vns)
 exec(_extract("def _voice_artefacts(vid):", "@app.route(\"/voices/open\""), vns)
 
 rename, delete = vns["rename_voice"], vns["delete_voice"]

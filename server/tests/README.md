@@ -39,8 +39,10 @@ learner builds an empty one and the tests still pass.
 | `test_update_ui.mjs` | The dashboard's update button and bar, and the worker bringing the server and dashboard back after the restart |
 | `test_register_host.py` | The native-host launcher: staged builds that must answer a live message before replacing a working one, upgrades while the old launcher is running, cmd-safe paths, and that the real registry key is never touched |
 | `test_namecheck.py` | No server module reads a name it never defines. A gate since a swallowed NameError silently disabled the boot-time registration repair |
+| `test_server_fixes.py` | Voice ids that could escape `voices/`, learned-state files written atomically, a re-synthesis keeping its verdict, skipped chunks staying silent, the saved voice restored before the model loads, the scan reaper |
+| `test_extension_fixes.mjs` | Stop aborting every in-flight request, a stale token refreshed once, finished audio released, one stored volume, the recorder timer, scan polling on reopen |
 | `test_scan_host.py` | What the phone-scanning listener refuses: wrong or partial keys, oversized bodies, stale sessions, unknown paths |
-| `test_scan_text.mjs` | Turning OCR output into speakable text: page furniture, wrapped lines, verse numbers by sequence, columns |
+| `test_scan_text.mjs` | Turning OCR output into speakable text: page furniture, wrapped lines, verse numbers by sequence (including ones OCR read as symbols or glued to the next word), commas read as full stops, columns |
 
 ## tools/
 

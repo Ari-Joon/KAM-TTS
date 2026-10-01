@@ -49,6 +49,63 @@ STORE_PATH    = _HERE / "pronunciation_store.json"
 PUNCT_PATH    = _HERE / "punctuation_corrections.json"
 BASELINE_PATH = _HERE / "voice_baseline.json"
 
+
+# --- Writing the learned files ---
+# Every one of these used to be written with a plain open("w") and json.dump.
+# open("w") empties the file before a byte of the new content exists, so a kill
+# in between (the power button's /shutdown ends in os._exit, and the host falls
+# back to terminate) left a truncated file. The readers then treated the parse
+# error as "nothing learned yet", and the next save wrote that emptiness back
+# over everything. So the new content goes to a temp file beside the target and
+# os.replace swaps it in, which is atomic on the same volume.
+#
+# The encoding is pinned because Windows otherwise writes the ANSI codepage
+# while server.py reads UTF-8, and one em dash in a punctuation correction was
+# enough to make the server's reader fail on every chunk from then on.
+import tempfile as _tempfile
+import locale as _locale
+
+
+def _write_json_atomic(path, obj, **dump_kwargs):
+    """Write obj as JSON to path so a reader only ever sees the old file or the
+    whole new one. Raises on failure, so callers keep their own error lines."""
+    path = str(path)
+    fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                                prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, **dump_kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        # Windows refuses to replace a file another thread has open for reading
+        # at that instant, so a busy reader gets a few short retries.
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_text(path):
+    """A learned file's text as UTF-8, falling back to the ANSI codepage for a
+    file an older version wrote before the encoding was pinned, so upgrading
+    reads the old corrections rather than losing them."""
+    raw = Path(path).read_bytes()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(_locale.getpreferredencoding(False), errors="replace")
+
+
 # --- Voice isolation ---
 # Every learned structure is namespaced by the active voice so feedback given
 # on one clone never bleeds into another. "default" keeps the original bare
@@ -60,10 +117,17 @@ def set_active_voice(voice_id):
     """Called by the server on startup and on every voice switch."""
     global _ACTIVE_VOICE
     _ACTIVE_VOICE = (voice_id or "default").strip() or "default"
+    # The baseline cache is keyed by voice, but a profile that was deleted and
+    # made again under the same name must not pick up the old one's numbers, so
+    # a switch starts from what is on disk.
+    _forget_cached_baseline()
 
-def _vk(key):
-    """Voice-namespace a good-settings store key ('default' stays bare)."""
-    return key if _ACTIVE_VOICE == "default" else f"v:{_ACTIVE_VOICE}:{key}"
+def _vk(key, voice=None):
+    """Voice-namespace a good-settings store key ('default' stays bare). voice
+    defaults to the active one; the analysis worker passes the chunk's own,
+    since a chunk queued before a switch belongs to the voice that made it."""
+    v = voice or _ACTIVE_VOICE
+    return key if v == "default" else f"v:{v}:{key}"
 
 def baseline_path_for(voice_id):
     """The baseline file belonging to one named voice.
@@ -74,10 +138,10 @@ def baseline_path_for(voice_id):
         return BASELINE_PATH
     return _HERE / f"voice_baseline_{voice_id}.json"
 
-def _baseline_path():
+def _baseline_path(voice=None):
     """The baseline file for one voice, since drift has to be measured against
     the active clone rather than whichever voice recorded a baseline first."""
-    return baseline_path_for(_ACTIVE_VOICE)
+    return baseline_path_for(voice or _ACTIVE_VOICE)
 
 # ---
 # Optional heavy dependencies, which degrade gracefully if they aren't installed
@@ -599,6 +663,58 @@ def _smoothed_accuracy(matches, n_words):
     return min(1.0, smoothed)
 
 
+def _transcribe_bytes(wav_bytes):
+    """Run Whisper over one chunk's audio and return its result.
+
+    Whisper wants a file path, so the audio goes through a temp file, and that
+    file is removed whatever happens. It used to be unlinked only after a
+    successful transcribe, so every failure left a WAV behind in %TEMP%, and on
+    a machine without ffmpeg (which Whisper shells out to and requirements.txt
+    does not install) that was every analysed chunk for as long as the server
+    ran."""
+    import tempfile
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+            tmp.write(wav_bytes)
+
+        # Final guard: if synthesis started after we dequeued, wait it out
+        # before transcribing (GPU transcribe is brief, so this rarely blocks
+        # anything now).
+        while _synthesis_active():
+            _time.sleep(0.25)
+        return _WHISPER_MODEL.transcribe(
+            tmp_path, language="en",
+            fp16=(_WHISPER_DEVICE == "cuda"),
+            word_timestamps=True,   # per-word timing + confidence (Part 3)
+        )
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _chunk_voice(chunk_id):
+    """The voice a logged chunk was synthesised with, or the active one when the
+    row has none (older rows, or a chunk that was never logged)."""
+    try:
+        with _db_lock:
+            conn = _get_db()
+            try:
+                row = conn.execute("SELECT voice FROM chunks WHERE id=?",
+                                   (chunk_id,)).fetchone()
+            finally:
+                conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return _ACTIVE_VOICE
+
+
 def _analysis_worker():
     """
     Background thread: dequeues (chunk_id, wav_bytes, text) tuples,
@@ -650,22 +766,7 @@ def _analysis_worker():
                         _WHISPER_MODEL = _whisper.load_model("tiny.en", device=_WHISPER_DEVICE)
                         print(f"[LEARNER] Whisper ready ({_WHISPER_DEVICE})")
 
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                        tmp.write(wav_bytes)
-                        tmp_path = tmp.name
-
-                    # Final guard: if synthesis started after we dequeued, wait
-                    # it out before transcribing (GPU transcribe is brief, so this
-                    # rarely blocks anything now).
-                    while _synthesis_active():
-                        _time.sleep(0.25)
-                    result = _WHISPER_MODEL.transcribe(
-                        tmp_path, language="en",
-                        fp16=(_WHISPER_DEVICE == "cuda"),
-                        word_timestamps=True,   # per-word timing + confidence (Part 3)
-                    )
-                    os.unlink(tmp_path)
+                    result = _transcribe_bytes(wav_bytes)
 
                     # Whisper's transcribe() is untyped; coerce explicitly so the
                     # type checker knows result["text"] is a str.
@@ -786,8 +887,16 @@ def _analysis_worker():
                 except Exception as e:
                     print(f"[LEARNER] librosa error: {e}")
 
+            # Everything this chunk teaches is filed under the voice that made
+            # it. The queue holds up to 50 chunks and only drains between
+            # syntheses, so switching voice mid-read used to credit the old
+            # voice's backlog (observations, temperature nudges, baseline) to
+            # the new one. The row is read rather than carried in the queue,
+            # since a rename while the chunk waits moves the row's voice too.
+            _voice = _chunk_voice(chunk_id)
+
             # --- Voice consistency vs baseline ---
-            baseline = _get_baseline()
+            baseline = _get_baseline(_voice)
             if baseline and "pitch_variance" in metrics:
                 expected_std = baseline.get("pitch_std", 20)
                 actual_std   = metrics["pitch_variance"]
@@ -889,7 +998,8 @@ def _analysis_worker():
                     if _low_accuracy_streak >= 2:
                         try:
                             prof = lookup_chunk_profile(chunk_id, text)
-                            _k, new_t = _adjust_profile_temperature(prof["keys"], -0.02)
+                            _k, new_t = _adjust_profile_temperature(prof["keys"], -0.02,
+                                                                    voice=_voice)
                             print(f"[LEARNER] Auto-tune ↓ temp={new_t} for profile "
                                   f"[{prof['band']}/{prof['length']}/{prof['punct']}/"
                                   f"{prof['lexis']}] (Whisper {wa:.0%}, "
@@ -905,7 +1015,8 @@ def _analysis_worker():
                         # Accurate but flat/robotic → warm this profile slightly.
                         try:
                             prof = lookup_chunk_profile(chunk_id, text)
-                            _k, new_t = _adjust_profile_temperature(prof["keys"], +0.02)
+                            _k, new_t = _adjust_profile_temperature(prof["keys"], +0.02,
+                                                                    voice=_voice)
                             print(f"[LEARNER] Auto-tune ↑ temp={new_t} for profile "
                                   f"[{prof['band']}/{prof['length']}/{prof['punct']}/"
                                   f"{prof['lexis']}] (flat pitch {pv})")
@@ -967,7 +1078,7 @@ def _analysis_worker():
 
             # --- Update baseline ---
             if quality_score and quality_score > 0.75 and "pitch_variance" in metrics:
-                _update_baseline(metrics)
+                _update_baseline(metrics, _voice)
                 if _live_settings_ref is not None and quality_score > 0.85:
                     print(f"[LEARNER] ✓ High quality ({quality_score:.2f}) — temp stable at {_live_settings_ref.get('temperature',0.33):.3f}")
 
@@ -991,27 +1102,40 @@ _worker_thread.start()
 # ---
 # Baseline management
 # ---
-_baseline_cache = None
+# The cache is keyed by voice. It used to be one value loaded from whichever
+# voice asked first and never dropped, so after a switch drift was measured
+# against the previous voice's pitch, and the next update blended that voice's
+# numbers, sample count included, into the new voice's baseline file.
+_baseline_cache = {}
 _baseline_lock  = threading.Lock()
 
-def _get_baseline():
-    global _baseline_cache
-    if _baseline_cache:
-        return _baseline_cache
-    if _baseline_path().exists():
+def _forget_cached_baseline(voice=None):
+    """Drop one voice's cached baseline, or every voice's when voice is None."""
+    if voice is None:
+        _baseline_cache.clear()
+    else:
+        _baseline_cache.pop(voice, None)
+
+def _get_baseline(voice=None):
+    v = voice or _ACTIVE_VOICE
+    cached = _baseline_cache.get(v)
+    if cached:
+        return cached
+    path = _baseline_path(v)
+    if path.exists():
         try:
-            with open(_baseline_path()) as f:
-                _baseline_cache = json.load(f)
-            return _baseline_cache
+            loaded = json.loads(_read_text(path))
+            _baseline_cache[v] = loaded
+            return loaded
         except Exception:
             pass
     return None
 
-def _update_baseline(metrics):
+def _update_baseline(metrics, voice=None):
     """Rolling average update to the baseline, so it can't overfit to one chunk."""
-    global _baseline_cache
+    v = voice or _ACTIVE_VOICE
     with _baseline_lock:
-        existing = _get_baseline() or {}
+        existing = _get_baseline(v) or {}
         n = existing.get("sample_count", 0)
 
         # Exponential moving average, so recent chunks count for more
@@ -1029,10 +1153,9 @@ def _update_baseline(metrics):
             "sample_count":  n + 1,
             "updated":       datetime.now().isoformat(),
         }
-        _baseline_cache = updated
+        _baseline_cache[v] = updated
         try:
-            with open(_baseline_path(), "w") as f:
-                json.dump(updated, f, indent=2)
+            _write_json_atomic(_baseline_path(v), updated, indent=2)
         except Exception as e:
             print(f"[LEARNER] Baseline save error: {e}")
 
@@ -1059,6 +1182,40 @@ def _update_baseline(metrics):
 # The public API, which server.py calls
 # ---
 
+# --- What a synthesis writes onto a chunk row ---
+# The id is a content hash, so replaying or scrubbing back to a sentence lands
+# on the row it already has. That used to be INSERT OR REPLACE, and REPLACE
+# deletes the old row before inserting, so every column it did not list went
+# back to NULL: the user's verdict, their note, and the Whisper scores. A
+# thumbs-down chunk that was heard again then counted as unrated, got marked
+# solid at the end of the session, could no longer be reverted, and a second
+# thumbs-up counted twice in the lifetime totals. Now a re-synthesis is an
+# upsert that rewrites exactly these columns and keeps the rest.
+_SYNTH_COLS = (
+    "ts", "text", "sentence_type", "silence_ms", "char_count", "success", "profile",
+    "used_temperature", "used_top_p", "used_top_k", "used_rep_penalty", "used_speed",
+    "clause_count", "ends_mid", "emphasis_density", "has_math", "voice", "sentence_count",
+    "primary_facet", "facet_count", "synth_ms", "duration_ms", "rtf", "retried",
+    "is_fragment", "pos_available", "error_detail", "rejected", "output_check",
+)
+_SYNTH_COLS_MINIMAL = ("ts", "text", "sentence_type", "silence_ms", "char_count", "success")
+
+
+def _upsert_sql(cols, clear_errors=True):
+    """INSERT a chunk row, or on an existing id update only these columns. A
+    success also clears the type and stage of an earlier fatal failure, since
+    REPLACE used to and a chunk that now works is not still failing. The
+    minimal fallback skips that, because it exists for a database whose
+    migrations did not run, where those columns may not exist."""
+    allc = ("id",) + tuple(cols)
+    sets = ", ".join(f"{c}=excluded.{c}" for c in cols)
+    if clear_errors:
+        sets += ", error_type=NULL, error_stage=NULL"
+    return (f"INSERT INTO chunks ({', '.join(allc)}) "
+            f"VALUES ({', '.join('?' for _ in allc)}) "
+            f"ON CONFLICT(id) DO UPDATE SET {sets}")
+
+
 def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
               display_text=None, synth_params=None, prosody=None, has_math=False,
               profile_str=None):
@@ -1070,7 +1227,7 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
     The chunk_id comes deterministically from a content hash of the chunk text
     rather than a random uuid. That means re-synthesising the same sentence,
     whether through replay or a prefetch race or scrubbing back, maps to the same
-    row and INSERT OR REPLACE updates it in place instead of adding a duplicate.
+    row and _upsert_sql updates it in place instead of adding a duplicate.
     So the stored chunk count reflects the distinct chunks in the document and
     one Read Page gives a stable count matching the popup's reading length.
 
@@ -1110,15 +1267,9 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
     with _db_lock:
         conn = _get_db()
         try:
-            conn.execute("""
-                INSERT OR REPLACE INTO chunks
-                    (id, ts, text, sentence_type, silence_ms, char_count, success, profile,
-                     used_temperature, used_top_p, used_top_k, used_rep_penalty, used_speed,
-                     clause_count, ends_mid, emphasis_density, has_math, voice, sentence_count,
-                     primary_facet, facet_count, synth_ms, duration_ms, rtf, retried,
-                     is_fragment, pos_available, error_detail, rejected, output_check)
-                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (chunk_id, time.time(), stored_text, sentence_type, silence_ms, len(stored_text), _profile_str,
+            conn.execute(_upsert_sql(_SYNTH_COLS), (
+                  chunk_id, time.time(), stored_text, sentence_type, silence_ms, len(stored_text), 1,
+                  _profile_str,
                   sp.get("temperature"), sp.get("top_p"), sp.get("top_k"),
                   sp.get("repetition_penalty"), sp.get("speed"),
                   pz.get("clause_count"), (1 if pz.get("ends_mid") else 0) if pz else None,
@@ -1139,11 +1290,9 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
             # Schema mismatch (e.g. a migration didn't apply on this DB) must never
             # break synthesis. Fall back to the minimal, always-present columns.
             print(f"[LEARNER] log_chunk full insert failed ({e}); using minimal insert")
-            conn.execute("""
-                INSERT OR REPLACE INTO chunks
-                    (id, ts, text, sentence_type, silence_ms, char_count, success)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
-            """, (chunk_id, time.time(), stored_text, sentence_type, silence_ms, len(stored_text)))
+            conn.execute(_upsert_sql(_SYNTH_COLS_MINIMAL, clear_errors=False),
+                         (chunk_id, time.time(), stored_text, sentence_type, silence_ms,
+                          len(stored_text), 1))
         conn.commit()
         conn.close()
 
@@ -1502,16 +1651,22 @@ def _apply_report(report_id, chunk_text, issue, token, expected, heard, action, 
     return {"report_id": report_id, "applied": True, "result": result_msg}
 
 
+# The pronunciation store has three writers: this module, POST /pronounce and
+# the rule-delete route in server.py. Each reads the whole file, changes one key
+# and writes it all back, so two at once lost whichever finished first. They
+# all take this lock, which server.py imports from here.
+STORE_LOCK = threading.RLock()
+
+
 def _add_to_pronunciation_store(token, spoken):
     """Thread-safe pronunciation store update."""
     try:
-        store = {}
-        if STORE_PATH.exists():
-            with open(STORE_PATH) as f:
-                store = json.load(f)
-        store[token.upper()] = spoken.lower().strip()
-        with open(STORE_PATH, "w") as f:
-            json.dump(store, f, indent=2)
+        with STORE_LOCK:
+            store = {}
+            if STORE_PATH.exists():
+                store = json.loads(_read_text(STORE_PATH))
+            store[token.upper()] = spoken.lower().strip()
+            _write_json_atomic(STORE_PATH, store, indent=2)
         print(f"[LEARNER] Pronunciation store updated: {token} → {spoken}")
     except Exception as e:
         print(f"[LEARNER] Store update error: {e}")
@@ -1700,18 +1855,17 @@ def unconfirm_chunk_quality(chunk_id):
     reverts a perfect mark. The EMA-blended acoustic baseline can't be perfectly
     un-blended (the pre-blend value is lost), but we decrement sample_count so the
     evidence tally stays honest and this chunk no longer counts as an exemplar."""
-    global _baseline_cache
+    v = _ACTIVE_VOICE
     with _baseline_lock:
-        ex = _get_baseline() or {}
+        ex = _get_baseline(v) or {}
         n = ex.get("sample_count", 0)
         if n > 0:
             updated = dict(ex)
             updated["sample_count"] = n - 1
             updated["updated"] = datetime.now().isoformat()
-            _baseline_cache = updated
+            _baseline_cache[v] = updated
             try:
-                with open(_baseline_path(), "w") as f:
-                    json.dump(updated, f, indent=2)
+                _write_json_atomic(_baseline_path(v), updated, indent=2)
             except Exception as e:
                 print(f"[LEARNER] baseline save error (unconfirm): {e}")
     print(f"[LEARNER] ↩ baseline sample decremented for reverted chunk {chunk_id[:8]}")
@@ -1783,9 +1937,9 @@ def confirm_chunk_quality(chunk_id):
                 print(f"[LEARNER] good_settings (pending) error: {e}")
         return {"reinforced": False, "reason": "metrics_pending",
                 "settings_recorded": bool(good)}
-    global _baseline_cache
+    v = _ACTIVE_VOICE
     with _baseline_lock:
-        ex = _get_baseline() or {}
+        ex = _get_baseline(v) or {}
         a = 0.25
         def ema(o, n):
             if n is None:
@@ -1798,10 +1952,9 @@ def confirm_chunk_quality(chunk_id):
             updated["voice_consistency"] = ema(ex.get("voice_consistency"), voice_cons)
         updated["sample_count"] = ex.get("sample_count", 0) + 1
         updated["updated"]      = datetime.now().isoformat()
-        _baseline_cache = updated
+        _baseline_cache[v] = updated
         try:
-            with open(_baseline_path(), "w") as f:
-                json.dump(updated, f, indent=2)
+            _write_json_atomic(_baseline_path(v), updated, indent=2)
         except Exception as e:
             print(f"[LEARNER] baseline save error: {e}")
     print(f"[LEARNER] ✓ baseline reinforced from confirmed chunk {chunk_id[:8]} (type={stype})")
@@ -1816,6 +1969,9 @@ def confirm_chunk_quality(chunk_id):
             "reinforced_settings": good, "new_baseline": updated}
 
 
+_PUNCT_LOCK = threading.Lock()   # two corrections at once must not lose one
+
+
 def learn_punctuation_correction(original, corrected):
     """Store a user punctuation correction + extract reusable PUNCT rules."""
     original  = (original or "").strip()
@@ -1823,13 +1979,12 @@ def learn_punctuation_correction(original, corrected):
     if not corrected or corrected == original:
         return {"ok": False, "edits": 0}
     try:
-        store = {}
-        if PUNCT_PATH.exists():
-            with open(PUNCT_PATH) as f:
-                store = json.load(f)
-        store[original] = corrected
-        with open(PUNCT_PATH, "w") as f:
-            json.dump(store, f, indent=2, ensure_ascii=False)
+        with _PUNCT_LOCK:
+            store = {}
+            if PUNCT_PATH.exists():
+                store = json.loads(_read_text(PUNCT_PATH))
+            store[original] = corrected
+            _write_json_atomic(PUNCT_PATH, store, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"[LEARNER] punct store error: {e}")
     import difflib
@@ -1871,15 +2026,26 @@ def _load_good_settings():
     global _good_settings_cache
     if _good_settings_cache is not None:
         return _good_settings_cache
+    p = _good_settings_path()
     try:
-        p = _good_settings_path()
         if p.exists():
-            with open(p) as f:
-                _good_settings_cache = json.load(f)
+            _good_settings_cache = json.loads(_read_text(p))
         else:
             _good_settings_cache = {}
-    except Exception:
+    except Exception as e:
+        # A file that exists but will not parse still holds everything learned,
+        # and the next save would write an empty store over it. So the damaged
+        # copy is moved aside first, where it can be repaired by hand, and
+        # learning carries on from empty rather than refusing to work.
         _good_settings_cache = {}
+        try:
+            aside = p.with_name(f"{p.name}.corrupt-{int(time.time())}")
+            os.replace(p, aside)
+            print(f"[LEARNER] good_settings.json could not be read ({e}); "
+                  f"kept it as {aside.name} and started a fresh one")
+        except OSError as e2:
+            print(f"[LEARNER] good_settings.json could not be read ({e}) "
+                  f"or set aside ({e2})")
     return _good_settings_cache
 
 
@@ -1915,8 +2081,7 @@ def record_good_settings(sentence_type, settings):
         global _good_settings_cache
         _good_settings_cache = store
         try:
-            with open(_good_settings_path(), "w") as f:
-                json.dump(store, f, indent=2)
+            _write_json_atomic(_good_settings_path(), store, indent=2)
         except Exception as e:
             print(f"[LEARNER] good_settings save error: {e}")
     print(f"[LEARNER] ★ recorded good settings for '{stype}' "
@@ -2021,9 +2186,12 @@ def _record_param_observation(chunk_id, quality, accuracy):
     stored on the chunk."""
     with _db_lock:
         conn = _get_db()
+        # The voice comes off the chunk's own row rather than the active voice,
+        # since analysis runs behind synthesis and the user may have switched
+        # voice while this chunk waited in the queue.
         row = conn.execute(
             "SELECT profile, sentence_type, used_temperature, used_top_p, "
-            "used_top_k, used_rep_penalty, used_speed FROM chunks WHERE id=?",
+            "used_top_k, used_rep_penalty, used_speed, voice FROM chunks WHERE id=?",
             (chunk_id,)).fetchone()
         if row and row[0]:
             conn.execute(
@@ -2032,7 +2200,7 @@ def _record_param_observation(chunk_id, quality, accuracy):
                 " rep_penalty, speed, quality, accuracy, voice) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), row[0], row[1], row[2], row[3], row[4],
-                 row[5], row[6], quality, accuracy, _ACTIVE_VOICE))
+                 row[5], row[6], quality, accuracy, row[7] or _ACTIVE_VOICE))
             conn.commit()
         conn.close()
 
@@ -2076,8 +2244,7 @@ def set_setting(key, value):
         global _good_settings_cache
         _good_settings_cache = store
         try:
-            with open(_good_settings_path(), "w") as f:
-                json.dump(store, f, indent=2)
+            _write_json_atomic(_good_settings_path(), store, indent=2)
         except Exception as e:
             print(f"[LEARNER] set_setting save error: {e}")
     return value
@@ -2151,6 +2318,10 @@ def rename_voice_data(old_id, new_id):
                     (new_id, old_id)).rowcount
         finally:
             conn.close()
+    # The server has just moved the baseline file to the new name, so neither
+    # name's cached copy is current any more.
+    _forget_cached_baseline(old_id)
+    _forget_cached_baseline(new_id)
 
     old_p, new_p = _voice_prefix(old_id), _voice_prefix(new_id)
     if old_p:
@@ -2162,8 +2333,7 @@ def rename_voice_data(old_id, new_id):
             global _good_settings_cache
             _good_settings_cache = store
             try:
-                with open(_good_settings_path(), "w") as f:
-                    json.dump(store, f, indent=2)
+                _write_json_atomic(_good_settings_path(), store, indent=2)
             except Exception as e:
                 print(f"[LEARNER] rename_voice_data save error: {e}")
     return moved
@@ -2186,6 +2356,8 @@ def forget_voice_data(voice_id):
                     "DELETE FROM param_observations WHERE voice=?", (voice_id,)).rowcount
         finally:
             conn.close()
+    # A voice made again later under this name must start from nothing.
+    _forget_cached_baseline(voice_id)
 
     pref = _voice_prefix(voice_id)
     if pref:
@@ -2197,8 +2369,7 @@ def forget_voice_data(voice_id):
             global _good_settings_cache
             _good_settings_cache = store
             try:
-                with open(_good_settings_path(), "w") as f:
-                    json.dump(store, f, indent=2)
+                _write_json_atomic(_good_settings_path(), store, indent=2)
             except Exception as e:
                 print(f"[LEARNER] forget_voice_data save error: {e}")
     return gone
@@ -2214,8 +2385,7 @@ def set_autotune(on):
         global _good_settings_cache
         _good_settings_cache = store
         try:
-            with open(_good_settings_path(), "w") as f:
-                json.dump(store, f, indent=2)
+            _write_json_atomic(_good_settings_path(), store, indent=2)
         except Exception as e:
             print(f"[LEARNER] autotune flag save error: {e}")
     log_history("TEMP", f"auto-tune {'enabled' if on else 'disabled'} by user", "user")
@@ -2803,7 +2973,12 @@ def run_autotune_cycle():
     if not autotune_enabled():
         return []
     actions = []
-    with _db_lock:
+    # The store is read at the top of this and written back whole at the end,
+    # with the database queries in between, so it holds the good-settings lock
+    # throughout. Without it a thumbs-up or a voice switch saved meanwhile was
+    # overwritten by this cycle's older copy. The lock order is good-settings
+    # then database, and nothing takes them the other way round.
+    with _good_settings_lock, _db_lock:
         conn = _get_db()
         profiles = [r[0] for r in conn.execute(
             "SELECT profile, COUNT(*) c FROM param_observations WHERE voice=? "
@@ -2884,8 +3059,7 @@ def run_autotune_cycle():
         global _good_settings_cache
         _good_settings_cache = store
         try:
-            with open(_good_settings_path(), "w") as f:
-                json.dump(store, f, indent=2)
+            _write_json_atomic(_good_settings_path(), store, indent=2)
         except Exception as e:
             print(f"[LEARNER] autotune save error: {e}")
         conn.close()
@@ -2894,10 +3068,11 @@ def run_autotune_cycle():
     return actions
 
 
-def _adjust_profile_temperature(profile_keys, step, base_default=0.33):
+def _adjust_profile_temperature(profile_keys, step, base_default=0.33, voice=None):
     """Nudge the preferred temperature for the MOST SPECIFIC profile key, and
     also (with a damped step) the coarser keys so broad learning still forms.
-    Stores under 'prof:<key>' with an evidence count. Returns (key, new_t)."""
+    Stores under 'prof:<key>' with an evidence count. Returns (key, new_t).
+    voice defaults to the active one; see _vk."""
     if not profile_keys:
         return (None, None)
     with _good_settings_lock:
@@ -2908,7 +3083,7 @@ def _adjust_profile_temperature(profile_keys, step, base_default=0.33):
         # previous, so specific patterns move most but broad buckets still learn.
         s = step
         for i, key in enumerate(profile_keys):
-            pk = _vk(f"prof:{key}")
+            pk = _vk(f"prof:{key}", voice)
             entry = dict(store.get(pk) or {})
             base = entry.get("temperature")
             if base is None:
@@ -2923,8 +3098,7 @@ def _adjust_profile_temperature(profile_keys, step, base_default=0.33):
         global _good_settings_cache
         _good_settings_cache = store
         try:
-            with open(_good_settings_path(), "w") as f:
-                json.dump(store, f, indent=2)
+            _write_json_atomic(_good_settings_path(), store, indent=2)
         except Exception as e:
             print(f"[LEARNER] profile temp save error: {e}")
     return (specific, results.get(specific))
@@ -2982,8 +3156,7 @@ def _adjust_pref_temperature(sentence_type, step):
         global _good_settings_cache
         _good_settings_cache = store
         try:
-            with open(_good_settings_path(), "w") as f:
-                json.dump(store, f, indent=2)
+            _write_json_atomic(_good_settings_path(), store, indent=2)
         except Exception as e:
             print(f"[LEARNER] temp save error: {e}")
     return new_t
@@ -3240,8 +3413,7 @@ def _adjust_band_rate(band, step):
         global _good_settings_cache
         _good_settings_cache = store
         try:
-            with open(_good_settings_path(), "w") as f:
-                json.dump(store, f, indent=2)
+            _write_json_atomic(_good_settings_path(), store, indent=2)
         except Exception as e:
             print(f"[LEARNER] band rate save error: {e}")
     print(f"[LEARNER] rate_mod[{band}] → {new_mod}" + (" (damped: direction flip)" if damped else ""))
@@ -3445,8 +3617,7 @@ def reset_learned_rates():
         global _good_settings_cache
         _good_settings_cache = store
         try:
-            with open(_good_settings_path(), "w") as f:
-                json.dump(store, f, indent=2)
+            _write_json_atomic(_good_settings_path(), store, indent=2)
         except Exception as e:
             print(f"[LEARNER] rate reset save error: {e}")
     log_history("RATE", "All learned speaking rates reset to default", "user")
@@ -3540,11 +3711,20 @@ _rules_cache      = None
 _rules_cache_lock = threading.Lock()
 
 
+# Bumped by every invalidation. A reader notes it before going to the database
+# and only stores what it read if nothing invalidated meanwhile. Without it a
+# /speak that was mid-read when a verdict added a rule stored the list from
+# before the rule, on top of the invalidation, and since hit counting never
+# invalidates, the new rule then stayed invisible for the rest of the session.
+_rules_cache_gen  = 0
+
+
 def invalidate_rule_cache():
     """Drop the cached active-rule list. Called after any change to `rules`."""
-    global _rules_cache
+    global _rules_cache, _rules_cache_gen
     with _rules_cache_lock:
         _rules_cache = None
+        _rules_cache_gen += 1
 
 
 def _active_rules():
@@ -3553,9 +3733,11 @@ def _active_rules():
     with _rules_cache_lock:
         if _rules_cache is not None:
             return _rules_cache
+        gen = _rules_cache_gen
     fresh = get_rules(active_only=True)
     with _rules_cache_lock:
-        _rules_cache = fresh
+        if _rules_cache_gen == gen:
+            _rules_cache = fresh
     return fresh
 
 
@@ -3692,8 +3874,7 @@ def mark_session_solid(since_ts=None, played=None):
             global _good_settings_cache
             _good_settings_cache = store
             try:
-                with open(_good_settings_path(), "w") as f:
-                    json.dump(store, f, indent=2)
+                _write_json_atomic(_good_settings_path(), store, indent=2)
             except Exception as e:
                 print(f"[LEARNER] solid reinforce save error: {e}")
         print(f"[LEARNER] session closed: {marked} chunks marked solid "
@@ -3939,6 +4120,24 @@ def apply_learned_rules(text):
         _increment_rule_hits(fired_ids)
 
     return text.strip()
+
+
+def is_suppressed_chunk(chunk_id):
+    """True when the user skipped exactly this chunk from the feed.
+
+    The skip verdict files a SUPPRESS rule whose pattern is the chunk id, and
+    apply_learned_rules matches patterns against text, where a 16-character
+    hash never appears, so those rules were stored, listed and never fired. The
+    id is the content hash of the chunk's final spoken text, which only exists
+    once cleaning has finished, so the server asks this at that point instead.
+    Text-pattern SUPPRESS rules still go through apply_learned_rules as before."""
+    if not chunk_id:
+        return False
+    for rule in _active_rules():
+        if rule["rule_type"] == "SUPPRESS" and rule["pattern"] == chunk_id:
+            _increment_rule_hits([rule["id"]])
+            return True
+    return False
 
 
 def _increment_rule_hits(rule_ids):

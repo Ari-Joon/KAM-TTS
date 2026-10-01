@@ -40,6 +40,8 @@ MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_PAGES       = 60
 SESSION_TTL     = 20 * 60      # seconds of inactivity before it closes itself
 SCAN_PORT       = 5051
+REAP_EVERY      = 30           # how often an open session checks its own expiry
+DIR_PREFIX      = "kam_scan_"  # the temp folders that hold a session's photos
 
 # The pairing code is what gets typed in by hand when the QR will not scan, so
 # it leaves out the characters people misread.
@@ -200,7 +202,7 @@ def open_session():
 
     code  = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(6))
     token = secrets.token_urlsafe(24)
-    d     = tempfile.mkdtemp(prefix="kam_scan_")
+    d     = tempfile.mkdtemp(prefix=DIR_PREFIX)
 
     try:
         srv = make_server(ip, SCAN_PORT, _phone_app, threaded=True)
@@ -208,13 +210,17 @@ def open_session():
         shutil.rmtree(d, ignore_errors=True)
         return {"ok": False, "error": f"Could not open port {SCAN_PORT} on {ip}: {e}"}
 
+    sess = {"code": code, "token": token, "dir": d, "pages": [],
+            "opened": _now(), "touched": _now(), "ip": ip,
+            "stop": threading.Event()}
     with _lock:
-        _session = {"code": code, "token": token, "dir": d, "pages": [],
-                    "opened": _now(), "touched": _now(), "ip": ip}
+        _session = sess
         _server  = srv
     _thread = threading.Thread(target=srv.serve_forever, daemon=True,
                                name="kam-scan-host")
     _thread.start()
+    threading.Thread(target=_reaper, args=(sess,), daemon=True,
+                     name="kam-scan-reaper").start()
     url = f"http://{ip}:{SCAN_PORT}/?k={token}"
     print(f"[SCAN] listening on {ip}:{SCAN_PORT} for session {code}")
     return {"ok": True, "code": code, "url": url, "ip": ip,
@@ -223,10 +229,20 @@ def open_session():
 
 def close_session():
     """Stop the listener, forget the token, and delete the photos."""
+    return _close()
+
+
+def _close(expected=None):
+    """close_session, optionally only if expected is still the open session, so
+    the reaper of an old session can never close the one that replaced it."""
     global _session, _server, _thread
     with _lock:
+        if expected is not None and _session is not expected:
+            return {"ok": True}
         srv, sess = _server, _session
         _server, _session = None, None
+    if sess is not None and sess.get("stop") is not None:
+        sess["stop"].set()
     if srv is not None:
         try:
             srv.shutdown()
@@ -245,6 +261,69 @@ def close_session():
     return {"ok": True}
 
 
+# --- Expiry without the dashboard ---
+# Expiry used to be noticed only when the dashboard polled /scan/status. With
+# the dashboard closed, or Chrome gone, an expired session kept its socket bound
+# on the LAN and its photos of the user's pages sat in %TEMP% until the server
+# stopped, and the power button stops it with os._exit, so they outlived that
+# too. Each session now has a thread that closes it once it expires, and boot
+# clears out folders a previous process left behind.
+
+def _reap_expired(sess=None):
+    """Close the open session if it has expired. With sess, only if that is
+    still the one open. Returns True when it closed something."""
+    with _lock:
+        cur = _session
+        if cur is None or (sess is not None and cur is not sess) or not _expired(cur):
+            return False
+    _close(expected=cur)
+    print(f"[SCAN] session {cur['code']} expired")
+    return True
+
+
+def _reaper(sess):
+    """Background thread for one session: check its expiry every REAP_EVERY
+    seconds, and stop as soon as the session is closed by anything else."""
+    stop = sess["stop"]
+    while not stop.wait(REAP_EVERY):
+        if _reap_expired(sess):
+            return
+
+
+def cleanup_stale_dirs(root=None, min_age=SESSION_TTL):
+    """Delete photo folders left by sessions that never closed, which means the
+    process ended with one open. Called once at boot, when no session can be
+    open, but the current one is skipped anyway, and so is anything younger
+    than min_age in case some other process is mid-session. Returns how many
+    folders went."""
+    root = root or tempfile.gettempdir()
+    with _lock:
+        keep = _session["dir"] if _session else None
+    gone = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    cutoff = _now() - min_age
+    for name in names:
+        if not name.startswith(DIR_PREFIX):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if (not os.path.isdir(path) or os.path.islink(path)
+                    or (keep and os.path.samefile(path, keep))
+                    or os.path.getmtime(path) > cutoff):
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            gone += 1
+    if gone:
+        print(f"[SCAN] removed {gone} photo folder(s) left by an earlier session")
+    return gone
+
+
 def session_status():
     """What the dashboard polls: is it open, where, and how many pages so far."""
     with _lock:
@@ -256,7 +335,7 @@ def session_status():
         else:
             expired = False
     if expired:
-        close_session()
+        _close(expected=sess)
         return {"open": False, "expired": True}
     with _lock:
         return {"open": True, "code": sess["code"], "ip": sess["ip"],

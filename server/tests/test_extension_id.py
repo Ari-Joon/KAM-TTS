@@ -11,6 +11,17 @@ i = src.index("_FALLBACK_EXTENSION_ID =")
 j = src.index("_EXTENSION_ORIGINS = _extension_origins()")
 block = src[i:j]
 
+# _extension_origins also reads the manifest register_host.py installs under
+# %LOCALAPPDATA%, and on a registered machine that real file would answer
+# before the temp ones below. A stand-in module points it at an empty folder so
+# these cases only ever see what they wrote. test_server_fixes.py covers the
+# registered location itself.
+import types as _types
+_fake_rh = _types.ModuleType("register_host")
+_fake_rh_dir = tempfile.mkdtemp()
+_fake_rh.manifest_path = lambda: os.path.join(_fake_rh_dir, "com.kam.tts.json")
+sys.modules["register_host"] = _fake_rh
+
 PASS = FAIL = 0
 def check(label, got, want):
     global PASS, FAIL

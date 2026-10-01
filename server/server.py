@@ -65,7 +65,7 @@ _READY_SENTINEL = _os_boot0.path.join(_SERVER_DIR0, ".kam_ready")
 _STAGE_FILE = _os_boot0.path.join(_SERVER_DIR0, ".kam_stage")
 def _stage(msg):
     try:
-        with open(_STAGE_FILE, "w") as _sf:
+        with open(_STAGE_FILE, "w", encoding="utf-8") as _sf:
             _sf.write(msg)
     except Exception:
         pass
@@ -129,7 +129,7 @@ def _acquire_single_instance():
         # Read the holder PID; if that process is alive, we are a duplicate.
         holder = -1
         try:
-            with open(_LOCK_FILE, "r") as _lf:
+            with open(_LOCK_FILE, "r", encoding="utf-8") as _lf:
                 holder = int((_lf.read() or "-1").strip() or "-1")
         except Exception:
             holder = -1
@@ -202,6 +202,52 @@ from scipy import signal  # type: ignore
 
 import hashlib, threading as _threading
 import collections as _collections
+import tempfile as _tempfile
+import locale as _locale
+import time as _time_mod
+
+
+def _write_json_atomic(path, obj, **dump_kwargs):
+    """Write a learned-state JSON file so a reader only ever sees the old file
+    or the whole new one. open("w") empties the file first, so a kill mid-write
+    (the power button ends in os._exit) used to leave it truncated. learner.py
+    has the same helper for its own files. Raises on failure."""
+    path = str(path)
+    fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                                prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, **dump_kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        # Windows refuses to replace a file that another thread is reading at
+        # that instant, so a busy reader gets a few short retries.
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                _time_mod.sleep(0.05)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_text_file(path):
+    """A learned file's text as UTF-8, falling back to the ANSI codepage for one
+    an older learner.py wrote before its encoding was pinned, so an upgrade
+    still reads the existing corrections."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(_locale.getpreferredencoding(False), errors="replace")
 
 # --- XTTS isn't thread safe, so only one inference at a time ---
 _inference_lock = _threading.Lock()
@@ -246,7 +292,7 @@ def _load_user_defaults():
     global _DEFAULT_SETTINGS
     try:
         if os.path.exists(_USER_DEFAULTS_PATH):
-            with open(_USER_DEFAULTS_PATH) as f:
+            with open(_USER_DEFAULTS_PATH, encoding="utf-8") as f:
                 saved = json.load(f)
             clean = {k: saved[k] for k in _FACTORY_SETTINGS if k in saved}
             if clean:
@@ -337,6 +383,24 @@ app = Flask(__name__)
 _FALLBACK_EXTENSION_ID = "mdhbimlofbadmgombcdmnmnebgglalob"
 
 
+def _native_manifest_paths():
+    """Where register_host.py's manifest can be, newest location first.
+
+    It moved to %LOCALAPPDATA%\\KAMTTS when the launcher did, so the project
+    folder can be moved without breaking it, but this kept reading the old spot
+    beside server.py, where nothing writes any more. The registered id was
+    therefore never seen. The old spot is still read second, for an install
+    that registered before the move and has not re-registered since."""
+    paths = []
+    try:
+        import register_host as _rh
+        paths.append(_rh.manifest_path())
+    except Exception as e:
+        print(f"[BOOT] Could not locate the registered manifest ({e})")
+    paths.append(os.path.join(_SERVER_DIR0, "com.kam.tts.json"))
+    return paths
+
+
 def _extension_origins():
     """Which chrome-extension origins may call this API.
 
@@ -368,21 +432,21 @@ def _extension_origins():
         print(f"[BOOT] Extension origin(s) from KAM_EXTENSION_ID: {', '.join(ids)}")
         return [f"chrome-extension://{i}" for i in ids]
 
-    manifest = os.path.join(_SERVER_DIR0, "com.kam.tts.json")
-    try:
-        with open(manifest) as f:
-            allowed = json.load(f).get("allowed_origins") or []
-        # Chrome writes these with a trailing slash; CORS wants them without.
-        origins = [o.rstrip("/") for o in allowed
-                   if isinstance(o, str) and o.startswith("chrome-extension://")]
-        if origins:
-            print(f"[BOOT] Extension origin(s) from the native-host manifest: "
-                  f"{', '.join(origins)}")
-            return origins
-    except FileNotFoundError:
-        pass          # normal before register_host.py has been run
-    except Exception as e:
-        print(f"[BOOT] Could not read the native-host manifest ({e})")
+    for manifest in _native_manifest_paths():
+        try:
+            with open(manifest, encoding="utf-8") as f:
+                allowed = json.load(f).get("allowed_origins") or []
+            # Chrome writes these with a trailing slash; CORS wants them without.
+            origins = [o.rstrip("/") for o in allowed
+                       if isinstance(o, str) and o.startswith("chrome-extension://")]
+            if origins:
+                print(f"[BOOT] Extension origin(s) from the native-host manifest: "
+                      f"{', '.join(origins)}")
+                return origins
+        except FileNotFoundError:
+            pass          # normal before register_host.py has been run
+        except Exception as e:
+            print(f"[BOOT] Could not read the native-host manifest ({e})")
 
     print(f"[BOOT] Extension origin: the pinned ID "
           f"{_FALLBACK_EXTENSION_ID}. If you changed the key in manifest.json, "
@@ -400,7 +464,7 @@ def _load_or_create_token():
         return env.strip()
     tpath = os.path.join(_SERVER_DIR0, "kam_token.txt")
     try:
-        with open(tpath) as f:
+        with open(tpath, encoding="utf-8") as f:
             tok = f.read().strip()
             if tok:
                 return tok
@@ -409,7 +473,7 @@ def _load_or_create_token():
     import secrets
     tok = "kam-" + secrets.token_urlsafe(24)
     try:
-        with open(tpath, "w") as f:
+        with open(tpath, "w", encoding="utf-8") as f:
             f.write(tok)
         print("[BOOT] Generated per-install API token (kam_token.txt)")
     except OSError as e:
@@ -503,6 +567,43 @@ class NoVoiceClipsError(FileNotFoundError):
 def _voice_dir(voice_id):
     return VOICE_SAMPLES_DIR if voice_id == "default" else os.path.join(VOICES_DIR, voice_id)
 
+
+# Characters that cannot be in a single folder name, or that change what a path
+# means: separators, the drive colon (which also opens an NTFS stream), the
+# Windows wildcards and control characters.
+_RE_BAD_VOICE_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def _checked_voice_id(raw):
+    """The voice id from a request if it names one folder directly inside
+    voices/, else None, and every route that takes a voice id goes through this.
+
+    _voice_dir joins the id onto VOICES_DIR, and that join used to be all there
+    was. So ".." named server/ itself, and /voices/delete with confirm=true
+    would rmtree the whole install, database and learned settings included; on
+    Windows an absolute id replaced the base outright. This does not reshape the
+    id the way /voices/create does, since a folder made by hand under voices/
+    (spaces, capitals) is listed under its real name and has to keep working;
+    it only refuses what is not a plain folder name, and then checks that the
+    resolved path really is a child of voices/."""
+    vid = (raw or "").strip()
+    if vid == "default":
+        return vid
+    # Windows quietly drops trailing dots and spaces, so "alice." would open
+    # alice while being recorded under another name.
+    if (not vid or vid in (".", "..") or vid != vid.rstrip(". ")
+            or _RE_BAD_VOICE_CHARS.search(vid)):
+        return None
+    root = os.path.realpath(VOICES_DIR)
+    if os.path.dirname(os.path.realpath(os.path.join(root, vid))) != root:
+        return None
+    return vid
+
+
+def _bad_voice_id(raw):
+    """The 400 every voice route returns for an id _checked_voice_id refused."""
+    return jsonify({"ok": False, "error": f"'{raw}' is not a voice name."}), 400
+
 def _list_voices():
     """All voice profiles with clip counts; 'default' always listed first."""
     out = [{"voice_id": "default",
@@ -594,16 +695,14 @@ def _screen_voice_clips(clips, voice_id):
 def LATENT_CACHE_PATH_FOR(voice_id):
     """The latent cache belonging to one named voice.
 
-    Split out from LATENT_CACHE_PATH so renaming and deleting a profile can
-    reach the file of a voice that is not the active one, which is the usual
-    case: you rename the voice you are not currently listening to."""
+    Per voice so switching voices is instant after first use. It takes the
+    voice explicitly so renaming and deleting a profile can reach the file of a
+    voice that is not the active one, which is the usual case: you rename the
+    voice you are not currently listening to. A switch also builds the new
+    voice's cache before that voice becomes active."""
     if voice_id == "default":
         return os.path.join(_SERVER_DIR, "voice_latents.pt")
     return os.path.join(_SERVER_DIR, f"voice_latents_{voice_id}.pt")
-
-def LATENT_CACHE_PATH():
-    """Per-voice latent cache so switching voices is instant after first use."""
-    return LATENT_CACHE_PATH_FOR(_ACTIVE_VOICE)
 
 # NOTE: there is deliberately no warmup FLAG file. Kernel caches are
 # per-process, so a saved "already warmed" marker did real harm: it made a fresh
@@ -656,39 +755,49 @@ def switch_voice(voice_id):
     """Switch the active voice. If the model is loaded, swap latents live under
     the inference lock (instant when this voice's cache exists; otherwise a
     one-off recompute of a few seconds). If the model is cold/standby the choice
-    simply applies at the next wake."""
+    simply applies at the next wake.
+
+    The new voice is only saved as the active one once its latents exist. It
+    used to be saved first, so a voice whose clips XTTS could not read (all of
+    them failing screening keeps all of them) came back as a 500 while already
+    recorded as active: the old voice kept speaking, its learning was filed
+    under the new name, and the next wake from standby failed on every chunk.
+    From cold there is nothing to build latents with, so the choice is made for
+    this session and saved by _load_active_latents once a load succeeds."""
     global _ACTIVE_VOICE, gpt_cond_latent, speaker_embedding
     clips = _discover_voice_samples(voice_id)
     if not clips:
         return {"ok": False, "error": f"No .wav clips found for voice '{voice_id}'. "
                                       f"Record some passages for it in the dashboard first."}
-    _ACTIVE_VOICE = voice_id
-    _learner.set_setting("active_voice", voice_id)
-    _learner.set_active_voice(voice_id)   # isolate all learning to this voice
     if tts is None:
+        _ACTIVE_VOICE = voice_id
+        _learner.set_active_voice(voice_id)   # isolate all learning to this voice
         return {"ok": True, "voice_id": voice_id, "applied": "on next model load"}
     with _inference_lock:
-        cached = _load_cached_latents()
-        if cached is not None:
-            gpt_cond_latent, speaker_embedding = cached
-            print(f"[VOICE] Switched to '{voice_id}' ({len(clips)} clips, cached latents)")
-            return {"ok": True, "voice_id": voice_id, "applied": "instant (cached)"}
         t0 = _time.time()
-        clips = _screen_voice_clips(clips, voice_id)
-        g, sp = tts.synthesizer.tts_model.get_conditioning_latents(
-            audio_path=clips, gpt_cond_len=30, max_ref_length=60)
-        gpt_cond_latent, speaker_embedding = g.contiguous(), sp.contiguous()
-        _save_cached_latents(gpt_cond_latent, speaker_embedding)
-        print(f"[VOICE] Switched to '{voice_id}' ({len(clips)} clips, "
-              f"latents computed in {_time.time()-t0:.1f}s)")
-        return {"ok": True, "voice_id": voice_id,
-                "applied": f"latents computed ({_time.time()-t0:.1f}s)"}
+        try:
+            (g, sp), computed = _latents_for(voice_id)
+        except Exception as e:
+            print(f"  {C.WARN}[VOICE]{C.RESET} could not build '{voice_id}': {e}")
+            return {"ok": False, "error": f"Could not build the voice '{voice_id}' "
+                                          f"from its clips ({e}). The current voice is unchanged."}
+        gpt_cond_latent, speaker_embedding = g, sp
+        _ACTIVE_VOICE = voice_id
+        _learner.set_active_voice(voice_id)   # isolate all learning to this voice
+    _learner.set_setting("active_voice", voice_id)
+    if not computed:
+        print(f"[VOICE] Switched to '{voice_id}' ({len(clips)} clips, cached latents)")
+        return {"ok": True, "voice_id": voice_id, "applied": "instant (cached)"}
+    print(f"[VOICE] Switched to '{voice_id}' ({computed} clips, "
+          f"latents computed in {_time.time()-t0:.1f}s)")
+    return {"ok": True, "voice_id": voice_id,
+            "applied": f"latents computed ({_time.time()-t0:.1f}s)"}
 
 
-def _voice_mtime():
+def _voice_mtime(voice_id=None):
     """Newest mtime across all reference clips (plus their count), so the latent
     cache invalidates when any clip is added, removed, or re-recorded."""
-    clips = _discover_voice_samples()
+    clips = _discover_voice_samples(voice_id)
     if not clips:
         return None
     try:
@@ -698,19 +807,23 @@ def _voice_mtime():
         return None
 
 
-def _load_cached_latents():
+# The three cache helpers take the voice explicitly, defaulting to the active
+# one, so a switch can build the new voice's latents before it becomes active.
+
+def _load_cached_latents(voice_id=None):
     """Restore conditioning latents from disk; None if missing/stale/corrupt."""
-    if not os.path.exists(LATENT_CACHE_PATH()):
+    path = LATENT_CACHE_PATH_FOR(voice_id or _ACTIVE_VOICE)
+    if not os.path.exists(path):
         return None
     try:
-        vm = _voice_mtime()
-        cache_mtime = os.path.getmtime(LATENT_CACHE_PATH())
+        vm = _voice_mtime(voice_id)
+        cache_mtime = os.path.getmtime(path)
         if vm:
             newest, count = vm
             if cache_mtime < newest:
                 print("[STARTUP] Latent cache stale (a clip is newer) - recomputing")
                 return None
-        payload = torch.load(LATENT_CACHE_PATH(), map_location=device, weights_only=True)
+        payload = torch.load(path, map_location=device, weights_only=True)
         # If the number of reference clips changed, the averaged embedding is
         # no longer valid, so recompute it.
         if vm and payload.get("clip_count") not in (None, vm[1]):
@@ -725,15 +838,75 @@ def _load_cached_latents():
         return None
 
 
-def _save_cached_latents(gpt, spk):
+def _save_cached_latents(gpt, spk, voice_id=None):
     try:
-        _vm = _voice_mtime()
+        _vm = _voice_mtime(voice_id)
         torch.save({"gpt_cond_latent": gpt.detach().cpu(),
                     "speaker_embedding": spk.detach().cpu(),
-                    "clip_count": (_vm[1] if _vm else None)}, LATENT_CACHE_PATH())
+                    "clip_count": (_vm[1] if _vm else None)},
+                   LATENT_CACHE_PATH_FOR(voice_id or _ACTIVE_VOICE))
         print("[STARTUP] Voice latents cached to disk")
     except Exception as e:
         print(f"[STARTUP] Could not save latent cache: {e}")
+
+
+def _latents_for(voice_id, fresh=False):
+    """One voice's conditioning latents, restored from its cache or computed
+    from its clips, without touching the globals.
+
+    Returns ((gpt, speaker), computed), where computed is the number of clips
+    the latents were built from, or 0 when they came from the cache. Raises
+    NoVoiceClipsError when the voice has no clips, and whatever XTTS raises
+    when it cannot read them."""
+    cached = None if fresh else _load_cached_latents(voice_id)
+    if cached is not None:
+        return cached, 0
+    print("[STARTUP] Computing voice latents (first boot / cache miss)...")
+    t1 = _time.time()
+    _clips = _discover_voice_samples(voice_id)
+    if not _clips:
+        raise NoVoiceClipsError(
+            "No voice reference clips found. Add .wav files to "
+            f"{_voice_dir(voice_id)}/ or place a my_voice.wav next to the server.")
+    _clips = _screen_voice_clips(_clips, voice_id)
+    print(f"[STARTUP] Cloning from {len(_clips)} reference clip(s)")
+    g, sp = tts.synthesizer.tts_model.get_conditioning_latents(
+        audio_path=_clips,                 # XTTS accepts a list; averages them
+        gpt_cond_len=30,                   # use more reference audio per clip
+        max_ref_length=60,
+    )
+    g, sp = g.contiguous(), sp.contiguous()
+    print(f"[STARTUP] Latents computed in {_time.time()-t1:.1f}s")
+    _save_cached_latents(g, sp, voice_id)
+    return (g, sp), len(_clips)
+
+
+def _load_active_latents():
+    """Put the active voice's latents in place for a freshly loaded model.
+
+    A voice that cannot be built falls back to the default for this session
+    rather than leaving a model with no voice, which would fail every chunk.
+    The fallback is not saved, so the next start tries the chosen voice again.
+    A voice that does load is saved as the active one, which is how a switch
+    made while the model was in standby becomes permanent."""
+    global gpt_cond_latent, speaker_embedding, _ACTIVE_VOICE
+    fresh = os.environ.get("KAM_FRESH_LATENTS") == "1"
+    try:
+        (gpt_cond_latent, speaker_embedding), _n = _latents_for(_ACTIVE_VOICE, fresh)
+    except Exception as e:
+        if _ACTIVE_VOICE == "default":
+            raise
+        print(f"  {C.WARN}[VOICE]{C.RESET} could not build '{_ACTIVE_VOICE}' ({e}); "
+              f"using the default voice until it is fixed")
+        _ACTIVE_VOICE = "default"
+        _learner.set_active_voice("default")
+        (gpt_cond_latent, speaker_embedding), _n = _latents_for("default", fresh)
+        return
+    try:
+        if _learner.get_setting("active_voice", "default") != _ACTIVE_VOICE:
+            _learner.set_setting("active_voice", _ACTIVE_VOICE)
+    except Exception as e:
+        print(f"[VOICE] could not save the active voice: {e}")
 
 
 def load_model():
@@ -746,8 +919,9 @@ def load_model():
     This is idempotent: if the model is already loaded in this process I return
     straight away. That stops a second full load, and a duplicate startup banner,
     if the module gets re-entered, which happens when Werkzeug imports it by name
-    to serve the app after it has already run as __main__."""
-    global tts, gpt_cond_latent, speaker_embedding
+    to serve the app after it has already run as __main__. _reload_model is the
+    way to force a fresh load."""
+    global tts
     if tts is not None:
         return
     t0 = _time.time()
@@ -770,28 +944,7 @@ def load_model():
         except Exception as e:
             print(f"[STARTUP] DeepSpeed enable skipped: {e}")
 
-    cached = None if os.environ.get("KAM_FRESH_LATENTS") == "1" else _load_cached_latents()
-    if cached is not None:
-        gpt_cond_latent, speaker_embedding = cached
-    else:
-        print("[STARTUP] Computing voice latents (first boot / cache miss)...")
-        t1 = _time.time()
-        _clips = _discover_voice_samples()
-        if not _clips:
-            raise NoVoiceClipsError(
-                "No voice reference clips found. Add .wav files to "
-                f"{VOICE_SAMPLES_DIR}/ or place a my_voice.wav next to the server.")
-        _clips = _screen_voice_clips(_clips, _ACTIVE_VOICE)
-        print(f"[STARTUP] Cloning from {len(_clips)} reference clip(s)")
-        gpt_cond_latent, speaker_embedding = tts.synthesizer.tts_model.get_conditioning_latents(
-            audio_path=_clips,                 # XTTS accepts a list; averages them
-            gpt_cond_len=30,                   # use more reference audio per clip
-            max_ref_length=60,
-        )
-        gpt_cond_latent   = gpt_cond_latent.contiguous()
-        speaker_embedding = speaker_embedding.contiguous()
-        print(f"[STARTUP] Latents computed in {_time.time()-t1:.1f}s")
-        _save_cached_latents(gpt_cond_latent, speaker_embedding)
+    _load_active_latents()
 
     # I deliberately don't call torch.cuda.empty_cache() here. The
     # standalone benchmark (which runs inference in ~3s) never does, and
@@ -863,6 +1016,26 @@ def _warm_model():
         print(f"[STARTUP] Model warmed in {_time.time()-t0:.1f}s")
     except Exception as e:
         print(f"[STARTUP] Warmup failed (non-fatal): {e}")
+
+
+def _reload_model():
+    """Throw the loaded model away and load it again from disk.
+
+    The last recovery step in _synthesise_and_log is meant to be this, but it
+    called load_model, which returns at once whenever a model is loaded, which
+    it always is at that point. So "reloading model" retried against the same
+    model and the same state. Both locks are held so no request can reach the
+    model while it is gone, and if the load fails the model is left unloaded,
+    so the next request goes through wake_model and tries again."""
+    global tts, gpt_cond_latent, speaker_embedding
+    with _standby_lock, _inference_lock:
+        tts = None
+        gpt_cond_latent = None
+        speaker_embedding = None
+        import gc as _gc
+        _gc.collect()
+        _device.empty_cache(DEV)
+        load_model()
 
 
 def evict_model():
@@ -1014,8 +1187,7 @@ def _write_detected_profile(facts):
     payload["source"] = "auto"        # vs "profiler" when the tool wrote it
     payload["rtf"] = None             # unknown until the profiler runs
     try:
-        with open(_hw_profile_path(), "w") as f:
-            json.dump(payload, f, indent=2)
+        _write_json_atomic(_hw_profile_path(), payload, indent=2)
         print("[HW] Wrote a hardware profile from auto-detection.")
         print("[HW] Run hardware_profile.py to add measured speed "
               "(enables prefetch tuning).")
@@ -1037,7 +1209,7 @@ def _load_hardware_profile():
     facts = _detect_machine_now()
     hp = {}
     try:
-        with open(_hw_profile_path()) as f:
+        with open(_hw_profile_path(), encoding="utf-8") as f:
             hp = json.load(f)
     except Exception:
         hp = {}
@@ -1242,7 +1414,7 @@ def _maybe_selfbenchmark():
     facts = _detect_machine_now()
     hp = {}
     try:
-        with open(_hw_profile_path()) as f:
+        with open(_hw_profile_path(), encoding="utf-8") as f:
             hp = json.load(f)
     except Exception:
         hp = {}
@@ -1284,6 +1456,11 @@ def _run_startup():
         print(f"[STARTUP] env probe failed: {_e}")
     print(f"[STARTUP] Loading XTTS-v2 on {DEV.label}…")
     _stage("model-loading")
+    # The saved voice has to be in place before the latents are loaded. This
+    # used to run near the end of startup, after load_model had already built
+    # the default voice's latents, so every restart spoke in the default voice
+    # while reporting, and filing all its learning under, the saved one.
+    _restore_active_voice()
     load_model()
     _stage("model-loaded")
 
@@ -1316,7 +1493,6 @@ def _run_startup():
     # a value of 0 keeps the model resident indefinitely, which is "always on").
     global _model_state, _last_synth_ts
     _load_idle_timeout()
-    _restore_active_voice()
 
     # The power button depends on a registration that holds absolute paths, and
     # absolute paths do not follow a folder that gets moved or renamed. The
@@ -1348,6 +1524,12 @@ def _run_startup():
         _learner.prune_old_data()
     except Exception as e:
         print(f"[LEARNER] retention skipped: {e}")
+    # Photos from a scan session the last process never closed. No session can
+    # be open yet, so any that are old enough are leftovers.
+    try:
+        _scan.cleanup_stale_dirs()
+    except Exception as e:
+        print(f"[SCAN] leftover photo cleanup skipped: {e}")
     # I measure this machine before adapting to it, so the very first boot on a
     # new device adapts to a real number instead of waiting for the user to
     # discover a separate profiler script. Skipped when a profile measured on
@@ -1481,11 +1663,14 @@ def _load_punct() -> dict:
         return _punct_cache
     if m != _punct_mtime:
         try:
-            with open(PUNCT_PATH, 'r', encoding='utf-8') as f:
-                _punct_cache = json.load(f)
-            _punct_mtime = m
+            # Tolerates a file an older learner.py wrote in the ANSI codepage,
+            # which this used to fail to decode on every single chunk.
+            _punct_cache = json.loads(_read_text_file(PUNCT_PATH))
         except Exception as e:
             print(f"[PUNCT] load failed: {e}")
+        # Recorded either way, so a broken file is reported once and retried
+        # when it next changes rather than on every chunk.
+        _punct_mtime = m
     return _punct_cache
 
 
@@ -1544,8 +1729,7 @@ def _load_store() -> dict:
         mtime = os.path.getmtime(STORE_PATH)
         # Using > with an epsilon since float != can miss changes on Windows NTFS
         if mtime > _store_mtime + 0.001:
-            with open(STORE_PATH, 'r', encoding='utf-8') as f:
-                raw = json.load(f)
+            raw = json.loads(_read_text_file(STORE_PATH))
             # Normalise to uppercase keys and lowercase values so lookup is
             # case-insensitive
             _store_cache = {k.upper(): v.lower().strip() for k, v in raw.items()}
@@ -1557,11 +1741,18 @@ def _load_store() -> dict:
         print(f"  {C.ERR}[PRONOUNCE]{C.RESET} load error: {e}")
     return _store_cache
 
+# learner.py writes this file too, so both sides read, change and write it
+# under one lock that learner owns. Without it a pronunciation taught here and
+# one learned from a report at the same moment lost whichever finished first.
+# getattr keeps a stubbed learner (the test suites use one) working.
+_STORE_LOCK = getattr(_learner, "STORE_LOCK", None) or _threading.RLock()
+
+
 def _save_store(store: dict):
-    """Persist the pronunciation store to disk."""
+    """Persist the pronunciation store to disk. Callers that read, change and
+    write it hold _STORE_LOCK around all three."""
     global _store_cache, _store_mtime
-    with open(STORE_PATH, 'w', encoding='utf-8') as f:
-        json.dump(store, f, indent=2, ensure_ascii=False)
+    _write_json_atomic(STORE_PATH, store, indent=2, ensure_ascii=False)
     _store_mtime = os.path.getmtime(STORE_PATH)
     _store_cache = store
     print(f"[PRONOUNCE] Store saved: {STORE_PATH}")
@@ -3941,6 +4132,15 @@ def speak():
         print(f"  {C.SKIP}[SKIP] too short ({len(text)}c): {repr(text)}{C.RESET}")
         return _silence_response()
 
+    # A chunk the user skipped from the feed. The skip verdict files its rule
+    # under the chunk id, which is the content hash log_chunk takes of exactly
+    # this final text, so this is the first point where the id can be known.
+    # apply_learned_rules matches text patterns and could never see it.
+    _cid = hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:16]
+    if _learner.is_suppressed_chunk(_cid):
+        print(f"  {C.SKIP}[SUPPRESS]{C.RESET} skipped by the user: {text[:60]}")
+        return _silence_response()
+
     # Thread-safe dedup, which stops prefetch races synthesising the same chunk
     # twice.
     #
@@ -3999,7 +4199,7 @@ def _synthesise_and_log(text, raw, position, chunk_no, dedup_key):
     wav_data = ctx = None
     recoveries = (
         ("retry_after_cache_clear", "CUDA cache cleared — retrying", None),
-        ("retry_after_model_reload", "Retry failed — reloading model", load_model),
+        ("retry_after_model_reload", "Retry failed — reloading model", _reload_model),
     )
     try:
         wav_data, ctx = generate_speech(text, position)
@@ -4142,19 +4342,23 @@ def set_pronunciation():
         return jsonify({"error": "Missing 'abbr' field"}), 400
 
     token  = data["abbr"].strip().upper()
-    store  = _load_store()
 
     if data.get("delete"):
-        removed = store.pop(token, None)
-        _save_store(store)
+        # A copy, so the cache is only replaced once the write has succeeded.
+        with _STORE_LOCK:
+            store = dict(_load_store())
+            removed = store.pop(token, None)
+            _save_store(store)
         return jsonify({"status": "deleted" if removed else "not_found", "token": token})
 
     if "spoken" not in data:
         return jsonify({"error": "Missing 'spoken' field"}), 400
 
     spoken = data["spoken"].strip()
-    store[token] = spoken
-    _save_store(store)
+    with _STORE_LOCK:
+        store = dict(_load_store())
+        store[token] = spoken
+        _save_store(store)
     print(f"  {C.PRONOUNCE}[PRONOUNCE]{C.RESET} learned: {token} → {spoken}")
     return jsonify({"status": "saved", "token": token, "spoken": spoken})
 
@@ -4466,7 +4670,6 @@ def cleanup_auto_flags():
 @app.route("/report/rules/<int:rule_id>", methods=["DELETE"])
 def delete_rule_route(rule_id):
     # If this is a PRONUNCIATION rule, also remove from pronunciation_store.json
-    import json as _json
     with _learner._db_lock:
         conn = _learner._get_db()
         row  = conn.execute("SELECT rule_type, pattern FROM rules WHERE id=?", (rule_id,)).fetchone()
@@ -4474,12 +4677,18 @@ def delete_rule_route(rule_id):
     if row and row["rule_type"] == "PRONUNCIATION":
         token = row["pattern"].upper()
         try:
-            if _learner.STORE_PATH.exists():
-                store = _json.load(open(_learner.STORE_PATH))
-                if token in store:
-                    del store[token]
-                    _json.dump(store, open(_learner.STORE_PATH,"w"), indent=2)
-                    print(f"[LEARNER] Removed '{token}' from pronunciation store")
+            # The same lock and the same UTF-8 atomic write as the store's other
+            # two writers. This one used to read and write in the ANSI codepage
+            # through handles it never closed, which mangled any accented
+            # spoken form the server had saved as UTF-8.
+            with _STORE_LOCK:
+                if _learner.STORE_PATH.exists():
+                    store = json.loads(_read_text_file(_learner.STORE_PATH))
+                    if token in store:
+                        del store[token]
+                        _write_json_atomic(_learner.STORE_PATH, store, indent=2,
+                                           ensure_ascii=False)
+                        print(f"[LEARNER] Removed '{token}' from pronunciation store")
         except Exception as e:
             print(f"[LEARNER] Store remove error: {e}")
     _learner.delete_rule(rule_id)
@@ -4517,6 +4726,8 @@ def check_voice_route():
     objective, and none of them are obvious by ear even on good headphones."""
     d = request.get_json(silent=True) or {}
     vid = (d.get("voice_id") or _ACTIVE_VOICE).strip()
+    if _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
     clips = _discover_voice_samples(vid)
     if not clips:
         return jsonify({"ok": False, "voice_id": vid,
@@ -4590,6 +4801,8 @@ def record_clip():
     Multipart rather than a raw body, since the take arrives with the text that
     was read and I want both written together or not at all."""
     vid  = (request.form.get("voice") or _ACTIVE_VOICE).strip()
+    if _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
     text = (request.form.get("text") or "").strip()
     try:
         slot = int(request.form.get("slot") or 0)
@@ -4674,6 +4887,8 @@ def list_clips():
     """Every clip in a profile with its measurements, so the dashboard can show
     what has been recorded without anyone opening a file manager."""
     vid   = (request.args.get("voice") or _ACTIVE_VOICE).strip()
+    if _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
     clips = _discover_voice_samples(vid)
     out   = []
     for p in clips:
@@ -4695,6 +4910,8 @@ def get_clip():
     onto the folder, since anything built from a query parameter is a path
     traversal waiting to happen."""
     vid  = (request.args.get("voice") or _ACTIVE_VOICE).strip()
+    if _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
     name = (request.args.get("name") or "").strip()
     for p in _discover_voice_samples(vid):
         if os.path.basename(p) == name:
@@ -4707,6 +4924,8 @@ def delete_clip():
     """Throw away a take. Same name matching as playback, for the same reason."""
     d    = request.get_json(silent=True) or {}
     vid  = (d.get("voice_id") or _ACTIVE_VOICE).strip()
+    if _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
     name = (d.get("name") or "").strip()
     for p in _discover_voice_samples(vid):
         if os.path.basename(p) == name:
@@ -4729,6 +4948,8 @@ def delete_clip():
 def select_voice():
     d = request.get_json(force=True) or {}
     vid = (d.get("voice_id") or "").strip()
+    if vid and _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
     if not vid:
         return jsonify({"ok": False, "error": "voice_id required"}), 400
     res = switch_voice(vid)
@@ -4775,6 +4996,8 @@ def rename_voice():
     global _ACTIVE_VOICE
     d   = request.get_json(force=True) or {}
     old = (d.get("voice_id") or "").strip()
+    if old and _checked_voice_id(old) is None:
+        return _bad_voice_id(old)
     new = _voice_id_from(d.get("name"))
 
     if old == "default":
@@ -4829,6 +5052,8 @@ def delete_voice():
     they are about to lose. GET the counts from /voices/data first."""
     d   = request.get_json(force=True) or {}
     vid = (d.get("voice_id") or "").strip()
+    if vid and _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
 
     if vid == "default":
         return jsonify({"ok": False, "error":
@@ -4869,6 +5094,8 @@ def voice_data():
     """What a voice would lose if it were deleted, so the dashboard can say so
     before asking rather than after."""
     vid = (request.args.get("voice_id") or _ACTIVE_VOICE).strip()
+    if _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
     out = _learner.voice_data_counts(vid)
     out["clips"] = len(_discover_voice_samples(vid))
     out["voice_id"] = vid
@@ -4881,6 +5108,8 @@ def open_voice_folder():
     replace or edit the source recordings directly."""
     d = request.get_json(force=True) or {}
     vid = (d.get("voice_id") or _ACTIVE_VOICE).strip()
+    if _checked_voice_id(vid) is None:
+        return _bad_voice_id(vid)
     path = _voice_dir(vid)
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
@@ -5074,8 +5303,7 @@ def update_settings():
     if d.get("save_default"):
         _DEFAULT_SETTINGS = dict(_LIVE_SETTINGS)
         try:
-            with open(_USER_DEFAULTS_PATH, "w") as f:
-                json.dump(_LIVE_SETTINGS, f, indent=2)
+            _write_json_atomic(_USER_DEFAULTS_PATH, _LIVE_SETTINGS, indent=2)
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
         return jsonify({"ok": True, "saved_default": True, "settings": _LIVE_SETTINGS})
@@ -5220,8 +5448,13 @@ def chunk_verdict():
             applied_text = "Marked good. Baseline updates once analysis completes."
         print(f"[LEARNER] ✨ sounded_perfect {chunk_id[:8]}")
     elif verdict == "mostly_right":
-        _learner._add_rule("MONITOR", chunk_id, note[:80] if note else "minor_issue", "", source="REPORT")
-        applied_text = (('Logged minor issue: "'+note[:60]+'".') if note else "Logged minor issue. Watching for recurrence.")
+        # This used to file a MONITOR rule with the chunk id as its pattern.
+        # MONITOR counts how often a phrase comes back and escalates it to a
+        # SPLIT before that phrase, so keyed on a hash it could never match any
+        # text, and had it escalated the SPLIT would have been keyed on the hash
+        # too. The phrase that should be watched is not known here, so nothing
+        # is filed; the verdict and note are still stored on the chunk below.
+        applied_text = (('Logged minor issue: "'+note[:60]+'".') if note else "Logged minor issue.")
         print(f"[LEARNER] ⚠ mostly_right {chunk_id[:8]}")
     elif verdict == "wrong_word":
         if not token or not expected:
@@ -5354,7 +5587,7 @@ def chunk_verdict():
         return jsonify({"ok": True, "verdict": "revert", "applied_text": applied_text, "was": prior})
     elif verdict == "skip":
         _learner._add_rule("SUPPRESS", chunk_id, "user_skipped", "", source="REPORT")
-        applied_text = "Suppressed. Similar chunks will not be flagged again."
+        applied_text = "Skipped. This chunk will be silent from now on."
         print(f"[LEARNER] ⤷ skip {chunk_id[:8]}")
     else:
         return jsonify({"error": f"unknown verdict: {verdict}"}), 400
@@ -5483,7 +5716,7 @@ if __name__ == "__main__":
     # stdout can be block-buffered when launched via a pipe, so the host watches
     # for this file rather than relying solely on seeing the printed marker.
     try:
-        with open(_READY_SENTINEL, "w") as _rf:
+        with open(_READY_SENTINEL, "w", encoding="utf-8") as _rf:
             _rf.write("ready")
     except Exception:
         pass
