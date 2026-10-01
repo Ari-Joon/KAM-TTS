@@ -363,7 +363,10 @@ def _run_migrations():
                      "error_type TEXT", "error_stage TEXT", "error_detail TEXT",
                      # How many waveforms were discarded as hallucinated before
                      # one passed, and the verdict on the one finally sent.
-                     "rejected INTEGER", "output_check TEXT"):
+                     "rejected INTEGER", "output_check TEXT",
+                     # Whether the current verdict bumped a lifetime counter, so
+                     # a revert only takes back a count that was really added.
+                     "verdict_counted INTEGER"):
             try:
                 conn.execute(f"ALTER TABLE chunks ADD COLUMN {_col.split()[0]} {_col.split()[1]}")
             except Exception:
@@ -480,6 +483,90 @@ def _create_indexes():
 
 
 _create_indexes()
+
+
+# Rules the report paths used to make that can never do anything useful. They
+# are switched off rather than deleted, so the audit trail stays and any one can
+# be switched back on by hand. Pronunciation rules are never touched here.
+_RETIRE_MARKER = "migration_retire_dead_report_rules_v1"
+_RE_CHUNK_ID   = re.compile(r"^[0-9a-f]{16}$")
+# Chunk ids were the first 16 characters of a random uuid before they became
+# content hashes, so a MONITOR rule from then has this shape instead.
+_RE_OLD_CHUNK_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{2}$")
+
+
+def _retire_dead_report_rules():
+    """Deactivate four kinds of dead or harmful rule, once. Returns the counts.
+
+      PUNCT     from a report with no token: anchored on the chunk's first 30
+                characters with "." as the value, so it matched nothing or put
+                a full stop mid-sentence ("demonstration., you'll")
+      SPLIT     from a chunk-split report with no token: the chunk's first 50
+                characters with the punctuation stripped, which cannot match
+                text that had punctuation and splits nothing where it can
+      MONITOR   keyed on a chunk id, which never appears in text
+      BOUNDARY  review_split, which /rules/boundary never exports
+
+    The PUNCT and SPLIT patterns are recognised by rebuilding them from the
+    reports that made them, so a rule a user made deliberately is never caught.
+    A marker in the counters table makes this run once, so a rule switched back
+    on by hand stays on."""
+    counts = {"PUNCT": 0, "SPLIT": 0, "MONITOR": 0, "BOUNDARY": 0}
+    with _db_lock:
+        conn = _get_db()
+        try:
+            done = conn.execute("SELECT value FROM counters WHERE name=?",
+                                (_RETIRE_MARKER,)).fetchone()
+            if done and done[0]:
+                return None
+            reports = conn.execute(
+                "SELECT chunk_text, token, action FROM reports").fetchall()
+            punct_prefixes = {(t or "")[:30] for t, tok, a in reports
+                              if a == "PUNCT" and not (tok or "").strip()}
+            split_prefixes = {re.sub(r"[^a-zA-Z0-9 ]", "", (t or "")[:50]).strip()
+                              for t, tok, a in reports
+                              if a == "ADJUST_CHUNK" and not (tok or "").strip()}
+            ids = []
+            for rid, rtype, pat, action, value, source in conn.execute(
+                    "SELECT id, rule_type, pattern, action, value, source FROM rules "
+                    "WHERE active=1 AND rule_type IN ('PUNCT','SPLIT','MONITOR','BOUNDARY')"):
+                pat = pat or ""
+                dead = (
+                    (rtype == "PUNCT" and source == "REPORT" and value == "."
+                     and pat in punct_prefixes)
+                    or (rtype == "SPLIT" and source == "REPORT" and action == "split_before"
+                        and pat in split_prefixes)
+                    or (rtype == "MONITOR" and (_RE_CHUNK_ID.match(pat)
+                                                or _RE_OLD_CHUNK_ID.match(pat)))
+                    or (rtype == "BOUNDARY" and action == "review_split"))
+                if dead:
+                    ids.append(rid)
+                    counts[rtype] += 1
+            total = len(ids)
+            detail = ", ".join(f"{n} {k}" for k, n in counts.items() if n)
+            with conn:
+                conn.executemany("UPDATE rules SET active=0 WHERE id=?", [(i,) for i in ids])
+                conn.execute("INSERT OR REPLACE INTO counters (name, value) VALUES (?, 1)",
+                             (_RETIRE_MARKER,))
+                if total:
+                    # Straight into history, since log_history is defined
+                    # further down and this runs at import.
+                    conn.execute(
+                        "INSERT INTO history (ts, event_type, detail, source) VALUES (?,?,?,?)",
+                        (time.time(), "MIGRATION",
+                         f"switched off {total} rules that could never work ({detail})", "auto"))
+        finally:
+            conn.close()
+    if total:
+        print(f"[LEARNER] Migration: switched off {total} rule(s) that could never "
+              f"work ({detail}); deactivated, not deleted")
+    return counts
+
+
+try:
+    _retire_dead_report_rules()
+except Exception as _e:
+    print(f"[LEARNER] dead-rule migration skipped: {_e}")
 
 # ---
 # Background analysis queue
@@ -697,6 +784,39 @@ def _transcribe_bytes(wav_bytes):
                 pass
 
 
+def _looks_like_acronym(word):
+    """True for a short letters-only token written as an acronym: "CNF", "BoW".
+
+    At least two capitals, and capitals at both ends, which keeps out ordinary
+    capitalised words ("Hello") and plurals ("GPUs", where spelling the s out
+    would be wrong). Deliberately narrow, since what it lets through can end up
+    spelled letter by letter."""
+    return (2 <= len(word) <= 5 and word.isalpha() and word[0].isupper()
+            and word[-1].isupper() and sum(c.isupper() for c in word) >= 2)
+
+
+def _skipped_words(text, in_trans):
+    """Words of the spoken text that Whisper did not hear, in their original
+    casing.
+
+    This used to be built from lower-cased words longer than three letters, and
+    the abbreviation speller further down only acts on a word written as an
+    acronym in the source. So "CNF" was dropped for being short and "BoW" was
+    lower-cased, and the speller could never fire. Matching still uses the
+    normalised form; only what is reported keeps the source's spelling, and a
+    short token is kept only when it is written as an acronym."""
+    out = []
+    for t in (text or "").split():
+        for part in re.split(r'[-/]', t):
+            norm = _norm_word(part)
+            if not norm:
+                continue
+            raw = re.sub(r"^\W+|[^\w']+$", "", part)
+            if (len(norm) > 3 or _looks_like_acronym(raw)) and not in_trans(norm):
+                out.append(raw)
+    return out
+
+
 def _chunk_voice(chunk_id):
     """The voice a logged chunk was synthesised with, or the active one when the
     row has none (older rows, or a chunk that was never logged)."""
@@ -816,7 +936,7 @@ def _analysis_worker():
 
                     # Skipped words: in the original but truly absent from the
                     # transcript even after normalised and fuzzy matching.
-                    skipped_words = [w for w in orig_words if len(w) > 3 and not _in_trans(w)]
+                    skipped_words = _skipped_words(text, _in_trans)
                     if skipped_words:
                         metrics["quality_flags"] = metrics.get("quality_flags", "") + \
                             f"|WHISPER_SKIP:{','.join(skipped_words[:3])}"
@@ -1062,15 +1182,18 @@ def _analysis_worker():
                         # rule that
                         # actually spells the abbreviation out, which is the only
                         # action that improves future audio.
-                        if (len(word) >= 2 and len(word) <= 5
-                                and word.isalpha()
-                                and w_orig.isupper()          # genuinely an acronym in source
+                        #
+                        # The rule keeps the source's own spelling as its
+                        # pattern, and apply_learned_rules matches these
+                        # spelled-out rules case-sensitively, so learning "BoW"
+                        # can never turn the ordinary word "bow" into letters.
+                        if (_looks_like_acronym(w_orig)   # an acronym in the source
                                 and word not in _COMMON_WORDS):
                             spoken = _spell_abbreviation(word)
                             if spoken and spoken.lower() != word.lower():
-                                _add_rule("PRONUNCIATION", word, "spell_abbreviation",
+                                _add_rule("PRONUNCIATION", w_orig, "spell_abbreviation",
                                           spoken, source="AUTO")
-                                print(f"[LEARNER] ★ learned abbreviation pronunciation: {word} → {spoken}")
+                                print(f"[LEARNER] ★ learned abbreviation pronunciation: {w_orig} → {spoken}")
 
                 # Flag hallucinations for dashboard review
                 if "HALLUCINATION" in flags_str:
@@ -1477,6 +1600,18 @@ def submit_report(chunk_text, issue, token=None, expected=None, heard=None,
             result["needed"] = need
             result["reason"] = f"{confidence} confidence: logged. Will apply after {need} matching reports ({agree} so far)."
 
+    # One plain sentence for the dashboard to show, saying what actually
+    # changed, or that nothing did and why.
+    res = result.get("result") or ""
+    if result.get("pending"):
+        result["message"] = (f"Logged. Nothing changes until {result['needed']} matching "
+                             f"reports agree ({result['agreement']} so far).")
+    elif res.startswith("error:"):
+        result["message"] = "The report was saved but could not be applied: " + res[6:].strip()
+    elif not res or res == "no_action":
+        result["message"] = "Logged. Nothing was changed."
+    else:
+        result["message"] = res[:1].upper() + res[1:] + ("" if res.endswith(".") else ".")
     return result
 
 
@@ -1512,8 +1647,10 @@ def _apply_report(report_id, chunk_text, issue, token, expected, heard, action, 
         if action == "ADD_TO_STORE" and token and expected:
             # Add to pronunciation store
             _add_to_pronunciation_store(token.upper(), expected.lower().strip())
-            result_msg = f"added {token} → {expected} to pronunciation store"
-            _add_rule("PRONUNCIATION", token, "store_override", expected, source="REPORT")
+            outcome = _add_rule("PRONUNCIATION", token, "store_override", expected,
+                                source="REPORT")
+            result_msg = (f"'{token}' will now be said as '{expected}'"
+                          + (", replacing the earlier correction" if outcome == "updated" else ""))
 
         elif action == "ADD_TO_STORE" and token:
             # Token given but no target pronunciation: flag it so the report
@@ -1522,29 +1659,67 @@ def _apply_report(report_id, chunk_text, issue, token, expected, heard, action, 
             result_msg = f"flagged {token}: add a 'should sound like' value to teach the pronunciation"
 
         elif action == "BLACKLIST":
-            if token:
-                # A named word the voice invented → block it.
+            # A strip rule removes the token from every chunk ever read, so it
+            # is only right for a word the voice made up. A made-up word is by
+            # definition not in the source text, and a report that says how the
+            # word should sound is about a real word said wrongly. The one
+            # strip rule ever filed (BoW, with "B.O.W" as the expected sound)
+            # was the second kind, and it deleted a real word from every read.
+            # Anything that is not clearly an invented word takes the
+            # temperature path instead, which is what a hallucination usually
+            # needs anyway.
+            invented = bool(token) and not expected and not re.search(
+                _word_pattern(token), chunk_text or "", flags=re.IGNORECASE)
+            if invented:
                 _add_rule("BLACKLIST", token, "strip", "", source="REPORT")
                 result_msg = f"blacklisted token: {token}"
             else:
-                # Hallucination with no specific word named: lower temperature
-                # for this chunk's full PROFILE (sentence type + complexity +
-                # length + punctuation + lexis) so the fix targets the actual
-                # failure fingerprint, with graceful fallback to coarser buckets.
+                # Lower temperature for this chunk's full PROFILE (sentence type
+                # + complexity + length + punctuation + lexis) so the fix targets
+                # the actual failure fingerprint, with graceful fallback to
+                # coarser buckets.
                 prof = lookup_chunk_profile(chunk_id, chunk_text)
                 stype = prof["sentence_type"]
-                key, new_t = _adjust_profile_temperature(prof["keys"], -0.03)
+                key, new_t = _adjust_profile_temperature(prof["keys"], -0.03, report=True)
                 # Keep the legacy per-type value moving too for back-compat.
                 _adjust_pref_temperature(stype, -0.03)
                 result_msg = f"lowered temperature to {new_t} for profile [{prof['band']}/{prof['length']}/{prof['punct']}/{prof['lexis']}] to reduce hallucination"
+                if token:
+                    why = ("a pronunciation was given, so it is a real word"
+                           if expected else "it is in the chunk's own text")
+                    result_msg += (f". '{token}' was not blacklisted because {why}; "
+                                   f"stripping it would remove it from everything you read")
                 log_history("TEMP", f"{stype} profile temp -0.03 → {new_t} ({prof['band']},{prof['length']},{prof['punct']},{prof['lexis']}; hallucination)", "user")
 
         elif action == "ADJUST_CHUNK" and chunk_text:
-            # Add a splitting/merging rule for this text pattern
-            # Extract the key phrase (first 50 chars, alphanumeric)
-            pattern = re.sub(r'[^a-zA-Z0-9 ]', '', chunk_text[:50]).strip()
-            _add_rule("SPLIT", pattern, "split_before", "", source="REPORT")
-            result_msg = f"chunk rule added for pattern: {pattern[:30]}"
+            # A SPLIT rule puts a sentence break before its pattern wherever the
+            # pattern appears. It used to be the first 50 characters of the
+            # chunk with the punctuation stripped, which could not match the
+            # chunk's own text whenever that had punctuation in it (33 of 49),
+            # and where it did match it broke before the first word, which
+            # splits nothing. The report's token is now the word or phrase that
+            # was dropped, and a break just before it gives the model a fresh
+            # start at the point where it lost its place.
+            #
+            # A SPLIT rule applies to every chunk ever read, so it is only made
+            # when that is safe: the phrase must be in this chunk (else it is
+            # not what was dropped from it), not at its very start (a break
+            # there splits nothing), and not a lone short word like "the",
+            # which would break every sentence that contains it. Anything else
+            # is flagged for review, and the reply says which.
+            m = re.search(_word_pattern(token), chunk_text, flags=re.IGNORECASE) if token else None
+            short_word = bool(token) and " " not in token.strip() and len(token.strip()) < 4
+            if m and m.start() > 0 and not short_word:
+                _add_rule("SPLIT", token, "split_before", "", source="REPORT")
+                result_msg = f"Chunks will now break just before '{token[:30]}'"
+            else:
+                anchor = token or chunk_text[:30]
+                why = ("no dropped word was given" if not token
+                       else "it is not in this chunk's text" if not m
+                       else "it is at the very start of the chunk" if m.start() == 0
+                       else "a break before so short a word would split too much")
+                _add_rule("FLAG", anchor, "needs_split_point", "", source="REPORT")
+                result_msg = f"Flagged for review, no split rule made: {why}"
 
         elif action == "FLAG_PATTERN" and (token or chunk_text):
             pattern = token or chunk_text[:30]
@@ -1559,12 +1734,26 @@ def _apply_report(report_id, chunk_text, issue, token, expected, heard, action, 
             # from re-classifying the display text the report carries.
             band = lookup_chunk_profile(chunk_id, chunk_text)["band"]
             step = -0.04 if action == "ADJUST_RATE_DOWN" else 0.04
+            before_mod = get_rate_modifier(band)
             new_mod, damped = _adjust_band_rate(band, step)
             direction = "slower" if step < 0 else "faster"
-            result_msg = f"{BAND_LABEL[band]} chunks will now play slightly {direction} (modifier {new_mod})"
-            if damped:
-                result_msg += ". Step halved because the previous report went the other way"
-            log_history("RATE", f"{BAND_LABEL[band]} band {direction}: modifier {new_mod} (too {'fast' if step<0 else 'slow'})", "user")
+            if new_mod == before_mod:
+                # Already at the 0.85-1.15 clamp in this direction. This used to
+                # say the chunks "will now play faster" when nothing changed,
+                # which is why the same TOO_SLOW report kept coming back. The
+                # base speed is the user's own slider, so I say so rather than
+                # move it for them.
+                result_msg = (f"{BAND_LABEL[band]} chunks are already at the "
+                              f"{'fastest' if step > 0 else 'slowest'} pace learning can "
+                              f"set (modifier {new_mod}), so nothing changed. Use the "
+                              f"speed slider to go {direction} than this")
+                log_history("RATE", f"{BAND_LABEL[band]} band already at limit {new_mod} "
+                                    f"(too {'fast' if step<0 else 'slow'})", "user")
+            else:
+                result_msg = f"{BAND_LABEL[band]} chunks will now play slightly {direction} (modifier {new_mod})"
+                if damped:
+                    result_msg += ". Step halved because the previous report went the other way"
+                log_history("RATE", f"{BAND_LABEL[band]} band {direction}: modifier {new_mod} (too {'fast' if step<0 else 'slow'})", "user")
 
         elif action in ("ADJUST_TEMP_DOWN", "ADJUST_TEMP_UP"):
             # Robotic (up = more variation) / unstable (down = steadier).
@@ -1574,7 +1763,7 @@ def _apply_report(report_id, chunk_text, issue, token, expected, heard, action, 
             step = 0.03 if action == "ADJUST_TEMP_UP" else -0.03
             prof = lookup_chunk_profile(chunk_id, chunk_text)
             stype = prof["sentence_type"]
-            key, new_t = _adjust_profile_temperature(prof["keys"], step)
+            key, new_t = _adjust_profile_temperature(prof["keys"], step, report=True)
             _adjust_pref_temperature(stype, step)   # keep legacy value in sync
             result_msg = f"temperature now {new_t} for profile [{prof['band']}/{prof['length']}/{prof['punct']}/{prof['lexis']}]"
             log_history("TEMP", f"{stype} profile temp {('+' if step>0 else '')}{step} → {new_t} ({prof['band']},{prof['length']},{prof['punct']},{prof['lexis']})", "user")
@@ -1594,16 +1783,29 @@ def _apply_report(report_id, chunk_text, issue, token, expected, heard, action, 
                               f"read aloud to teach it")
             try:
                 prof = lookup_chunk_profile(chunk_id, chunk_text)
-                _key, new_t = _adjust_profile_temperature(prof["keys"], -0.02)
+                _key, new_t = _adjust_profile_temperature(prof["keys"], -0.02, report=True)
                 log_history("TEMP", f"equation report: {prof['sentence_type']} "
                                     f"profile temp -0.02 → {new_t}", "user")
             except Exception:
                 pass
 
         elif action == "PUNCT" and (token or chunk_text):
-            anchor = token or chunk_text[:30]
-            _add_rule("PUNCT", anchor, "repunctuate", expected or ".", source="REPORT")
-            result_msg = f"punctuation rule added at: {anchor[:30]}"
+            # With no token this used to anchor a rule on the first 30
+            # characters of the chunk and insert "." after them, which either
+            # matched nothing (46 of 71) or put a full stop mid-sentence, as in
+            # "demonstration., you'll". The report now carries the text where
+            # the punctuation went wrong as the token and how it should read as
+            # expected, and the rule swaps the one for the other wherever it
+            # appears. Without both there is nothing safe to learn, so the
+            # chunk is flagged for review instead.
+            if token and expected and token != expected:
+                _add_rule("PUNCT", token, "replace_text", expected, source="REPORT")
+                result_msg = f"'{token[:30]}' will now be read as '{expected[:30]}'"
+            else:
+                anchor = token or chunk_text[:30]
+                _add_rule("FLAG", anchor, "needs_punctuation", "", source="REPORT")
+                result_msg = (f"Flagged for review, no rule made: a punctuation fix "
+                              f"needs the text that was wrong and how it should read")
 
         elif action == "SUPPRESS" and chunk_text:
             pattern = re.sub(r'[^a-zA-Z0-9 ]', '', chunk_text[:50]).strip()
@@ -1620,9 +1822,12 @@ def _apply_report(report_id, chunk_text, issue, token, expected, heard, action, 
                 _add_rule("BOUNDARY", fragment, "keep_with_previous", "", source="REPORT")
                 result_msg = f"boundary rule added: '{fragment[:40]}' will stay with the previous chunk"
             else:
-                # No fragment named: flag the chunk so the split point is tracked.
+                # No fragment named: flag the chunk so the split point is
+                # tracked. This was a BOUNDARY rule with action review_split,
+                # which /rules/boundary never exports and nothing else reads, so
+                # it is a plain FLAG now, which at least counts its recurrences.
                 anchor = chunk_text[:40]
-                _add_rule("BOUNDARY", anchor, "review_split", "", source="REPORT")
+                _add_rule("FLAG", anchor, "review_split", "", source="REPORT")
                 result_msg = f"split flagged for review: {anchor[:30]}"
             log_history("SPLIT", f"Boundary correction: {result_msg}", "user")
 
@@ -1826,28 +2031,43 @@ def get_history_summary():
 
 
 def _add_rule(rule_type, pattern, action, value, source="AUTO"):
+    """Add a rule, or update the value of the active one with this type and
+    pattern. Returns "new", "updated" or "same".
+
+    It used to keep the existing rule untouched, so a second pronunciation
+    report correcting the first ("Gem.E.ni" then "Gem,ini") was stored as a
+    report and never took effect. A different value now replaces the old one.
+    An automatic rule never overwrites one the user made, though, since the
+    abbreviation speller would otherwise undo a user's own correction."""
     with _db_lock:
         conn = _get_db()
-        # Don't duplicate existing rules
         existing = conn.execute(
-            "SELECT id FROM rules WHERE rule_type=? AND pattern=? AND active=1",
+            "SELECT id, value, source FROM rules WHERE rule_type=? AND pattern=? AND active=1",
             (rule_type, pattern)
         ).fetchone()
-        is_new = not existing
-        if is_new:
+        outcome = "same"
+        if not existing:
             conn.execute("""
                 INSERT INTO rules (ts, rule_type, pattern, action, value, source)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (time.time(), rule_type, pattern, action, value, source))
             conn.commit()
+            outcome = "new"
+        elif ((existing["value"] or "") != (value or "")
+              and not (source == "AUTO" and existing["source"] != "AUTO")):
+            conn.execute("UPDATE rules SET value=?, action=?, source=?, ts=? WHERE id=?",
+                         (value, action, source, time.time(), existing["id"]))
+            conn.commit()
+            outcome = "updated"
         conn.close()
-    if is_new:
+    if outcome != "same":
         invalidate_rule_cache()
-    # Record genuinely new rules in the permanent history.
-    if is_new:
+        # Record new and changed rules in the permanent history.
         src = "user" if source == "REPORT" else "auto"
-        detail = f'{rule_type} "{pattern}"' + (f' → {value}' if value else "")
+        detail = (f'{rule_type} "{pattern}"' + (f' → {value}' if value else "")
+                  + (" (updated)" if outcome == "updated" else ""))
         log_history(rule_type, detail, src)
+    return outcome
 
 
 def unconfirm_chunk_quality(chunk_id):
@@ -1868,6 +2088,24 @@ def unconfirm_chunk_quality(chunk_id):
                 _write_json_atomic(_baseline_path(v), updated, indent=2)
             except Exception as e:
                 print(f"[LEARNER] baseline save error (unconfirm): {e}")
+    # The thumbs-up also counted as evidence on the chunk's specific profile
+    # key, so that count comes back off. The temperature pull is an EMA and
+    # cannot be unblended, the same as the baseline above.
+    try:
+        prof = lookup_chunk_profile(chunk_id, None)
+        if prof.get("from_stored"):
+            with _good_settings_lock:
+                store = dict(_load_good_settings())
+                pk = _vk(f"prof:{prof['keys'][0]}")
+                entry = dict(store.get(pk) or {})
+                if entry.get("count", 0) > 0:
+                    entry["count"] -= 1
+                    store[pk] = entry
+                    global _good_settings_cache
+                    _good_settings_cache = store
+                    _write_json_atomic(_good_settings_path(), store, indent=2)
+    except Exception as e:
+        print(f"[LEARNER] profile count revert skipped: {e}")
     print(f"[LEARNER] ↩ baseline sample decremented for reverted chunk {chunk_id[:8]}")
     return {"unconfirmed": True}
 
@@ -1894,6 +2132,13 @@ def _settings_that_produced(row_mapping):
         "speed":              row_mapping.get("used_speed"),
     }
     return params if params["temperature"] is not None else None
+
+
+# How far approval pulls a profile key toward the temperature that earned it.
+# A thumbs-up uses the same 0.3 as record_good_settings; passive "solid" uses
+# the same 0.08 as the per-type pull in mark_session_solid.
+_THUMBS_UP_ALPHA = 0.3
+_SOLID_ALPHA     = 0.08
 
 
 def confirm_chunk_quality(chunk_id):
@@ -1924,6 +2169,17 @@ def confirm_chunk_quality(chunk_id):
         good = dict(_live_settings_ref)
         print(f"[LEARNER] chunk {chunk_id[:8]} has no stored parameters "
               f"(pre-dates per-chunk recording) — reinforcing live settings")
+
+    # The temperature the chunk was made with, pulled onto the profile keys
+    # synthesis actually resolves. This does not depend on the acoustic
+    # metrics, so it happens whether or not analysis has caught up.
+    try:
+        prof = lookup_chunk_profile(chunk_id, None)
+        if prof.get("from_stored"):
+            _reinforce_profile_temperatures(
+                [(prof["keys"], r["used_temperature"])], _THUMBS_UP_ALPHA, create=True)
+    except Exception as e:
+        print(f"[LEARNER] profile reinforce skipped: {e}")
 
     if pitch_var is None or energy_tail is None:
         # Prosody analysis hasn't finished yet, so we cannot reinforce the
@@ -2584,9 +2840,21 @@ def diagnose_chunk(chunk_id=None, chunk_text=None):
             prof = r.get("profile")
             sources = {}
             if prof:
-                entry = _load_good_settings().get(_vk(f"prof:{prof}")) or {}
-                for param, store_key in (("temperature", "temperature"),
-                                         ("top_p", "top_p"),
+                store_now = _load_good_settings()
+                entry = store_now.get(_vk(f"prof:{prof}")) or {}
+                # Temperature resolves through the sentence-type hierarchy, not
+                # this key, so its source is read from there.
+                if prof.count("|") == 3:
+                    keys = _profile_keys_from_parts(
+                        (r.get("sentence_type") or "sentence").lower(),
+                        *prof.split("|"), bool(r.get("has_math")))
+                    hit = next((k for k in keys
+                                if (store_now.get(_vk(f"prof:{k}")) or {}).get("count", 0) >= 2
+                                and (store_now.get(_vk(f"prof:{k}")) or {}).get("temperature") is not None),
+                               None)
+                    sources["temperature"] = (f"learned for {hit}" if hit
+                                              else "per-type or live settings")
+                for param, store_key in (("top_p", "top_p"),
                                          ("top_k", "top_k"),
                                          ("repetition_penalty", "repetition_penalty"),
                                          ("speed", "speed_mod")):
@@ -2881,8 +3149,20 @@ def autotune_report():
 # Params the autotuner may adjust, each with (min, max, step, integer?). A param
 # is only ever nudged when its own observation split shows a clear quality margin
 # for a profile, so params that don't affect quality are left untouched.
+#
+# Temperature is not one of them any more. The tuner writes to prof:<band|length|
+# punct|lexis>, and synthesis resolves temperature through the sentence-type
+# hierarchy (prof:<type|band|...>), which never includes that key, so every
+# temperature it ever tuned was written where nothing reads it. Reading it at
+# synthesis instead would give temperature two learners pulling on one value,
+# the profile hierarchy fed by reports and the tuner fed by the same chunks, so
+# I took it out: temperature is learned by the hierarchy alone.
+#
+# speed is tuned as a trim. The evidence is the absolute speed each chunk was
+# made at, since that is what param_observations records and what the listener
+# heard, but what is stored and nudged is speed_mod, which synthesis multiplies
+# onto live speed x band rate. The bounds and step below apply to that trim.
 _AUTOTUNE_PARAMS = {
-    "temperature": (0.05, 0.95, 0.01, False),
     "top_p":       (0.50, 0.99, 0.01, False),
     "rep_penalty": (1.0, 10.0, 0.05, False),
     "top_k":       (5,   100,  1,    True),
@@ -2890,9 +3170,22 @@ _AUTOTUNE_PARAMS = {
 }
 # Map param name → the profile-entry key it's stored under (what synthesis reads).
 _AUTOTUNE_STORE_KEY = {
-    "temperature": "temperature", "top_p": "top_p", "rep_penalty": "repetition_penalty",
+    "top_p": "top_p", "rep_penalty": "repetition_penalty",
     "top_k": "top_k", "speed": "speed_mod",
 }
+# A param with no stored value yet starts here rather than at the median of its
+# observations. For speed that median is an absolute speed (around 1.38 on my
+# data), and storing it as a trim made a profile's first tuning step jump it to
+# live x band x 1.38, which is where the 1.5 to 1.6 speeds came from.
+_AUTOTUNE_SEED = {"speed": 1.0}
+# A checkpoint is the tripwire on one change. Once this many observations have
+# come in since it and quality has held, the change has proved itself and the
+# checkpoint closes, so that (profile, param) can be tuned again. Checkpoints
+# used to close only on a rollback, so anything that worked was tuned once ever.
+_AUTOTUNE_CKPT_CLOSE_N = 12
+# _profile_quality_stats stays general, so a param the tuner no longer moves
+# still gets a proper spread guard when it is judged; its range lives here.
+_ESTIMATOR_RANGES = {"temperature": (0.05, 0.95)}
 
 def _welch_t(low, high):
     """Welch's t for two samples that may have different variances.
@@ -2941,7 +3234,7 @@ def _profile_quality_stats(profile, param, conn):
     span = hi_val - lo_val
     # Require the param to span a meaningful range relative to its own scale;
     # a param that never moved can't be credited with a quality difference.
-    rng = _AUTOTUNE_PARAMS.get(param)
+    rng = _AUTOTUNE_PARAMS.get(param) or _ESTIMATOR_RANGES.get(param)
     if rng:
         full = rng[1] - rng[0]
         if full > 0 and (span / full) < 0.05:   # varied <5% of its range → skip
@@ -2993,10 +3286,14 @@ def run_autotune_cycle():
                 "WHERE voice=? AND profile=? ORDER BY id DESC LIMIT 6)",
                 (_ACTIVE_VOICE, prof)).fetchone()[0]
 
-        # Tripwire, reverting any profile/param checkpoint whose quality dropped.
+        # Tripwire, reverting any profile/param checkpoint whose quality dropped,
+        # and closing any whose change has held for long enough.
         for ckey, ck in list(ckpts.items()):
             prof = ck.get("profile"); param = ck.get("param")
-            if not prof or not param:
+            if not prof or param not in _AUTOTUNE_STORE_KEY:
+                # Includes the temperature checkpoints from before temperature
+                # left the tuner; their values were never read, so there is
+                # nothing to roll back.
                 ckpts.pop(ckey, None); continue
             recent = _recent_q(prof)
             if recent is not None and ck.get("q_before") is not None \
@@ -3006,6 +3303,16 @@ def run_autotune_cycle():
                 pentry[skey] = ck.get("before")
                 store[_vk(f"prof:{prof}")] = pentry
                 actions.append(f"↩ rolled back {prof}/{param} (q {recent:.2f} < {ck['q_before']:.2f})")
+                ckpts.pop(ckey, None)
+                continue
+            since = conn.execute(
+                "SELECT COUNT(*), AVG(quality) FROM param_observations "
+                "WHERE voice=? AND profile=? AND ts > ?",
+                (_ACTIVE_VOICE, prof, ck.get("ts") or 0)).fetchone()
+            if (since and since[0] >= _AUTOTUNE_CKPT_CLOSE_N and since[1] is not None
+                    and (ck.get("q_before") is None or since[1] >= ck["q_before"] - 0.02)):
+                actions.append(f"✓ kept {prof}/{param} (quality held at {since[1]:.2f} "
+                               f"over {since[0]} chunks)")
                 ckpts.pop(ckey, None)
 
         # Forward pass, going per profile and per param, nudging only on clear
@@ -3022,6 +3329,8 @@ def run_autotune_cycle():
                 skey = _AUTOTUNE_STORE_KEY[param]
                 entry = dict(store.get(_vk(f"prof:{prof}")) or {})
                 cur = entry.get(skey)
+                if cur is None and param in _AUTOTUNE_SEED:
+                    cur = _AUTOTUNE_SEED[param]
                 if cur is None:
                     # No stored preference yet, so seed it from the median of
                     # what's actually been used for this param and profile.
@@ -3068,14 +3377,28 @@ def run_autotune_cycle():
     return actions
 
 
-def _adjust_profile_temperature(profile_keys, step, base_default=0.33, voice=None):
+def _adjust_profile_temperature(profile_keys, step, base_default=None, voice=None,
+                                report=False):
     """Nudge the preferred temperature for the MOST SPECIFIC profile key, and
     also (with a damped step) the coarser keys so broad learning still forms.
     Stores under 'prof:<key>' with an evidence count. Returns (key, new_t).
-    voice defaults to the active one; see _vk."""
+    voice defaults to the active one; see _vk.
+
+    A key with no temperature yet starts from the temperature synthesis would
+    use for this chunk right now. It used to start from a fixed 0.33, so with
+    the live slider at 0.45 a "more expressive" report wrote 0.36 and made the
+    chunk flatter. base_default overrides that starting point.
+
+    report=True is for a step the user asked for. Synthesis only trusts a key
+    once its count reaches 2, so a single report on a new fingerprint used to
+    change nothing audible; a report now lifts the specific key's count to at
+    least 2 so the next read of that kind of chunk sounds different."""
     if not profile_keys:
         return (None, None)
     with _good_settings_lock:
+        if base_default is None:
+            live = (_live_settings_ref or {}).get("temperature", 0.33)
+            base_default = resolve_profile_temperature(profile_keys, live, voice=voice)
         store = dict(_load_good_settings())
         specific = profile_keys[0]
         results = {}
@@ -3091,6 +3414,8 @@ def _adjust_profile_temperature(profile_keys, step, base_default=0.33, voice=Non
             new_t = round(max(0.05, min(0.95, base + s)), 3)
             entry["temperature"] = new_t
             entry["count"] = entry.get("count", 0) + 1
+            if report and i == 0:
+                entry["count"] = max(entry["count"], 2)
             entry["updated"] = datetime.now().isoformat()
             store[pk] = entry
             results[key] = new_t
@@ -3104,7 +3429,61 @@ def _adjust_profile_temperature(profile_keys, step, base_default=0.33, voice=Non
     return (specific, results.get(specific))
 
 
-def resolve_profile_temperature(profile_keys, current_temp, min_count=2):
+def _reinforce_profile_temperatures(samples, alpha, create, voice=None):
+    """Pull the profile keys of approved chunks toward the temperature those
+    chunks were actually made with.
+
+    Thumbs-up and end-of-session "solid" used to reinforce only the legacy
+    per-type key ("sentence", "heading"), which synthesis only reaches when no
+    prof: key in the chunk's hierarchy has a count of 2, and for six of the
+    eight types in use one always does. So approval reinforced a value nothing
+    read. This works on the same prof: keys synthesis resolves.
+
+    samples is a list of (profile_keys, used_temperature). The most specific key
+    moves by alpha and each coarser one by half the previous, the same damping
+    _adjust_profile_temperature uses, and it is an EMA, so a value already at
+    the used temperature does not move. create=True (an explicit thumbs-up)
+    starts the specific key if it is missing and counts as evidence on it; passive
+    "solid" only nudges keys that already exist and adds no count. Returns the
+    number of keys changed."""
+    samples = [(k, t) for k, t in samples if k and t is not None]
+    if not samples:
+        return 0
+    changed = 0
+    with _good_settings_lock:
+        store = dict(_load_good_settings())
+        for keys, used_t in samples:
+            a = alpha
+            for i, key in enumerate(keys):
+                pk = _vk(f"prof:{key}", voice)
+                entry = dict(store.get(pk) or {})
+                old = entry.get("temperature")
+                if old is None:
+                    # Only the specific key is ever started; a coarser one with
+                    # no value of its own is left for the evidence to build.
+                    if not create or i > 0:
+                        a *= 0.5
+                        continue
+                    new_t = round(float(used_t), 3)
+                else:
+                    new_t = round(old * (1 - a) + float(used_t) * a, 3)
+                entry["temperature"] = new_t
+                if create and i == 0:
+                    entry["count"] = entry.get("count", 0) + 1
+                entry["updated"] = datetime.now().isoformat()
+                store[pk] = entry
+                changed += 1
+                a *= 0.5
+        global _good_settings_cache
+        _good_settings_cache = store
+        try:
+            _write_json_atomic(_good_settings_path(), store, indent=2)
+        except Exception as e:
+            print(f"[LEARNER] profile reinforce save error: {e}")
+    return changed
+
+
+def resolve_profile_temperature(profile_keys, current_temp, min_count=2, voice=None):
     """Return the learned temperature for a chunk profile.
 
     I walk the key hierarchy from most specific down to coarsest and take the
@@ -3116,12 +3495,12 @@ def resolve_profile_temperature(profile_keys, current_temp, min_count=2):
         return current_temp
     store = _load_good_settings()
     for key in profile_keys:
-        entry = store.get(_vk(f"prof:{key}"))
+        entry = store.get(_vk(f"prof:{key}", voice))
         if entry and entry.get("temperature") is not None and entry.get("count", 0) >= min_count:
             return entry["temperature"]
     # Legacy fallback: the plain sentence_type entry (pre-profile learning).
     stype = profile_keys[-1].split("|")[0]
-    legacy = store.get(_vk(stype))
+    legacy = store.get(_vk(stype, voice))
     if legacy and legacy.get("temperature") is not None:
         return legacy["temperature"]
     return current_temp
@@ -3405,6 +3784,10 @@ def _adjust_band_rate(band, step):
             step *= 0.5
             damped = True
         new_mod = round(max(0.85, min(1.15, base + step)), 3)
+        if new_mod == round(base, 3):
+            # Pinned at the clamp: nothing moved, so nothing is recorded, or a
+            # step that never happened would halve the next real one.
+            return new_mod, False
         entry["rate_mod"]      = new_mod
         entry["last_step_dir"] = 1 if step > 0 else -1
         entry["last_step_ts"]  = now
@@ -3801,8 +4184,11 @@ def mark_session_solid(since_ts=None, played=None):
     # rather than toward whatever the live slider currently reads.
     stype_temps = {}
 
+    solid = []   # (chunk id, used temperature), for the profile keys below
+
     def _digest(cid, stype, used_temp):
         nonlocal marked
+        solid.append((cid, used_temp))
         key = (stype or "sentence").lower()
         stype_counts[key] = stype_counts.get(key, 0) + 1
         if used_temp is not None:
@@ -3837,6 +4223,20 @@ def mark_session_solid(since_ts=None, played=None):
                 _digest(cid, stype, used_temp)
         conn.commit()
         conn.close()
+
+    # The same gentle pull on the profile keys synthesis actually resolves,
+    # which the per-type pull below never reaches for most types. Passive, so
+    # it only nudges keys that already exist and adds no evidence count.
+    if solid:
+        try:
+            samples = []
+            for cid, used_temp in solid:
+                prof = lookup_chunk_profile(cid, None)
+                if prof.get("from_stored"):
+                    samples.append((prof["keys"], used_temp))
+            _reinforce_profile_temperatures(samples, _SOLID_ALPHA, create=False)
+        except Exception as e:
+            print(f"[LEARNER] solid profile reinforce skipped: {e}")
 
     # Gentle reinforcement: pull each affected type's stored temperature a
     # little toward the temperature those chunks were ACTUALLY produced with.
@@ -4008,6 +4408,13 @@ SUPPRESS_SENTINEL = "\x00SUPPRESS\x00"
 _MONITOR_ESCALATE_HITS = 3
 
 
+def _word_pattern(token):
+    """A regex matching token as a whole word. A \\b at each end only works
+    when the token starts and ends with a word character, so "e.g." or "C++"
+    could never match; "no word character on either side" works for any token."""
+    return r"(?<!\w)" + re.escape(token) + r"(?!\w)"
+
+
 def apply_learned_rules(text):
     """
     Apply all the learned rules to the text before synthesis.
@@ -4043,7 +4450,9 @@ def apply_learned_rules(text):
             continue
 
         if rtype == "BLACKLIST":
-            regex = re.escape(pat)
+            # Bounded on both sides, so a strip rule removes the word and never
+            # the same letters inside another word. It used to match anywhere.
+            regex = _word_pattern(pat)
             new_text, n = re.subn(regex, "", text, flags=re.IGNORECASE)
             if n > 0:
                 text = new_text
@@ -4054,8 +4463,13 @@ def apply_learned_rules(text):
             # Skip no-op rules (pattern == value, case-insensitive)
             if not spoken or spoken.lower() == pat.lower():
                 continue
-            regex = r"\b" + re.escape(pat) + r"\b"
-            new_text, n = re.subn(regex, spoken, text, flags=re.IGNORECASE)
+            # A function replacement, so a backslash in what the user typed is
+            # spoken as typed rather than read as a regex group reference.
+            # A spelled-out acronym the analysis learned matches only as written,
+            # since "BoW" in any case would also catch the word "bow".
+            flags = 0 if rule.get("action") == "spell_abbreviation" else re.IGNORECASE
+            regex = _word_pattern(pat)
+            new_text, n = re.subn(regex, lambda _m, s=spoken: s, text, flags=flags)
             if n > 0:
                 text = new_text
                 fired_ids.append(rule["id"])
@@ -4065,6 +4479,15 @@ def apply_learned_rules(text):
             # that should follow the anchor (stored by learn_punctuation_correction).
             repl = (rule.get("value") or "").strip()
             if not repl:
+                continue
+            if rule.get("action") == "replace_text":
+                # From a punctuation report: the exact text that was wrong and
+                # how it should read. Case-sensitive, since it is a literal fix
+                # to text the user copied from the page.
+                new_text, n = re.subn(_word_pattern(pat), lambda _m, r=repl: r, text)
+                if n > 0 and new_text != text:
+                    text = new_text
+                    fired_ids.append(rule["id"])
                 continue
             regex = r"\b" + re.escape(pat) + r"\b"
             # Insert the corrected fragment right after the first anchor match.
@@ -4079,8 +4502,12 @@ def apply_learned_rules(text):
                     fired_ids.append(rule["id"])
 
         elif rtype == "SPLIT":
-            regex = r"(?<!\. )\b" + re.escape(pat) + r"\b"
-            new_text, n = re.subn(regex, ". " + pat, text, flags=re.IGNORECASE, count=1)
+            # The matched text is kept as it was written, rather than replaced by
+            # the pattern's own casing, and the same whole-word match as above
+            # lets a phrase that ends in punctuation match at all.
+            regex = r"(?<!\. )" + _word_pattern(pat)
+            new_text, n = re.subn(regex, lambda m: ". " + m.group(0), text,
+                                  flags=re.IGNORECASE, count=1)
             if n > 0:
                 text = new_text
                 fired_ids.append(rule["id"])

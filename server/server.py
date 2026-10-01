@@ -4385,8 +4385,10 @@ def submit_report_route():
         confidence = d.get("confidence", "MEDIUM"),
         notes      = d.get("notes"),
     )
-    # Validation failure → HTTP 400 with user-facing message
+    # Validation failure → HTTP 400 with user-facing message. The dashboard
+    # shows "message", so a refusal carries one as well as a success does.
     if isinstance(result, dict) and result.get("ok") is False:
+        result.setdefault("message", result.get("error"))
         return jsonify(result), 400
     return jsonify(result)
 
@@ -5412,12 +5414,16 @@ def _store_verdict(chunk_id, verdict, note, applied_text):
         prior_row = conn.execute("SELECT user_feedback FROM chunks WHERE id=?", (chunk_id,)).fetchone()
         prior = prior_row[0] if prior_row else None
         legacy = "positive" if verdict == "sounded_perfect" else "negative"
-        conn.execute("UPDATE chunks SET user_feedback=?, user_verdict=?, user_note=?, applied_action=? WHERE id=?",
-                     (legacy, verdict, note or "", applied_text, chunk_id))
+        counted = legacy != prior
+        # verdict_counted records whether this verdict added to a lifetime
+        # total, so a revert takes back only a count that was really added.
+        conn.execute("UPDATE chunks SET user_feedback=?, user_verdict=?, user_note=?, "
+                     "applied_action=?, verdict_counted=? WHERE id=?",
+                     (legacy, verdict, note or "", applied_text, 1 if counted else 0, chunk_id))
         conn.commit(); conn.close()
     # Durable lifetime totals (survive clears), only when the verdict newly
     # changes to this class, which keeps Reports and Stats consistent.
-    if legacy != prior:
+    if counted:
         _learner.bump_counter("perfect_total" if legacy == "positive" else "negative_total", 1)
 
 
@@ -5434,8 +5440,19 @@ def chunk_verdict():
     corrected  = (d.get("corrected") or "").strip()
     if not chunk_id or not verdict:
         return jsonify({"error": "chunk_id and verdict required"}), 400
+    # A thumbs-down that is recorded but takes no temperature step. Marking
+    # many chunks at once used to step the same profile once per chunk, so a
+    # mass thumbs-down on one kind of sentence drove its temperature down by
+    # dozens of steps; the dashboard now steps once per profile and records
+    # the rest this way.
+    # Either form is accepted: the flag, or the verdict name itself.
+    if verdict == "sounded_wrong" and d.get("record_only"):
+        verdict = "sounded_wrong_recorded"
     applied_text = ""
-    if verdict == "sounded_perfect":
+    if verdict == "sounded_wrong_recorded":
+        applied_text = "Marked as sounding wrong. Recorded only; no temperature change."
+        print(f"[LEARNER] 👎 sounded_wrong (recorded only) {chunk_id[:8]}")
+    elif verdict == "sounded_perfect":
         res = None
         if hasattr(_learner, "confirm_chunk_quality"):
             try: res = _learner.confirm_chunk_quality(chunk_id)
@@ -5496,7 +5513,7 @@ def chunk_verdict():
         # near-global anyway, but only on the evidence.
         try:
             prof = _learner.lookup_chunk_profile(chunk_id, chunk_text)
-            _key, new_t = _learner._adjust_profile_temperature(prof["keys"], delta)
+            _key, new_t = _learner._adjust_profile_temperature(prof["keys"], delta, report=True)
             _learner.log_history("TEMP",
                 f"🎚 voice_off profile temp {'+' if delta > 0 else ''}{delta} → {new_t} "
                 f"({prof['band']},{prof['length']},{prof['punct']},{prof['lexis']})", "user")
@@ -5521,7 +5538,7 @@ def chunk_verdict():
             # its stored row, rather than recomputed from the display text.
             prof  = _learner.lookup_chunk_profile(chunk_id, chunk_text)
             stype = prof["sentence_type"]
-            _key, new_t = _learner._adjust_profile_temperature(prof["keys"], -0.03)
+            _key, new_t = _learner._adjust_profile_temperature(prof["keys"], -0.03, report=True)
             _learner._adjust_pref_temperature(stype, -0.03)   # legacy sync
             _learner.log_history("TEMP",
                 f"👎 hallucination profile temp -0.03 → {new_t} "
@@ -5533,21 +5550,34 @@ def chunk_verdict():
             applied_text = "Hallucination logged."
         print(f"[LEARNER] 👎 sounded_wrong {chunk_id[:8]} ({stype})")
     elif verdict == "revert":
-        # Undo a previous thumbs up/down on this chunk: clear its feedback,
-        # decrement the durable counter, and reverse the learning nudge so a
-        # mislabel doesn't permanently skew the model.
-        prior = None
+        # Undo the last verdict on this chunk: clear it, take back the lifetime
+        # count it added, and reverse its learning step.
+        #
+        # This used to decide from user_feedback alone, and 'negative' is also
+        # what /report and every non-thumbs verdict write. So reverting a chunk
+        # that only had a report on it raised the temperature +0.03 that nothing
+        # had lowered and took one off negative_total that nothing had added.
+        # It now goes by user_verdict, the verdict that actually ran, and by
+        # verdict_counted, whether that verdict really added to a total.
+        prior = verdict_was = None
+        counted = False
+        stype = "sentence"
         try:
             with _learner._db_lock:
                 conn = _learner._get_db()
-                row = conn.execute("SELECT user_feedback, sentence_type FROM chunks WHERE id=?", (chunk_id,)).fetchone()
+                row = conn.execute("SELECT user_feedback, sentence_type, user_verdict, "
+                                   "verdict_counted FROM chunks WHERE id=?",
+                                   (chunk_id,)).fetchone()
                 conn.close()
-            prior = row[0] if row else None
-            stype = (row[1] if row and len(row) > 1 else None) or _learner._lookup_chunk_type(chunk_id, chunk_text)
+            if row:
+                prior, verdict_was = row[0], row[2]
+                # A verdict stored before verdict_counted existed is assumed to
+                # have counted, which is what the old code assumed of every one.
+                counted = bool(verdict_was) and row[3] != 0
+            stype = (row[1] if row else None) or _learner._lookup_chunk_type(chunk_id, chunk_text)
         except Exception as e:
             print(f"[LEARNER] revert lookup failed: {e}")
-            stype = "sentence"
-        if prior == "negative":
+        if verdict_was == "sounded_wrong":
             # Reverse the -0.03 hallucination nudge on BOTH the composite profile
             # and the legacy per-type value (matches the sounded_wrong path).
             # Same stored fingerprint, so the revert lands on the key the
@@ -5556,16 +5586,14 @@ def chunk_verdict():
                 prof = _learner.lookup_chunk_profile(chunk_id, chunk_text)
                 _key, new_t = _learner._adjust_profile_temperature(prof["keys"], +0.03)
                 _learner._adjust_pref_temperature(stype, +0.03)   # legacy sync
-                _learner.bump_counter("negative_total", -1)
                 _learner.log_history("TEMP", f"↩ reverted hallucination profile temp +0.03 → {new_t}", "user")
                 applied_text = f"Reverted. Temperature restored to {new_t}."
             except Exception as e:
                 print(f"[LEARNER] revert(neg) failed: {e}")
                 applied_text = "Reverted hallucination flag."
-        elif prior == "positive":
-            # Remove the reinforcement sample and decrement the counter.
+        elif verdict_was == "sounded_perfect":
+            # Remove the reinforcement sample.
             try:
-                _learner.bump_counter("perfect_total", -1)
                 if hasattr(_learner, "unconfirm_chunk_quality"):
                     _learner.unconfirm_chunk_quality(chunk_id)
                 _learner.log_history("CONFIRM", "↩ reverted a perfect mark", "user")
@@ -5573,17 +5601,36 @@ def chunk_verdict():
             except Exception as e:
                 print(f"[LEARNER] revert(pos) failed: {e}")
                 applied_text = "Reverted perfect mark."
+        elif verdict_was == "sounded_wrong_recorded":
+            # Recorded without a step, so there is no step to take back.
+            applied_text = "Reverted. That mark took no temperature step, so none is undone."
+        elif verdict_was:
+            # The other verdicts made rules or one-off nudges that revert does
+            # not know how to take back exactly, so it says so rather than
+            # guessing at a reversal.
+            applied_text = (f"Cleared the '{verdict_was}' mark. What it changed is "
+                            f"left in place; remove it from the rules list if needed.")
+        elif prior:
+            applied_text = ("Cleared the mark. It came from a report or a finished "
+                            "session, not a verdict, so there was nothing to reverse.")
         else:
             applied_text = "Nothing to revert on this chunk."
+        if counted:
+            try:
+                _learner.bump_counter("perfect_total" if verdict_was == "sounded_perfect"
+                                      else "negative_total", -1)
+            except Exception as e:
+                print(f"[LEARNER] revert counter failed: {e}")
         # Clear the stored verdict columns.
         try:
             with _learner._db_lock:
                 conn = _learner._get_db()
-                conn.execute("UPDATE chunks SET user_feedback=NULL, user_verdict=NULL, applied_action=NULL WHERE id=?", (chunk_id,))
+                conn.execute("UPDATE chunks SET user_feedback=NULL, user_verdict=NULL, "
+                             "applied_action=NULL, verdict_counted=NULL WHERE id=?", (chunk_id,))
                 conn.commit(); conn.close()
         except Exception as e:
             print(f"[LEARNER] revert clear failed: {e}")
-        print(f"[LEARNER] ↩ revert {chunk_id[:8]} (was {prior})")
+        print(f"[LEARNER] ↩ revert {chunk_id[:8]} (was {verdict_was or prior})")
         return jsonify({"ok": True, "verdict": "revert", "applied_text": applied_text, "was": prior})
     elif verdict == "skip":
         _learner._add_rule("SUPPRESS", chunk_id, "user_skipped", "", source="REPORT")
