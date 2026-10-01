@@ -27,8 +27,18 @@
   }
 
   async function fetchPage(i) {
+    const get = t => fetch(`${SERVER}/scan/page/${i}`, { headers: { 'X-KAM-Token': t } });
     const t = await apiToken();
-    const r = await fetch(`${SERVER}/scan/page/${i}`, { headers: { 'X-KAM-Token': t } });
+    let r = await get(t);
+    // A 403 means the token held here went stale, because the server came back
+    // with a new one while this page stayed open. So I forget it and try once
+    // more with a fresh one, and only if it really is different.
+    if (r.status === 403) {
+      token = null;
+      const fresh = await apiToken().catch(() => null);
+      if (fresh && fresh !== t) r = await get(fresh);
+    }
+    if (r.status === 403) throw new Error('the server refused this extension\'s token');
     if (!r.ok) throw new Error('page ' + i + ' is no longer there');
     return await r.blob();
   }
@@ -117,6 +127,12 @@
       return;
     }
     showPairing(st);
+    // A session can be open with nothing here watching it, when the dashboard
+    // was reloaded (by an update, say) while the phone was still paired. Only
+    // the Start button used to begin polling, so opening the panel showed the
+    // code but every photo sent after that was never fetched. So whoever finds
+    // an open session makes sure it is being watched.
+    if (!poll) startPolling();
     if (st.pages > seen) readNewPages(st.pages);
     else if (!busy && !seen) say('Waiting for the first photo…');
   }

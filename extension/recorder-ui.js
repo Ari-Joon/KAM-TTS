@@ -36,10 +36,22 @@ async function recToken() {
   return _recToken;
 }
 
+// A 403 means the token held here is stale: the server was restarted with a
+// new one while the dashboard stayed open. So I forget it, ask again and retry
+// once, but only with a token that differs, since the same one would be refused
+// the same way. A FormData body can be sent twice, so the retry is safe.
 async function recFetch(path, opts = {}) {
+  const send = t => fetch(`http://127.0.0.1:5050${path}`, Object.assign({}, opts, {
+    headers: Object.assign({}, opts.headers || {}, { "X-KAM-Token": t }),
+  }));
   const t = await recToken();
-  const headers = Object.assign({}, opts.headers || {}, { "X-KAM-Token": t });
-  return fetch(`http://127.0.0.1:5050${path}`, Object.assign({}, opts, { headers }));
+  const r = await send(t);
+  if (r.status !== 403) return r;
+  _recToken = null;
+  let fresh = null;
+  try { fresh = await recToken(); } catch (e) { return r; }
+  if (!fresh || fresh === t) return r;
+  return send(fresh);
 }
 
 // --- Opening and closing ---
@@ -66,6 +78,12 @@ async function recOpen() {
 function recClose() {
   recStopMeter();
   recStopPlayback();
+  // Closing mid-take used to leave the 100 ms timer running for good, and the
+  // next take started a second one over it, so the orphan kept writing
+  // "Recording… 0.0s" over whatever the label said next. The button also stayed
+  // in its recording state. recRelease drops the recorder with the mic, so the
+  // take is gone and the screen has to say so.
+  recResetRecordButton();
   recRelease();
   if (_recSavedUrl) { URL.revokeObjectURL(_recSavedUrl); _recSavedUrl = null; }
   _$("rec-overlay").classList.remove("open");
@@ -251,17 +269,28 @@ async function recToggle() {
   _$("rec-btn").textContent = "■";
   _$("rec-btn").title = "Stop";
   recSay("", "");
+  clearInterval(_recTimerId);   // never two timers, whatever came before
   _recTimerId = setInterval(() => {
     _$("rec-timer").textContent = `Recording… ${recElapsed().toFixed(1)}s`;
   }, 100);
 }
 
-async function recFinish() {
+// Stop the take timer and put the record button back to its resting state.
+function recResetRecordButton() {
   clearInterval(_recTimerId);
+  _recTimerId = 0;
   const btn = _$("rec-btn");
-  btn.classList.remove("recording");
-  btn.textContent = "●";
-  btn.title = "Start recording";
+  if (btn) {
+    btn.classList.remove("recording");
+    btn.textContent = "●";
+    btn.title = "Start recording";
+  }
+  const timer = _$("rec-timer");
+  if (timer) timer.textContent = "Ready when you are.";
+}
+
+async function recFinish() {
+  recResetRecordButton();
   _$("rec-timer").textContent = "Working…";
   try {
     _recTake = await recStop();
@@ -548,11 +577,14 @@ function recBindUi() {
 
   // A take under review is not saved yet, so closing on Escape would throw it
   // away silently. Space toggling the recorder would fight the passage editor.
+  // A take still being recorded counts too, since _recTake is empty until it
+  // stops and so this guard used to let Escape throw a recording away.
   _$("rec-overlay").addEventListener("click", e => {
-    if (e.target === _$("rec-overlay") && !_recTake) recClose();
+    if (e.target === _$("rec-overlay") && !_recTake && !recIsRecording()) recClose();
   });
   document.addEventListener("keydown", e => {
-    if (e.key === "Escape" && _$("rec-overlay").classList.contains("open") && !_recTake) recClose();
+    if (e.key === "Escape" && _$("rec-overlay").classList.contains("open")
+        && !_recTake && !recIsRecording()) recClose();
   });
 
   recBindHandles();

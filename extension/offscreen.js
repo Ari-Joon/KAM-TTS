@@ -31,14 +31,17 @@ let pausedAt     = 0;
 // loudness. Boost above unity is made safe by a soft-clip curve + brick-wall
 // limiter (see the Web Audio chain below), so louder never means distorted.
 let _playbackGain = 1.0;   // 1.0 = 100% (unaltered)
+// The stored volume lives in chrome.storage.local, and the worker owns it. An
+// offscreen document can use chrome.runtime and nothing else, so the old read
+// of chrome.storage.session here always failed and every new offscreen
+// document started at 100% whatever the slider said. So I ask the worker.
 try {
-  chrome.storage.session.get('playbackGain').then(d => {
-    if (d && typeof d.playbackGain === 'number') {
-      _playbackGain = Math.max(0, Math.min(6, d.playbackGain));
-      _applyGain(_playbackGain);
-    }
-  }).catch(() => {});
-} catch (e) { /* session storage unavailable */ }
+  chrome.runtime.sendMessage({ action: "getPlaybackGain" }, res => {
+    if (chrome.runtime.lastError || !res || typeof res.gain !== "number") return;
+    _playbackGain = Math.max(0, Math.min(6, res.gain));
+    _applyGain(_playbackGain);
+  });
+} catch (e) { /* worker not reachable; 100% until the next setVolume */ }
 
 // One persistent AudioContext + boost graph, built lazily on first playback.
 // Each chunk's <audio> element feeds this shared chain via a MediaElementSource.
@@ -233,7 +236,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if (!Number.isNaN(g)) {
         _playbackGain = g;
         _applyGain(g);
-        try { chrome.storage.session.set({ playbackGain: g }).catch(() => {}); } catch (e) {}
       }
       sendResponse({ status: "ok", volume: _playbackGain });
       return false;
@@ -259,7 +261,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       respondSeq = null;
 
       if (currentAudio) {
-        try { currentAudio.pause(); } catch (_) {}
+        _disposeAudio(currentAudio);
         currentAudio = null;
       }
 
@@ -285,6 +287,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (finished || currentToken !== myToken) return;
         finished = true;
         if (currentAudio === audio) currentAudio = null;
+        _disposeAudio(audio);
         if (mySeq !== null && mySeq !== undefined) {
           try { chrome.runtime.sendMessage({ action: "chunkComplete", seq: mySeq, reason }).catch(() => {}); } catch (_) {}
         }
@@ -346,7 +349,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       pausedAt = 0;
       isPausedHard = false;   // stop also clears the pause gate
       if (currentAudio) {
-        try { currentAudio.pause(); } catch (_) {}
+        _disposeAudio(currentAudio);
         currentAudio = null;
       }
       settleDone("stopped");
@@ -373,6 +376,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
+// Let go of a chunk's element for good: stop it, take it out of the page, free
+// its blob and unhook its Web Audio nodes. This used to happen only on `ended`
+// or `error`, so every chunk that was stopped, jumped past or replaced stayed
+// in the page holding its whole WAV, and with the boost on its source stayed
+// wired into the shared gain node. This document is kept alive on purpose, so
+// over a long session that only grew. Safe to call more than once.
+function _disposeAudio(audio) {
+  if (!audio || audio._kamDisposed) return;
+  audio._kamDisposed = true;
+  try { audio.pause(); } catch (_) {}
+  if (audio.parentNode) audio.parentNode.removeChild(audio);
+  if (audio._kamUrl) { try { URL.revokeObjectURL(audio._kamUrl); } catch (_) {} audio._kamUrl = null; }
+  const nodes = audio._kamNodes || [];
+  nodes.forEach(n => { try { n && n.disconnect(); } catch (_) {} });
+  if (nodes.length && nodes[0] === _curSource) {
+    _curSource = null; _curSubsonic = null; _curLimiter = null;
+    _curElementBoosted = false;
+  }
+  audio._kamNodes = null;
+}
+
 function decodeAudio(base64) {
   try {
     const binary = atob(base64);
@@ -390,9 +414,12 @@ function decodeAudio(base64) {
     // offscreen documents have no user
     // gesture), which was silencing playback. Native element volume is used at
     // or below 100%.
+    audio._kamUrl = url;
     let boosted = false;
     if (_playbackGain > 1.0) {
       boosted = _connectToBoost(audio);
+      // Its nodes go with it when it is disposed of.
+      if (boosted) audio._kamNodes = [_curSource, _curSubsonic, _curLimiter];
     }
     _curElementBoosted = boosted;
     audio.volume = boosted ? 1.0 : Math.max(0, Math.min(1, _playbackGain));
@@ -400,10 +427,7 @@ function decodeAudio(base64) {
     // document; an element in the document body plays consistently and is counted
     // toward the doc's AUDIO_PLAYBACK lifetime.
     document.body.appendChild(audio);
-    const cleanup = () => {
-      URL.revokeObjectURL(url);
-      if (audio.parentNode) audio.parentNode.removeChild(audio);
-    };
+    const cleanup = () => _disposeAudio(audio);
     audio.addEventListener("ended", cleanup, { once: true });
     audio.addEventListener("error", cleanup, { once: true });
     return audio;

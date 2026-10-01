@@ -1,3 +1,21 @@
+// The whole script sits in one function so it can be injected more than once.
+// The worker now injects it into tabs that were open before an install or a
+// reload, and those tabs may also get the manifest copy, or may still hold the
+// copy from before a reload. Top-level let and const would then throw "already
+// declared", and two live copies would draw two header bars. The body is not
+// re-indented, since that would touch every line for no change in behaviour.
+(() => {
+// A copy stays in charge only while its own runtime is alive. After a reload
+// the old copy's runtime is gone, its listeners hear nothing, and it is left
+// behind as an orphan, so it has to give way rather than block the new one. I
+// keep the runtime object from load time, since the global could be replaced.
+const _kamRt = (typeof chrome !== "undefined" && chrome.runtime) || null;
+const _kamPrev = globalThis.__kamTtsContent;
+if (_kamPrev && typeof _kamPrev.alive === "function" && _kamPrev.alive()) return;
+globalThis.__kamTtsContent = {
+  alive: () => { try { return !!(_kamRt && _kamRt.id); } catch (e) { return false; } },
+};
+
 let ttsIsPaused = false;
 
 // ---
@@ -685,3 +703,9 @@ function _removeOverlayBarOnly() {
   if (el) el.remove();
   document.body.style.marginTop = "";
 }
+
+// Taking over from an orphan: its header bar is still on the page, but its
+// buttons call a runtime that no longer exists, so they are dead. Updating that
+// bar in place would keep them dead, so it goes, along with its highlight.
+if (_kamPrev && document.getElementById("tts-overlay")) removeOverlay();
+})();

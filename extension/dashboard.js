@@ -257,7 +257,16 @@ function clearConsole() {
 function pollConsole() {
   api(`/console?since=${_logSince}`)
     .then(d => {
-      if (d.lines && d.lines.length) {
+      // A cursor behind ours means the server restarted, since a new one
+      // counts from zero. It answers a cursor it has not reached with no lines,
+      // and ours only moved when lines came back, so after a restart from the
+      // power button the console stayed silent until the new server had
+      // printed more than the old one ever did. So I sync to its end the way
+      // the first poll does: the boot lines have already arrived through the
+      // host, and rendering the backlog would print them twice.
+      if (typeof d.cursor === 'number' && d.cursor < _logSince) {
+        _logSince = d.cursor;
+      } else if (d.lines && d.lines.length) {
         // On the first successful poll the server returns its whole backlog, but
         // the power-button host has already streamed those startup lines to the
         // console during boot. Rendering them again is the duplication. So on
@@ -1015,6 +1024,31 @@ function toggleAiSection(id) {
   if (arrow) arrow.classList.toggle('open', !collapsed);
 }
 
+// Where the volume slider starts. storedGain is playbackGain from
+// chrome.storage.local (0..6), legacyPct is the old localStorage percentage. A
+// stored gain always wins; the old value only seeds storage when nothing is
+// stored yet, and migrate says so.
+function volumeStartPct(storedGain, legacyPct) {
+  const g = Number(storedGain);
+  if (storedGain != null && Number.isFinite(g)) {
+    return { pct: Math.round(Math.max(0, Math.min(6, g)) * 100), migrate: false };
+  }
+  const p = parseInt(legacyPct, 10);
+  if (legacyPct != null && Number.isFinite(p)) {
+    return { pct: Math.max(0, Math.min(600, p)), migrate: true };
+  }
+  return { pct: 100, migrate: false };
+}
+
+// The section headers are rebuilt with innerHTML on every refresh and used to
+// carry onclick="toggleAiSection(...)". The extension's CSP blocks inline
+// handlers, so clicking a header did nothing at all. One listener on the
+// document reads data-ai-toggle instead, and it survives every rebuild.
+document.addEventListener('click', e => {
+  const head = e.target && e.target.closest && e.target.closest('[data-ai-toggle]');
+  if (head) toggleAiSection(head.dataset.aiToggle);
+});
+
 function _explainChunk(r) {
   const flags  = (r.quality_flags || '').split('|').filter(Boolean);
   const wa     = r.whisper_accuracy;
@@ -1190,7 +1224,7 @@ function refreshAI(silent) {
 
 
       <div class="ai-section" id="ai-sec-stats">
-        <div class="ai-section-header" onclick="toggleAiSection('ai-sec-stats')">
+        <div class="ai-section-header" data-ai-toggle="ai-sec-stats">
           <span class="ai-section-title">📊 Whisper Analysis</span>
           <span class="ai-collapse-arrow open">▶</span>
         </div>
@@ -1208,7 +1242,7 @@ function refreshAI(silent) {
       </div>
 
       <div class="ai-section" id="ai-sec-insights">
-        <div class="ai-section-header" onclick="toggleAiSection('ai-sec-insights')">
+        <div class="ai-section-header" data-ai-toggle="ai-sec-insights">
           <span class="ai-section-title">🔬 Quality Insights</span>
           <span class="ai-collapse-arrow open">▶</span>
         </div>
@@ -2323,25 +2357,37 @@ document.addEventListener('DOMContentLoaded',()=>{
     });
   });
 
-  // Volume is a client-side playback control rather than a server TTS param. It
-  // goes to the background worker, which relays it to the offscreen audio sink,
-  // and it's persisted
-  // locally so it survives reloads.
+  // Volume is a client-side playback control rather than a server TTS param.
+  // Its one home is playbackGain in chrome.storage.local, as a 0..6 gain
+  // factor. The worker watches that key and passes changes to the offscreen
+  // audio sink, and hands it the stored value whenever a new offscreen
+  // document starts. This page used to keep its own copy in localStorage and
+  // only told the sink on load, so after a restart the slider and what you
+  // heard disagreed.
   const _volSlider = document.getElementById('tp-vol');
   const _volLabel  = document.getElementById('tp-vol-v');
-  function _applyVolume(pct, persist) {
-    const clamped = Math.max(0, Math.min(600, pct));
-    if (_volLabel) _volLabel.textContent = clamped + '%';
-    // Send as a 0..6 gain factor; the offscreen boost chain handles >1 safely.
-    try { chrome.runtime.sendMessage({ action: 'setVolume', volume: clamped / 100 }).catch(() => {}); } catch (e) {}
-    if (persist) { try { localStorage.setItem('kamPlaybackVolume', String(clamped)); } catch (e) {} }
+  function _showVolume(pct) {
+    if (_volSlider) _volSlider.value = pct;
+    if (_volLabel) _volLabel.textContent = pct + '%';
   }
   if (_volSlider) {
-    let _stored = 100;
-    try { const v = localStorage.getItem('kamPlaybackVolume'); if (v != null) _stored = parseInt(v, 10) || 0; } catch (e) {}
-    _volSlider.value = _stored;
-    _applyVolume(_stored, false);   // sync offscreen on load
-    _volSlider.addEventListener('input', () => _applyVolume(parseInt(_volSlider.value, 10), true));
+    let legacy = null;
+    try { legacy = localStorage.getItem('kamPlaybackVolume'); } catch (e) {}
+    try {
+      chrome.storage.local.get('playbackGain', d => {
+        const start = volumeStartPct(d && d.playbackGain, legacy);
+        _showVolume(start.pct);
+        // The old localStorage value is carried over once, so nobody's
+        // chosen volume is lost by the move, and then it is gone.
+        if (start.migrate) chrome.storage.local.set({ playbackGain: start.pct / 100 });
+        try { localStorage.removeItem('kamPlaybackVolume'); } catch (e) {}
+      });
+    } catch (e) { _showVolume(100); }
+    _volSlider.addEventListener('input', () => {
+      const pct = Math.max(0, Math.min(600, parseInt(_volSlider.value, 10) || 0));
+      _showVolume(pct);
+      try { chrome.storage.local.set({ playbackGain: pct / 100 }); } catch (e) {}
+    });
   }
 
   // Sync every tuning slider from a settings payload returned by the server.
@@ -2411,7 +2457,10 @@ document.addEventListener('DOMContentLoaded',()=>{
       // apply. The dashboard isn't a content-script tab, so we ask the popup's
       // background worker to speak via a fresh tab-less session.
       chrome.runtime.sendMessage(
+        // Not digestible: these are test sentences, not reading, and they must
+        // not be marked solid and reinforced as though someone had read them.
         { action: 'startSpeaking', chunks: sentences, startIndex: 0, speed: 1.0, tabId: null,
+          digestible: false,
           nonce: Date.now() + '-' + Math.random().toString(36).slice(2) },
         () => {}
       );

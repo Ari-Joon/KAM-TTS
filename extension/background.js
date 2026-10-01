@@ -36,13 +36,33 @@ async function _ensureToken() {
   return KAM_TOKEN;
 }
 
+// Forget the cached token, in memory and in storage, so the next _ensureToken
+// asks the server again.
+async function _dropToken() {
+  KAM_TOKEN = "";
+  try { await chrome.storage.local.remove("kamToken"); } catch (e) {}
+}
+
 // Drop-in fetch for authed server endpoints: awaits the token before sending,
 // so a request fired before the token arrives is never rejected with 403.
+//
+// A 403 means the cached token is stale. The server makes a new one whenever
+// kam_token.txt is missing or cannot be written, and the cache used to be kept
+// forever, so every call after that was refused until storage was cleared by
+// hand. So on a 403 I drop the cache, fetch the token once more and retry once,
+// and only if the server really hands out a different token, since a second
+// try with the same one would be refused the same way.
 async function kamFetch(url, opts = {}) {
-  const tok = await _ensureToken();
-  return fetch(url, Object.assign({}, opts, {
+  const send = tok => fetch(url, Object.assign({}, opts, {
     headers: Object.assign({}, opts.headers || {}, { "X-KAM-Token": tok })
   }));
+  const tok = await _ensureToken();
+  const res = await send(tok);
+  if (res.status !== 403) return res;
+  await _dropToken();
+  const fresh = await _ensureToken();
+  if (!fresh || fresh === tok) return res;
+  return send(fresh);
 }
 _ensureToken();
 
@@ -144,7 +164,11 @@ let sessionId         = 0;
 let readingTabId      = null;
 let _playSeqCounter   = 0;      // unique id per chunk play
 let _pendingPlay      = {};     // seq → resolver, for the completion broadcast
-let currentFetchAbort = null;
+// Every /speak request still in flight. The prefetch window keeps two or three
+// going at once, and this used to be a single slot holding only the newest, so
+// a stop or a jump aborted one and left the rest synthesising on a serial GPU
+// ahead of the new read. Teardown now aborts the lot.
+const _speakAborts    = new Set();
 let playerTabId       = null;
 let playerReady       = false;
 
@@ -254,9 +278,19 @@ function toReadingTab(msg) {
 function teardownPlayback() {
   sessionId++;                       // invalidate every existing loop
   isStopped = true;
+  const wasPaused = isPaused;
   isPaused  = false;
   isPlaying = false;
-  if (currentFetchAbort) { try { currentFetchAbort.abort(); } catch (_) {} currentFetchAbort = null; }
+  for (const c of _speakAborts) { try { c.abort(); } catch (_) {} }
+  _speakAborts.clear();
+  // Teardown always leaves playback unpaused, since stopOffscreen lifts the
+  // offscreen gate too. Nothing said so, though, so after a jump or a new read
+  // started while paused the overlay and popup went on showing play while the
+  // audio ran, and the next click paused it. So the pages are told.
+  if (wasPaused) {
+    toReadingTab({ action: "resumedPlaying" });
+    chrome.runtime.sendMessage({ action: "resumedPlaying" }).catch(() => {});
+  }
   // Resolve any awaiters so no loop is stranded on a pending completion.
   for (const k in _pendingPlay) { try { _pendingPlay[k]({ reason: "torndown" }); } catch (_) {} }
   _pendingPlay = {};
@@ -461,6 +495,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // current playback. teardownPlayback() bumps sessionId so the old loop dies
     // at its next await before this one begins, so there's never more than one.
     teardownPlayback();
+    // Digest what was heard of the read being replaced before its list is
+    // reset below. Only stop used to do this, so starting a new selection over
+    // a running one threw away every chunk already listened to. It runs while
+    // sessionDigestible still describes the old read, which is the right one.
+    digestPlayedChunks();
 
     const newSession  = ++sessionId;   // fresh id after teardown's bump
     isStopped         = false;
@@ -517,8 +556,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "setVolume") {
-    toPlayer({ action: "setVolume", volume: request.volume });
+    // Stored rather than relayed: the storage listener below pushes it to the
+    // offscreen document, and storage is what a new offscreen document reads.
+    _saveGain(request.volume);
     sendResponse({ status: "ok" });
+    return true;
+  }
+
+  // The offscreen document asks for the volume as it starts, since it can use
+  // chrome.runtime and nothing else, so it cannot read storage itself.
+  if (request.action === "getPlaybackGain") {
+    _readGain().then(gain => sendResponse({ gain }));
     return true;
   }
 
@@ -579,14 +627,62 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       body:    request.body ? JSON.stringify(request.body) : undefined,
     };
     kamFetch(`${SERVER}${request.path}`, opts)
-      .then(r => r.json())
-      .then(data => sendResponse({ ok: true, data }))
+      .then(_dashboardReply)
+      .then(sendResponse)
       .catch(e  => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
 
   return false;
 });
+
+// Turn a server reply into what the dashboard proxy sends back. A refusal used
+// to come back as ok with {error:"unauthorised"} for data, so the console poll
+// painted the server online while every call was being turned away. A 401 or
+// 403 is an error now. Other statuses still pass their JSON through, because
+// some routes (the updater, say) explain a refusal in the body and the
+// dashboard shows that explanation.
+async function _dashboardReply(r) {
+  if (r.status === 401 || r.status === 403) {
+    return { ok: false, error: "The server refused this extension's token (" + r.status + ")." };
+  }
+  return { ok: true, data: await r.json() };
+}
+
+// =============================================================================
+// VOLUME
+// =============================================================================
+// One stored gain factor (0 to 6, where 1 is 100%) in chrome.storage.local.
+// The dashboard kept it in its own localStorage and the offscreen document in
+// chrome.storage.session, which an offscreen document cannot even reach, so
+// after a restart, or whenever the offscreen document was made again, playback
+// fell back to 100% while the slider still showed what was chosen.
+function _clampGain(g) {
+  const n = Number(g);
+  return Number.isFinite(n) ? Math.max(0, Math.min(6, n)) : null;
+}
+
+async function _readGain() {
+  try {
+    const d = await chrome.storage.local.get("playbackGain");
+    const g = _clampGain(d && d.playbackGain);
+    return g === null ? 1.0 : g;
+  } catch (e) { return 1.0; }
+}
+
+function _saveGain(g) {
+  const v = _clampGain(g);
+  if (v === null) return;
+  try { chrome.storage.local.set({ playbackGain: v }).catch(() => {}); } catch (e) {}
+}
+
+try {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !changes.playbackGain) return;
+    const g = _clampGain(changes.playbackGain.newValue);
+    if (g !== null) toPlayer({ action: "setVolume", volume: g });
+  });
+} catch (e) { /* storage unavailable; the offscreen document keeps its last value */ }
 
 // =============================================================================
 // FETCH
@@ -658,12 +754,19 @@ function detectPositionHint(rawText) {
   return null;
 }
 
-async function fetchAudioBase64(text, idx) {
+// mySession is the read this request belongs to. A request that outlives its
+// read (one that finished just as it was aborted, or that nothing aborted) must
+// not touch the next read's state, since its index means a different chunk
+// there: it used to write its server id into the new chunkIdByIndex and
+// announce its old text as the chunk now playing, so a thumbs-up rated the
+// wrong chunk.
+async function fetchAudioBase64(text, idx, mySession) {
   const safe = sanitizeText(text);
   if (!safe || safe.length < 2) return null;
   const position = detectPositionHint(text);
   const controller  = new AbortController();
-  currentFetchAbort = controller;
+  _speakAborts.add(controller);
+  const current = () => mySession === undefined || mySession === sessionId;
   try {
     const res = await kamFetch(`${SERVER}/speak`, {
       method: "POST",
@@ -672,6 +775,7 @@ async function fetchAudioBase64(text, idx) {
       signal: controller.signal
     });
     if (!res.ok) throw new Error(`Server ${res.status}`);
+    if (!current()) return null;     // superseded read; its audio is no use now
     // Forward chunk ID to popup for quality feedback, and record it against this
     // chunk's index so the solid-digest can reference the exact server id.
     const chunkId = res.headers.get('X-Chunk-Id');
@@ -689,7 +793,7 @@ async function fetchAudioBase64(text, idx) {
     }
     return btoa(bin);
   } finally {
-    if (currentFetchAbort === controller) currentFetchAbort = null;
+    _speakAborts.delete(controller);
   }
 }
 
@@ -709,7 +813,7 @@ async function speakChunks(mySession) {
   function prefetch(idx) {
     if (idx >= allChunks.length) return;
     if (prefetchCache[idx]) return;
-    prefetchCache[idx] = fetchAudioBase64(allChunks[idx], idx).catch((e) => {
+    prefetchCache[idx] = fetchAudioBase64(allChunks[idx], idx, mySession).catch((e) => {
       // Surface the failure: a silent null here looks like a mystery playback
       // crash. AbortError is normal teardown; everything else is logged.
       if (!e || e.name !== "AbortError") {
@@ -902,6 +1006,35 @@ function _warmStart() {
 }
 try { chrome.runtime.onStartup.addListener(_warmStart); } catch (e) {}
 try { chrome.runtime.onInstalled.addListener(_warmStart); } catch (e) {}
+
+// --- Content script for tabs that were already open ---
+// Chrome only injects the manifest's content scripts into pages loaded after
+// the extension is. A tab open before an install, a reload, or the reload an
+// update does had no content.js, so a read there played with no header bar and
+// no highlight, and nothing said why. So on install and on startup it goes into
+// every open web page. content.js guards itself, so a tab that already has a
+// live copy is left alone.
+function _injectableUrl(url) {
+  return /^https?:/.test(url || "") && !/^https:\/\/chromewebstore\.google\.com/.test(url);
+}
+
+async function _injectContentIntoOpenTabs() {
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({}); } catch (e) { return 0; }
+  let n = 0;
+  for (const t of tabs) {
+    // A discarded tab has no page to run in, and it gets the manifest script
+    // anyway when it is brought back.
+    if (!t || t.id == null || t.discarded || !_injectableUrl(t.url)) continue;
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: t.id, allFrames: true }, files: ["content.js"] });
+      n++;
+    } catch (e) { /* a page that refuses scripting, or one closed meanwhile */ }
+  }
+  return n;
+}
+try { chrome.runtime.onInstalled.addListener(() => { _injectContentIntoOpenTabs(); }); } catch (e) {}
+try { chrome.runtime.onStartup.addListener(() => { _injectContentIntoOpenTabs(); }); } catch (e) {}
 // Also run once now, for the case where the SW just woke on its own.
 _warmStart();
 _resumeAfterUpdate();

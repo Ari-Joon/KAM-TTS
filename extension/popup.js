@@ -7,31 +7,50 @@ let _tokenPromise = null;
 function _ensureToken() {
   if (KAM_TOKEN) return Promise.resolve(KAM_TOKEN);
   if (_tokenPromise) return _tokenPromise;          // one in-flight fetch, shared
+  // The slot is cleared in a finally, since the early return on a stored token
+  // used to skip the clear. The settled promise then stayed in the slot, so
+  // after a stale token was dropped this kept handing the same one back.
   _tokenPromise = (async () => {
     try {
-      const st = await chrome.storage.local.get("kamToken");
-      if (st.kamToken) { KAM_TOKEN = st.kamToken; return KAM_TOKEN; }
-    } catch (e) {}
-    try {
-      const r = await fetch("http://127.0.0.1:5050/token");
-      if (r.ok) {
-        KAM_TOKEN = (await r.json()).token || "";
-        if (KAM_TOKEN) chrome.storage.local.set({ kamToken: KAM_TOKEN });
-      }
-    } catch (e) { /* server down — retried on the next call */ }
-    _tokenPromise = null;                            // allow a later retry
-    return KAM_TOKEN;
+      try {
+        const st = await chrome.storage.local.get("kamToken");
+        if (st.kamToken) { KAM_TOKEN = st.kamToken; return KAM_TOKEN; }
+      } catch (e) {}
+      try {
+        const r = await fetch("http://127.0.0.1:5050/token");
+        if (r.ok) {
+          KAM_TOKEN = (await r.json()).token || "";
+          if (KAM_TOKEN) chrome.storage.local.set({ kamToken: KAM_TOKEN });
+        }
+      } catch (e) { /* server down, so it is retried on the next call */ }
+      return KAM_TOKEN;
+    } finally {
+      _tokenPromise = null;                          // allow a later retry
+    }
   })();
   return _tokenPromise;
 }
 
 // Drop-in replacement for fetch() on authed server endpoints: waits for the
 // token, then injects the header. Returns the same promise shape as fetch.
+//
+// A 403 means the cached token is stale, since the server makes a new one when
+// kam_token.txt is missing or cannot be written. The cache used to be kept for
+// good, so every call was refused from then on. So I drop it, in memory and in
+// storage, ask for the token again and retry once, but only with a token that
+// actually differs, because the same one would just be refused again.
 async function kamFetch(url, opts = {}) {
-  const tok = await _ensureToken();
-  return fetch(url, Object.assign({}, opts, {
+  const send = tok => fetch(url, Object.assign({}, opts, {
     headers: Object.assign({}, opts.headers || {}, { "X-KAM-Token": tok })
   }));
+  const tok = await _ensureToken();
+  const res = await send(tok);
+  if (res.status !== 403) return res;
+  KAM_TOKEN = "";
+  try { await chrome.storage.local.remove("kamToken"); } catch (e) {}
+  const fresh = await _ensureToken();
+  if (!fresh || fresh === tok) return res;
+  return send(fresh);
 }
 _ensureToken();   // warm the cache as soon as the popup opens
 
