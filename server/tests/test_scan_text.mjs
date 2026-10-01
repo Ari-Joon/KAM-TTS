@@ -66,6 +66,50 @@ r = T.stripVerseNumbers('It was 1947. Alpha beta gamma.');
 check('a year before a capital is not eaten when out of sequence',
       r.text, 'It was 1947. Alpha beta gamma.');
 
+console.log('\n=== verse numbers OCR could not read as numbers ===');
+// The shapes measured on a photographed page on 1 Oct 2026, where nearly every
+// word error was one of these rather than a misread word.
+r = T.stripVerseNumbers('*Alpha beta. ?Gamma delta. 3 Epsilon zeta.');
+check('symbols where a marker was go, and the count carries on',
+      r.text, 'Alpha beta. Gamma delta. Epsilon zeta.');
+check('every marker is counted', r.removed, 3);
+
+r = T.stripVerseNumbers('1 Alpha. 2Gamma delta. *5Epsilon. 3°Zeta eta. #© Theta.');
+check('glued digits and mixed debris go too',
+      r.text, 'Alpha. Gamma delta. Epsilon. Zeta eta. Theta.');
+r = T.stripVerseNumbers('1 Alpha. 8Gamma delta.');
+check('glued digits are still held to the count', r.text, 'Alpha. 8Gamma delta.');
+
+r = T.stripVerseNumbers('1 Alpha. © Beta. ? Gamma. ® Delta. * Eta. 7 Theta iota.');
+check('a run of unreadable markers does not break the count for the next readable one',
+      r.text, 'Alpha. Beta. Gamma. Delta. Eta. Theta iota.');
+
+check('a short run of symbols is a marker too',
+      T.stripVerseNumbers('1 Alpha. *** Beta.').text, 'Alpha. Beta.');
+check('a long one is left for whoever reads it, since it is not a verse',
+      T.stripVerseNumbers('1 Alpha. ******** Beta.').text, 'Alpha. ******** Beta.');
+check('digits glued to capitals that are not a word are not a marker',
+      T.stripVerseNumbers('1 Alpha. The 2KG scroll.').text, 'Alpha. The 2KG scroll.');
+
+r = T.stripVerseNumbers('1 Alpha beta. The journey took 40 days. *Gamma took 7 more.');
+check('real numbers survive among debris', /40 days/.test(r.text) && /7 more/.test(r.text), true);
+
+r = T.stripVerseNumbers('© 2024 Alpha Press. Copyright #3 in the series.');
+check('a symbol before a number is not debris', r.text, '© 2024 Alpha Press. Copyright #3 in the series.');
+
+console.log('\n=== commas OCR read as full stops ===');
+check('a stop before a lower-case word is put back to a comma',
+      T.restoreCommas('after their kind. and trees bearing fruit. with seeds.'),
+      'after their kind, and trees bearing fruit, with seeds.');
+check('a stop before a capital is a real stop',
+      T.restoreCommas('It was good. And so on.'), 'It was good. And so on.');
+check('an abbreviation keeps its own stop',
+      T.restoreCommas('apples, pears etc. and more, cf. the list, Dr. who'),
+      'apples, pears etc. and more, cf. the list, Dr. who');
+check('e.g. and i.e. are left alone',
+      T.restoreCommas('fruit, e.g. apples, i.e. the red ones'), 'fruit, e.g. apples, i.e. the red ones');
+check('the cleanup can be turned off', T.clean('kind. and', { commas: false }).text, 'kind. and');
+
 console.log('\n=== columns are told, not guessed ===');
 // Tesseract interleaves two columns when its layout analysis guesses wrong, and
 // the result reads smoothly while being nonsense, so the caller declares them.

@@ -80,27 +80,73 @@ const KamScanText = (() => {
 
   const LOOKAHEAD = 3;   // how far the count may skip and still be believed
 
+  // Verse numbers are printed small and raised, which is exactly what OCR reads
+  // worst. Measured on a photographed two-column page on 1 Oct 2026, nearly
+  // every word error was a verse number rather than a word: read as a symbol
+  // ("*In", "?The", "#God", a lone "©"), as digits and symbols mixed ("3°To",
+  // "*5God"), or as digits glued to the word after ("8God"). None of these is a
+  // number followed by a space, so the old pattern left them all in, and the
+  // symbols got spoken. This is the set of characters that turn up in that
+  // debris and never begin a word in running text.
+  const DEBRIS = '*#©®°§¶†‡?^~•«»';
+  const MAX_DEBRIS = 4;
+
   function stripVerseNumbers(text) {
-    // A candidate is a 1-3 digit number that begins the line, or follows the end
-    // of a sentence, and is followed by a capitalised word. That is the shape a
-    // verse marker has once the lines are joined.
-    const re = /(^|[.!?;:”"’']\s+|\s)(\d{1,3})\s+(?=[“"‘']?[A-Z])/g;
-    let expected = null;
-    let removed = 0;
-    const out = text.replace(re, (whole, lead, digits) => {
+    // Three shapes, all at the start of a word and all followed by a
+    // capitalised word, since that is where a verse marker sits once the lines
+    // are joined:
+    //   "12 Alpha"   digits then a space, checked against the count
+    //   "12Alpha"    digits glued to a word, checked against the count
+    //   "*5Alpha"    debris, which is never text, so it always goes
+    const d = DEBRIS.replace(/[\^\-\]\\]/g, '\\$&');
+    const re = new RegExp(
+      `(^|\\s)(?:(\\d{1,3})(?:\\s+(?=[“"‘']?[A-Z])|(?=[A-Z][a-z]))` +
+      `|([${d}\\d]*[${d}][${d}\\d]*)\\s*(?=[“"‘']?[A-Z]))`, 'g');
+    // `last` is the last verse number actually read. Debris is a verse whose
+    // number was lost, so each one widens how far the next readable number may
+    // jump and still be believed, and the count does not fall apart after a
+    // run of unreadable markers.
+    let last = null, lost = 0, removed = 0;
+    const out = text.replace(re, (whole, lead, digits, debris) => {
+      if (debris !== undefined) {
+        if (debris.length > MAX_DEBRIS) return whole;
+        lost++; removed++;
+        return lead;
+      }
       const n = parseInt(digits, 10);
-      if (expected === null) {
-        // Seed on a plausible opening verse. A page rarely opens on a number
-        // above 176, which is the longest psalm and so the practical ceiling.
-        if (n >= 1 && n <= 176) { expected = n + 1; removed++; return lead; }
-        return whole;
-      }
-      if (n >= expected && n <= expected + LOOKAHEAD) {
-        expected = n + 1; removed++; return lead;
-      }
-      return whole;   // out of sequence, so it is a number in the text
+      // Seed on a plausible opening verse. A page rarely opens on a number
+      // above 176, which is the longest psalm and so the practical ceiling.
+      const believed = last === null
+        ? n >= 1 && n <= 176
+        : n > last && n <= last + 1 + lost + LOOKAHEAD;
+      if (!believed) return whole;   // out of sequence, so it is a number in the text
+      last = n; lost = 0; removed++;
+      return lead;
     });
     return { text: out.replace(/\s{2,}/g, ' ').trim(), removed };
+  }
+
+  // --- Commas read as full stops ---------------------------------------------
+  // In small print the tail of a comma is a pixel or two, and OCR reads it as a
+  // full stop: "herbs yielding seed after their kind. and trees". Spoken, that
+  // is a full stop and a falling pitch in the middle of a sentence. A full stop
+  // followed by a lower-case word is almost never right in print, so it is put
+  // back to a comma, except after an abbreviation, where it is the abbreviation's
+  // own stop ("etc. and") and the server's text cleaning expects to see it.
+
+  const ABBREV = new Set(['etc', 'vs', 'cf', 'al', 'approx', 'fig', 'figs', 'no',
+    'nos', 'vol', 'vols', 'pp', 'p', 'ch', 'chap', 'ed', 'eds', 'ref', 'viz', 'ca',
+    'mr', 'mrs', 'ms', 'dr', 'st', 'mt', 'jr', 'sr', 'co', 'inc', 'ltd', 'dept', 'esp',
+    'ibid', 'op', 'cit', 'ie', 'eg', 'v', 'ver', 'vv']);
+
+  function restoreCommas(text) {
+    return text.replace(/(^|[\s(“"‘'])([A-Za-z][A-Za-z']*)\.(\s+)(?=[a-z])/g,
+      (whole, lead, word, gap) => {
+        // "e.g." and "i.e." have a stop inside the token, so the word captured
+        // is just "g" or "e"; single letters are left alone for that reason.
+        if (word.length < 2 || ABBREV.has(word.toLowerCase())) return whole;
+        return `${lead}${word},${gap}`;
+      });
   }
 
   // --- Columns --------------------------------------------------------------
@@ -149,13 +195,14 @@ const KamScanText = (() => {
       const r = stripVerseNumbers(text);
       text = r.text; removed = r.removed;
     }
+    if (o.commas !== false) text = restoreCommas(text);
     // Paragraphs read better than one wall, and the chunker downstream splits
     // on blank lines happily.
     text = text.split('\n').map(s => s.trim()).filter(Boolean).join('\n');
     return { text, versesRemoved: removed };
   }
 
-  return { clean, stripFurniture, joinWrapped, stripVerseNumbers, columnSlices };
+  return { clean, stripFurniture, joinWrapped, stripVerseNumbers, restoreCommas, columnSlices };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = KamScanText;
