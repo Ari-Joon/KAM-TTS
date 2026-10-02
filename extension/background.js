@@ -160,6 +160,15 @@ let sessionStartTs    = 0;     // when the current read began (epoch seconds)
 let playedChunks      = [];    // server ids of chunks fully played this session
 let chunkIdByIndex    = {};    // index -> real server chunk id (from X-Chunk-Id)
 let sessionDigestible = true;  // whether this read's chunks may be marked solid
+// What the server needs to keep chunks in reading order. readId names the read
+// (a jump stays in it, so the feed keeps numbering its chunks as one read);
+// _speakEpoch changes on every new read, jump and stop, and the server turns
+// away anything from an epoch older than the newest it has seen. Kept strictly
+// increasing even within one millisecond, since cancelling epoch N supersedes
+// N+1 too.
+let readId      = "";
+let _speakEpoch = 0;
+function _nextEpoch() { _speakEpoch = Math.max(Date.now(), _speakEpoch + 2); return _speakEpoch; }
 let sessionId         = 0;
 let readingTabId      = null;
 let _playSeqCounter   = 0;      // unique id per chunk play
@@ -283,6 +292,14 @@ function teardownPlayback() {
   isPlaying = false;
   for (const c of _speakAborts) { try { c.abort(); } catch (_) {} }
   _speakAborts.clear();
+  // Aborting here does not reach the server, whose threads would go on to
+  // synthesise every queued chunk of this run for nobody. So it is told.
+  if (_speakEpoch) {
+    kamFetch(`${SERVER}/speak/cancel`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ epoch: _speakEpoch }),
+    }).catch(() => {});
+  }
   // Teardown always leaves playback unpaused, since stopOffscreen lifts the
   // offscreen gate too. Nothing said so, though, so after a jump or a new read
   // started while paused the overlay and popup went on showing play while the
@@ -509,6 +526,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     currentChunkIndex = request.startIndex || 0;
     currentSpeed      = request.speed || 1.0;
     sessionStartTs    = Date.now() / 1000;   // session window for solid marking
+    readId            = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     playedChunks      = [];                   // ids of chunks fully heard this session
     chunkIdByIndex    = {};                   // reset per-read index->id map
     sessionDigestible = (request.digestible !== false);  // false for Custom Text
@@ -597,6 +615,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.runtime.sendMessage({ action: "pausedPlaying" }).catch(() => {});
       sendResponse({ status: "ok", isPaused });
     }
+    return true;
+  }
+
+  if (request.action === "prepareClear") {
+    prepareClear().then(sendResponse, () => sendResponse({ keep: [] }));
     return true;
   }
 
@@ -762,7 +785,7 @@ function detectPositionHint(rawText) {
 // there: it used to write its server id into the new chunkIdByIndex and
 // announce its old text as the chunk now playing, so a thumbs-up rated the
 // wrong chunk.
-async function fetchAudioBase64(text, idx, mySession) {
+async function fetchAudioBase64(text, idx, mySession, epoch) {
   const safe = sanitizeText(text);
   if (!safe || safe.length < 2) return null;
   const position = detectPositionHint(text);
@@ -773,9 +796,14 @@ async function fetchAudioBase64(text, idx, mySession) {
     const res = await kamFetch(`${SERVER}/speak`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-KAM-Token": KAM_TOKEN },
-      body: JSON.stringify({ text: safe, index: (idx != null ? idx + 1 : null), position: position }),
+      body: JSON.stringify({ text: safe, index: (idx != null ? idx + 1 : null), position: position,
+                             read_id: readId || null, read_ts: sessionStartTs || null,
+                             read_total: allChunks.length, epoch: epoch || null }),
       signal: controller.signal
     });
+    // 409: the server turned it away because a newer read began first. That
+    // is the ordering working, not a failure, so it is not logged as one.
+    if (res.status === 409) return null;
     if (!res.ok) throw new Error(`Server ${res.status}`);
     if (!current()) return null;     // superseded read; its audio is no use now
     // Record the server's id against this chunk's index, so the solid-digest
@@ -805,6 +833,7 @@ async function fetchAudioBase64(text, idx, mySession) {
 // =============================================================================
 
 async function speakChunks(mySession) {
+  const myEpoch = _nextEpoch();
   await ensurePlayer();
   if (isStopped || mySession !== sessionId) return;
 
@@ -816,7 +845,7 @@ async function speakChunks(mySession) {
   function prefetch(idx) {
     if (idx >= allChunks.length) return;
     if (prefetchCache[idx]) return;
-    prefetchCache[idx] = fetchAudioBase64(allChunks[idx], idx, mySession).catch((e) => {
+    prefetchCache[idx] = fetchAudioBase64(allChunks[idx], idx, mySession, myEpoch).catch((e) => {
       // Surface the failure: a silent null here looks like a mystery playback
       // crash. AbortError is normal teardown; everything else is logged.
       if (!e || e.name !== "AbortError") {
@@ -1002,15 +1031,29 @@ function announceChunk(idx) {
 // are never in playedChunks). Clears the list so a chunk is never digested
 // twice. No-op if nothing was played.
 function digestPlayedChunks() {
-  if (!sessionDigestible) { playedChunks = []; return; }  // Custom Text: never digest
-  if (!playedChunks.length) return;
+  if (!sessionDigestible) { playedChunks = []; return Promise.resolve(); }  // Custom Text: never digest
+  if (!playedChunks.length) return Promise.resolve();
   const ids = playedChunks.slice();
   playedChunks = [];
-  kamFetch(`${SERVER}/session/complete`, {
+  return kamFetch(`${SERVER}/session/complete`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-KAM-Token": KAM_TOKEN },
     body: JSON.stringify({ played: ids })
   }).catch(() => {});
+}
+
+// The dashboard is about to clear the chunk history. Mark what has been heard
+// as solid first, and name the current read's chunks that are made but not yet
+// heard so the clear keeps them and they can still be marked once heard.
+async function prepareClear() {
+  await digestPlayedChunks();
+  const keep = [];
+  if (isPlaying && !isStopped) {
+    for (const [i, id] of Object.entries(chunkIdByIndex)) {
+      if (Number(i) >= currentChunkIndex && id) keep.push(id);
+    }
+  }
+  return { keep };
 }
 
 // --- Warm start ---

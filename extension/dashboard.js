@@ -375,6 +375,10 @@ function _chunkCardHTML(row, q, verdict) {
   const fbDown = verdict === 'down' ? ' rejected'  : '';
   return `<div class="chunk-meta">`
     +(row.seq?`<span class="chunk-badge chunk-num">chunk ${row.seq}/${row.total}</span>`:'')
+    // Heard to the end with no verdict, so it was digested as acceptable and
+    // gently reinforced. Shown quietly, since it is not a user's judgement.
+    +(row.user_feedback === 'solid' && verdict !== 'up' && verdict !== 'down'
+        ? `<span class="chunk-badge chunk-solid" title="Heard to the end without a rating, so it was marked solid and gently reinforced">✓ solid</span>` : '')
     +`<span class="chunk-badge type-${row.sentence_type||''}">${row.sentence_type||'?'}</span>`
     +(row.primary_facet && row.primary_facet !== 'prose'
         ? `<span class="chunk-badge facet-${esc(row.primary_facet)}" title="Content facets detected in this chunk${row.facet_count>1?` (${row.facet_count} in total)`:''} — these shape how it is read and how it is learned from">${_FACET_ICON[row.primary_facet]||''} ${esc(row.primary_facet)}${row.facet_count>1?' +'+(row.facet_count-1):''}</span>`
@@ -535,7 +539,7 @@ function _renderChunkFeed(rows) {
     // the signature rather than the raw row value, so a click that the server
     // has not yet confirmed still redraws the buttons.
     const sig = [row.ts, q, row.quality_flags, verdict, reported, row.report_issue,
-                 row.whisper_accuracy, row.seq, row.total].join('|');
+                 row.whisper_accuracy, row.seq, row.total, row.user_feedback].join('|');
     if (card.dataset.sig !== sig) {
       card.innerHTML = _chunkCardHTML(row, q, verdict);
       card.dataset.sig = sig;
@@ -2739,6 +2743,16 @@ document.addEventListener('DOMContentLoaded',()=>{
   // Report
   const sub=document.getElementById('btn-submit'); if(sub) sub.addEventListener('click',submitReport);
 
+  function _prepareClear() {
+    return new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ action: 'prepareClear' }, r => {
+          resolve(chrome.runtime.lastError || !r ? { keep: [] } : r);
+        });
+      } catch (e) { resolve({ keep: [] }); }
+    });
+  }
+
   // Clear the chunk history, which resets the distinct-chunk count and fixes the
   // inflated counts from before content-hash dedup, without touching the rules,
   // history, or the voice baseline.
@@ -2746,7 +2760,12 @@ document.addEventListener('DOMContentLoaded',()=>{
   if (clrChunks) {
     clrChunks.addEventListener('click', () => {
       clrChunks.disabled = true;
-      api('/report/stats/reset', 'POST')
+      // Before anything is deleted, the worker marks what has been heard as
+      // solid and names the current read's chunks that are made but not yet
+      // heard, which are kept. Clearing used to delete both, so a clear mid-read
+      // threw away every solid that read would have earned.
+      _prepareClear()
+        .then(prep => api('/report/stats/reset', 'POST', { keep: prep.keep || [] }))
         .then(() => {
           _chunkCount = 0; _allChunks = [];
           const ctr = document.getElementById('chunk-counter'); if (ctr) ctr.textContent = '0 chunks';

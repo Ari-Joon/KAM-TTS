@@ -24,7 +24,7 @@ MODULES = (
     "server.py", "learner.py", "pos_prosody.py", "alignment.py",
     "register_host.py", "scan_host.py", "kam_host.py", "device.py",
     "audio_quality.py", "benchmark.py", "setup_kam.py",
-    "clean_voice_clips.py", "hardware_profile.py",
+    "clean_voice_clips.py", "hardware_profile.py", "speak_order.py",
 )
 
 

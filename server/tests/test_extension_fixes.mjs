@@ -192,16 +192,51 @@ function loadPlayback({ kamFetch, paused = false } = {}) {
   const w = new Function('chrome', 'kamFetch', 'stopPlayerAudio', 'sanitizeText', 'detectPositionHint', 'SERVER', `
     let sessionId = 1, isStopped = false, isPaused = ${paused}, isPlaying = true;
     let readingTabId = 5, _pendingPlay = {}, chunkIdByIndex = {}, KAM_TOKEN = "t";
+    let readId = 'read-1', sessionStartTs = 1000, allChunks = ['a', 'b', 'c', 'd'], _speakEpoch = 0;
     const _speakAborts = new Set();
     ${grab(bg, 'toReadingTab')}
     ${grab(bg, 'teardownPlayback')}
     ${grab(bg, 'fetchAudioBase64')}
     return { teardownPlayback, fetchAudioBase64, aborts: _speakAborts,
+             set epoch(v) { _speakEpoch = v; },
              get sessionId() { return sessionId; }, set sessionId(v) { sessionId = v; },
              get ids() { return chunkIdByIndex; }, get paused() { return isPaused; } };`)(
     chrome, kamFetch, () => {}, t => t, () => null, 'http://s');
   return { w, bcast, tabMsgs };
 }
+
+await section('each /speak names its read, place and epoch, and a 409 is quiet', async () => {
+  const bodies = [];
+  const reply = (status) => async (url, opts) => {
+    bodies.push([url, JSON.parse(opts.body)]);
+    return { ok: status === 200, status, headers: { get: () => 'id' }, arrayBuffer: async () => new Uint8Array([65]).buffer };
+  };
+  {
+    const { w } = loadPlayback({ kamFetch: reply(200) });
+    await w.fetchAudioBase64('chunk text', 2, 1, 777);
+    const b = bodies[0][1];
+    check('the read, its start, its length, the place and the epoch are sent',
+          [b.read_id, b.read_ts, b.read_total, b.index, b.epoch], ['read-1', 1000, 4, 3, 777]);
+  }
+  {
+    const { w } = loadPlayback({ kamFetch: reply(409) });
+    let threw = false, got;
+    try { got = await w.fetchAudioBase64('chunk text', 2, 1, 777); } catch (e) { threw = true; }
+    check('a 409 (a newer read began) is no audio, not an error', [threw, got], [false, null]);
+  }
+});
+
+await section('teardown tells the server to drop the run it stopped', async () => {
+  const calls = [];
+  const { w } = loadPlayback({ kamFetch: async (url, opts) => { calls.push([url, opts && opts.body]); return { ok: true }; } });
+  w.epoch = 4242;
+  w.teardownPlayback();
+  check('one cancel, naming the epoch', calls, [['http://s/speak/cancel', JSON.stringify({ epoch: 4242 })]]);
+  calls.length = 0;
+  const { w: w2 } = loadPlayback({ kamFetch: async (url) => { calls.push(url); return { ok: true }; } });
+  w2.teardownPlayback();
+  check('nothing to cancel before any run began', calls, []);
+});
 
 await section('every in-flight /speak is aborted on teardown', async () => {
   const signals = [];
@@ -280,6 +315,7 @@ await section('starting a new read digests the old one first', async () => {
     let playedChunks = [], chunkIdByIndex = {}, sessionDigestible = true, sessionId = 0;
     let readingTabId = null, _pendingPlay = {}, playerReady = false, playerTabId = null;
     let KAM_TOKEN = "t";
+    let readId = "", _speakEpoch = 0;
     const _speakAborts = new Set();
     ${grab(bg, 'toReadingTab')}
     ${grab(bg, 'teardownPlayback')}

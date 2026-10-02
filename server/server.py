@@ -251,6 +251,11 @@ def _read_text_file(path):
 
 # --- XTTS isn't thread safe, so only one inference at a time ---
 _inference_lock = _threading.Lock()
+# The order /speak requests take their turn in, in front of the lock above. See
+# speak_order.py: a lock alone let prefetched chunks synthesise in whatever
+# order their threads woke, and kept synthesising a stopped read's chunks.
+from speak_order import SpeakOrder as _SpeakOrder
+_speak_order = _SpeakOrder()
 
 # --- Standby / idle-eviction state ---
 # The XTTS model holds several GB of VRAM whether or not it's synthesising.
@@ -4075,6 +4080,7 @@ def speak():
         return jsonify({"error": "Text is empty"}), 400
     _chunk_no = data.get("index")
     _position = data.get("position")  # 'heading' | 'paragraph_end' | None
+    _read = _read_from(data)
 
     text = clean_text(raw)
 
@@ -4172,7 +4178,18 @@ def speak():
         time.sleep(0.1); _w += 0.1
 
     try:
-        return _synthesise_and_log(text, raw, _position, _chunk_no, _h)
+        # Take this chunk's turn in read order. A chunk from a read that has
+        # since been stopped or replaced is turned away before it reaches the
+        # GPU; the extension has already abandoned the request.
+        _epoch = _read.get("epoch") if _read else None
+        if not _speak_order.acquire(_epoch, _read.get("index") if _read else None):
+            print(f"  {C.SKIP}[SUPERSEDED]{C.RESET} {('#' + str(_chunk_no) + ' ') if _chunk_no else ''}"
+                  f"a newer read began: {text[:50]}")
+            return jsonify({"superseded": True}), 409
+        try:
+            return _synthesise_and_log(text, raw, _position, _chunk_no, _h, _read)
+        finally:
+            _speak_order.release(_epoch)
     finally:
         # Release an unfulfilled reservation so a retry is not made to wait.
         if _reserved:
@@ -4181,7 +4198,43 @@ def speak():
                     _dedup_cache.pop(_h, None)
 
 
-def _synthesise_and_log(text, raw, position, chunk_no, dedup_key):
+def _read_from(data):
+    """Where this chunk sits in what is being read, from the request. The
+    extension sends the read's id, its start time, the chunk's position and the
+    read's length, plus an epoch that changes on every new read, jump and stop.
+    Anything missing or malformed means no read, never an error."""
+    try:
+        rid = data.get("read_id")
+        if not rid:
+            return None
+        def _int(v):
+            return int(v) if v is not None and str(v).lstrip("-").isdigit() else None
+        def _num(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        return {"id": str(rid)[:64], "index": _int(data.get("index")),
+                "total": _int(data.get("read_total")), "ts": _num(data.get("read_ts")),
+                "epoch": _num(data.get("epoch"))}
+    except Exception:
+        return None
+
+
+@app.route("/speak/cancel", methods=["POST"])
+def speak_cancel():
+    """The extension stopped or jumped: everything still queued from that epoch
+    gives up instead of being synthesised for nobody."""
+    d = request.get_json(silent=True) or {}
+    try:
+        epoch = float(d.get("epoch"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "epoch required"}), 400
+    _speak_order.cancel(epoch)
+    return jsonify({"ok": True, "waiting": len(_speak_order.waiting())})
+
+
+def _synthesise_and_log(text, raw, position, chunk_no, dedup_key, read=None):
     """Synthesise one prepared chunk, persist everything known about it, and
     return the audio response. Split out of speak() so the dedup reservation
     can be released in a finally block around the whole of it."""
@@ -4207,7 +4260,7 @@ def _synthesise_and_log(text, raw, position, chunk_no, dedup_key):
         # The text cleaned to nothing, which isn't a failure, there's just
         # nothing to say.
         print(f"  {C.SKIP}[SKIP] {ve}{C.RESET}")
-        _learner.log_error(text, error_type="EMPTY", stage="clean",
+        _learner.log_error(text, error_type="EMPTY", stage="clean", read=read,
                            message=str(ve), fatal=False)
         return _silence_response()
     except Exception as first_err:
@@ -4233,7 +4286,7 @@ def _synthesise_and_log(text, raw, position, chunk_no, dedup_key):
             chunk_id = _learner.log_error(
                 text, error_type=last["type"], stage=last["stage"],
                 message=last["message"], attempts=attempts,
-                display_text=clean_display_text(raw), fatal=True)
+                display_text=clean_display_text(raw), fatal=True, read=read)
             # Return the id alongside the error so the failure is addressable:
             # GET /diagnose/<id> explains exactly what happened to this chunk.
             return jsonify({"error": last["message"], "error_type": last["type"],
@@ -4281,7 +4334,7 @@ def _synthesise_and_log(text, raw, position, chunk_no, dedup_key):
             if _analysis_counter % _ANALYSIS_EVERY == 0:
                 _analysis_wav = _wb
         chunk_id = _learner.log_chunk(
-            text, ctx.sentence_type, ctx.silence_ms,
+            text, ctx.sentence_type, ctx.silence_ms, read=read,
             wav_bytes=_analysis_wav, display_text=_display,
             synth_params=ctx.used_params,
             has_math=_has_math,
@@ -4592,9 +4645,13 @@ def report_stats():
 
 @app.route("/report/stats/reset", methods=["POST"])
 def reset_stats():
-    """Clear all the chunk history, which resets the stats page to zero."""
-    _learner.reset_stats()
-    return jsonify({"ok": True})
+    """Clear the chunk history, which resets the stats page to zero. The
+    dashboard passes the current read's chunks that are made but not yet heard
+    as `keep`, so they can still be marked solid once they are."""
+    d = request.get_json(silent=True) or {}
+    keep = d.get("keep") if isinstance(d.get("keep"), list) else None
+    _learner.reset_stats(keep_ids=[str(k)[:32] for k in keep] if keep else None)
+    return jsonify({"ok": True, "kept": len(keep or [])})
 
 
 @app.route("/report/learning", methods=["GET"])

@@ -99,6 +99,8 @@ await section('chunkReady is sent as each chunk starts to play', async () => {
     let chunkIdByIndex = {}, playedChunks = [], sessionId = 1, _playSeqCounter = 0, _pendingPlay = {};
     let _hwPrefetchTarget = 3, KAM_TOKEN = 't', readingTabId = null, currentFetchAbort = null;
     const _speakAborts = new Set();
+    let readId = 'r1', sessionStartTs = 100, _speakEpoch = 0;
+    ${opt(bg, '_nextEpoch')}
     ${grab(bg, 'fetchAudioBase64')}
     ${opt(bg, 'announceChunk')}
     ${grab(bg, 'speakChunks')}

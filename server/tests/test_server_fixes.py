@@ -390,7 +390,7 @@ def _():
 def _():
     produced = []
 
-    def fake_synth(text, raw, position, chunk_no, dedup_key):
+    def fake_synth(text, raw, position, chunk_no, dedup_key, read=None):
         produced.append(text)
         return "SYNTH"
 

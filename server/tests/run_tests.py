@@ -50,6 +50,8 @@ SUITES = [
     ("voiceclips",    "test_voiceclips.py",   "recording, transcripts, clip slots"),
     ("server_fixes",  "test_server_fixes.py", "voice ids, atomic writes, verdicts kept, skips obeyed"),
     ("learning_loop", "test_learning_loop.py", "reports that change speech, and only real words"),
+    ("speak_order",   "test_speak_order.py",  "chunks synthesised in reading order"),
+    ("read_order",    "test_read_order.py",   "the feed in reading order; clear keeps solids"),
     ("report_client", "test_report_client.mjs", "feedback names the chunk being heard"),
     ("ext_fixes",     "test_extension_fixes.mjs", "aborts, token refresh, audio cleanup, volume"),
     ("updater",       "test_updater.py",      "installing a newer release, and every refusal"),

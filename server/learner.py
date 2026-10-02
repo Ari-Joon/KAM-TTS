@@ -366,7 +366,14 @@ def _run_migrations():
                      "rejected INTEGER", "output_check TEXT",
                      # Whether the current verdict bumped a lifetime counter, so
                      # a revert only takes back a count that was really added.
-                     "verdict_counted INTEGER"):
+                     "verdict_counted INTEGER",
+                     # Where the chunk sat in what was being read: which read,
+                     # its position, how long the read was, and when the read
+                     # began. The live feed orders and labels by these, since
+                     # the order chunks finish synthesising in is not the order
+                     # they are read in.
+                     "read_id TEXT", "read_index INTEGER", "read_total INTEGER",
+                     "read_ts REAL"):
             try:
                 conn.execute(f"ALTER TABLE chunks ADD COLUMN {_col.split()[0]} {_col.split()[1]}")
             except Exception:
@@ -1339,9 +1346,23 @@ def _upsert_sql(cols, clear_errors=True):
             f"ON CONFLICT(id) DO UPDATE SET {sets}")
 
 
+def _set_read_position(conn, chunk_id, read):
+    """Record where a chunk sits in the read it was made for. Separate from the
+    upsert so a request that carries no read (the benchmark, a direct API call)
+    leaves an existing position alone rather than blanking it."""
+    if not read or not read.get("id"):
+        return
+    try:
+        conn.execute("UPDATE chunks SET read_id=?, read_index=?, read_total=?, read_ts=? "
+                     "WHERE id=?", (str(read["id"])[:64], read.get("index"),
+                                    read.get("total"), read.get("ts"), chunk_id))
+    except Exception as e:
+        print(f"[LEARNER] read position not stored ({e})")
+
+
 def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
               display_text=None, synth_params=None, prosody=None, has_math=False,
-              profile_str=None):
+              profile_str=None, read=None):
     """
     Called by server.py after every successful synthesis.
     Logs the chunk and queues background quality analysis.
@@ -1416,6 +1437,7 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
             conn.execute(_upsert_sql(_SYNTH_COLS_MINIMAL, clear_errors=False),
                          (chunk_id, time.time(), stored_text, sentence_type, silence_ms,
                           len(stored_text), 1))
+        _set_read_position(conn, chunk_id, read)
         conn.commit()
         conn.close()
 
@@ -1444,7 +1466,7 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
 
 
 def log_error(text, error_type="ERROR", stage="inference", message="",
-              attempts=None, display_text=None, fatal=True):
+              attempts=None, display_text=None, fatal=True, read=None):
     """Record a synthesis failure with enough detail to diagnose it later.
 
     This used to write a row with a random uuid, sentence_type='ERROR' and
@@ -1483,6 +1505,7 @@ def log_error(text, error_type="ERROR", stage="inference", message="",
                     (id, ts, text, sentence_type, silence_ms, char_count, success)
                 VALUES (?, ?, ?, 'ERROR', 0, ?, 0)
             """, (chunk_id, time.time(), stored_text, len(stored_text or "")))
+        _set_read_position(conn, chunk_id, read)
         conn.commit()
         conn.close()
 
@@ -4178,6 +4201,7 @@ def mark_session_solid(since_ts=None, played=None):
                                   output, which never outweighs an explicit
                                   verdict."""
     marked = 0
+    missing = 0   # heard, but no longer in the chunk history
     stype_counts = {}
     # Per sentence type, the temperatures those solid chunks were ACTUALLY
     # synthesised with. Reinforcement below moves toward the mean of these
@@ -4206,6 +4230,11 @@ def mark_session_solid(since_ts=None, played=None):
                     "SELECT sentence_type, user_feedback, used_temperature "
                     "FROM chunks WHERE id=?", (cid,)).fetchone()
                 if not row:
+                    # Heard, but its row is gone: the chunk history was
+                    # cleared after it was made. It cannot be reinforced
+                    # without the settings it was made with, but it is
+                    # counted and said, rather than vanishing silently.
+                    missing += 1
                     continue
                 stype, fb, used_temp = row[0], row[1], row[2]
                 if fb:   # already perfect, negative or solid, so leave it
@@ -4290,7 +4319,11 @@ def mark_session_solid(since_ts=None, played=None):
                         f"{marked} chunks solid · temp {moves}", "auto")
         else:
             log_history("CONFIRM", f"{marked} chunks solid", "auto")
-    return {"ok": True, "solid": marked}
+    if missing:
+        print(f"[LEARNER] {missing} heard chunk(s) not marked solid: "
+              f"no longer in the chunk history (cleared after they were made)")
+        bump_counter("solid_missed_total", missing)
+    return {"ok": True, "solid": marked, "missing": missing}
 
 
 def get_stats():
@@ -4654,14 +4687,25 @@ def get_chunk_feed(limit=20):
                        AS report_count,
                    (SELECT r.issue FROM reports r WHERE r.chunk_id = c.id
                         ORDER BY r.ts DESC, r.rowid DESC LIMIT 1) AS report_issue
-            FROM chunks c ORDER BY c.ts DESC LIMIT ?
+                   , c.read_id, c.read_index, c.read_total
+            FROM chunks c
+            ORDER BY COALESCE(c.read_ts, c.ts) DESC,
+                     COALESCE(c.read_index, 0) DESC,
+                     c.ts DESC
+            LIMIT ?
         """, (limit,)).fetchall()
         conn.close()
     out = []
     for i, r in enumerate(rows):
         d = dict(r)
-        d["seq"]   = total - i   # newest row (i=0) = total
-        d["total"] = total
+        if d.get("read_index") is not None and d.get("read_total"):
+            # Its place in what was being read, which is what "chunk 3/9" is
+            # taken to mean.
+            d["seq"]   = d["read_index"]
+            d["total"] = d["read_total"]
+        else:
+            d["seq"]   = total - i   # rows from before reads were recorded
+            d["total"] = total
         out.append(d)
     return out
 
@@ -4705,7 +4749,7 @@ def get_chunks_filtered(limit=100, offset=0, filter_type="all"):
 
     return {"total": total, "offset": offset, "chunks": ranked}
 
-def reset_stats():
+def reset_stats(keep_ids=None):
     """Clear only the per-session chunk analysis, which resets the dashboard's
     live stats and feed to zero.
 
@@ -4716,8 +4760,17 @@ def reset_stats():
     clear, and that was wrong."""
     with _db_lock:
         conn = _get_db()
-        conn.execute("DELETE FROM chunks")
+        keep = [k for k in (keep_ids or []) if k][:500]
+        if keep:
+            # The read in progress keeps its chunks, so the ones already made
+            # but not yet heard can still be marked solid when they are heard.
+            # Deleting them is how a clear mid-read used to lose them.
+            marks = ",".join("?" for _ in keep)
+            conn.execute(f"DELETE FROM chunks WHERE id NOT IN ({marks})", keep)
+        else:
+            conn.execute("DELETE FROM chunks")
         conn.commit()
         conn.close()
     print("[LEARNER] Per-session chunk history cleared "
-          "(rules, history & voice baseline preserved)")
+          f"(rules, history & voice baseline preserved"
+          f"{f'; {len(keep)} chunk(s) of the current read kept' if keep else ''})")
