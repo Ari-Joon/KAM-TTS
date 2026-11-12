@@ -203,6 +203,28 @@ SR_OUT = 24000
 # longer than its text can account for is the classic runaway generation.
 _MS_PER_CHAR       = 0.070
 _RUNAWAY_FACTOR    = 1.9     # longer than this x expected = almost certainly babble
+# A fixed allowance on top of that. The per-character rate holds for a
+# sentence and not for a heading: a word or two is said slowly and carefully,
+# so "Overview." takes 1.2 to 1.4 s where the rate predicts 0.55, and with a
+# purely multiplicative limit every clean reading of it was a "runaway". Since
+# August all 28 rejected attempts were of this kind, in chunks of 8 words or
+# fewer, and half of those chunks used all three attempts and then shipped the
+# last one flagged as flawed. Measured on 32 short headings from the real
+# model, with Whisper to say which really ran on: the old rule rejected 17,
+# of which 6 had run on; with half a second of allowance, and the length taken
+# between the first and last sound rather than over the padding too, it
+# rejects those 6 and nothing else.
+_RUNAWAY_ALLOWANCE_S = 0.5
+# XTTS generates about this many audio tokens per second of speech at speed
+# 1.0 (measured: 1113.5 output samples per token at 24 kHz). speed stretches
+# the audio after generation, so tokens = seconds x speed x this.
+_TOKENS_PER_S      = 21.55
+# Room above the rejection threshold for the silence either side of the speech,
+# so a reading that would pass is never cut short by the ceiling.
+_TOKEN_HEADROOM    = 8
+# The library stops at 605 whatever it is asked for, and a ceiling above that
+# would replace its limit with a larger one, so mine never exceeds this.
+_TOKEN_MAX         = 600
 _TRUNCATED_FACTOR  = 0.35    # shorter than this x expected = cut off early
 _MIN_SPEECH_FRAC   = 0.25    # at least this much of the clip must be above the floor
 _TAIL_ENERGY_HOT   = 0.55    # ending this loud (vs peak) means it was cut mid-word
@@ -225,6 +247,7 @@ class OutputCheck:
     problem:    Optional[str] = None    # runaway | looping | truncated | dead | ""
     detail:     str = ""
     duration_s: float = 0.0
+    spoken_s:   float = 0.0             # first sound to last, without the padding
     expected_s: float = 0.0
     speech_frac: float = 0.0
     tail_ratio: float = 0.0
@@ -232,9 +255,44 @@ class OutputCheck:
     def as_dict(self) -> dict:
         return {"ok": self.ok, "problem": self.problem, "detail": self.detail,
                 "duration_s": round(self.duration_s, 2),
+                "spoken_s": round(self.spoken_s, 2),
                 "expected_s": round(self.expected_s, 2),
                 "speech_frac": round(self.speech_frac, 3),
                 "tail_ratio": round(self.tail_ratio, 3)}
+
+
+def expected_seconds(text_len: int, speed: float = 1.0) -> float:
+    """How long this many characters should take to say at this speed."""
+    return max(0.25, text_len * _MS_PER_CHAR / max(0.5, speed))
+
+
+def runaway_limit_s(text_len: int, speed: float = 1.0) -> float:
+    """Seconds of speech beyond which a chunk of this many characters is taken
+    to have run on past its text. The one place the limit is worked out, so the
+    check, the token ceiling and the trim in process_audio cannot disagree."""
+    return expected_seconds(text_len, speed) * _RUNAWAY_FACTOR + _RUNAWAY_ALLOWANCE_S
+
+
+def token_ceiling(text_len: int, speed: float = 1.0) -> int:
+    """The most audio tokens worth generating for a chunk of this length.
+
+    Generation used to be unbounded, so a real runaway ran to the library's
+    limit of 605 tokens, about 28 seconds of audio and several seconds of GPU,
+    before the check saw it and threw it away. This sits just above the
+    rejection threshold, so anything that reaches it would have been rejected
+    anyway and anything that would pass is untouched. It comes out at about
+    2.9 x characters + 20."""
+    seconds = runaway_limit_s(text_len, speed) * max(0.5, speed)
+    return min(_TOKEN_MAX, int(seconds * _TOKENS_PER_S) + 1 + _TOKEN_HEADROOM)
+
+
+def hit_token_ceiling(n_samples: int, ceiling: Optional[int], speed: float = 1.0) -> bool:
+    """True when a waveform is as long as its token ceiling allows, meaning
+    generation was stopped by the ceiling rather than by the model."""
+    if not ceiling:
+        return False
+    full = ceiling * (SR_OUT / _TOKENS_PER_S) / max(0.05, speed)
+    return n_samples >= full - SR_OUT / _TOKENS_PER_S
 
 
 def _looks_looped(audio: np.ndarray) -> bool:
@@ -283,12 +341,16 @@ def _looks_looped(audio: np.ndarray) -> bool:
     return False
 
 
-def check_output(wav, text_len: int, speed: float = 1.0) -> OutputCheck:
+def check_output(wav, text_len: int, speed: float = 1.0, capped: bool = False) -> OutputCheck:
     """Check a synthesised waveform against the text it was supposed to speak.
 
     I run this before the audio gets post-processed and returned, so a failure
     can be retried at a steadier temperature instead of going out and then being
-    scored badly by the listen-back pass a minute later."""
+    scored badly by the listen-back pass a minute later.
+
+    capped says generation was stopped by its token ceiling (see
+    token_ceiling). That is a runaway whatever the waveform looks like, since
+    the model had not finished when it was cut off."""
     audio = np.asarray(wav, dtype=np.float32)
     res = OutputCheck()
     if audio.size == 0:
@@ -296,7 +358,7 @@ def check_output(wav, text_len: int, speed: float = 1.0) -> OutputCheck:
         return res
 
     res.duration_s = len(audio) / float(SR_OUT)
-    res.expected_s = max(0.25, text_len * _MS_PER_CHAR / max(0.5, speed))
+    res.expected_s = expected_seconds(text_len, speed)
 
     mag = np.abs(audio)
     peak = float(mag.max())
@@ -309,11 +371,20 @@ def check_output(wav, text_len: int, speed: float = 1.0) -> OutputCheck:
     tail = mag[-int(SR_OUT * 0.05):] if len(mag) > SR_OUT * 0.05 else mag
     res.tail_ratio = float(tail.mean() / (peak + 1e-9))
 
-    if res.duration_s > res.expected_s * _RUNAWAY_FACTOR:
+    # The length that counts is from the first sound to the last. XTTS pads a
+    # chunk with up to a fifth of a second of near-silence, which is trimmed
+    # before anyone hears it, and on a one-word heading that padding alone was
+    # a large part of the old limit. The floor is the trim's own, 1% of peak.
+    loud = np.flatnonzero(mag > 0.01 * peak)
+    res.spoken_s = (int(loud[-1]) - int(loud[0]) + 1) / float(SR_OUT)
+
+    limit = runaway_limit_s(text_len, speed)
+    if capped or res.spoken_s > limit:
         res.ok, res.problem = False, "runaway"
-        res.detail = (f"{res.duration_s:.1f}s of audio for {text_len} characters "
-                      f"(expected about {res.expected_s:.1f}s) — the model did not "
-                      f"stop where the text ended")
+        res.detail = (f"{res.spoken_s:.1f}s of speech for {text_len} characters "
+                      f"(expected about {res.expected_s:.1f}s, limit {limit:.1f}s) — "
+                      + ("generation was stopped at its token ceiling" if capped
+                         else "the model did not stop where the text ended"))
         return res
 
     if _looks_looped(audio):

@@ -94,5 +94,62 @@ ran, dropped = run(o, [(0.0, None, None), (0.0, 3, 1), (0.01, 4, 1), (0.02, None
 check("both untagged requests ran", sum(1 for e, _ in ran if e is None), 2)
 check("only the superseded epoch was dropped", dropped, [] if (3, 1) in ran else [(3, 1)])
 
+print("\n=== the chunk a run starts on does not wait to be gathered ===")
+# A long gather, so the difference is far outside timing noise: without head
+# the lone request waits the whole gather, with it not at all.
+class SlowGather(SpeakOrder):
+    GATHER_S = 0.6
+
+def timed(o, *a, **k):
+    t0 = time.monotonic()
+    ok = o.acquire(*a, **k)
+    took = time.monotonic() - t0
+    if ok: o.release(a[0])
+    return ok, took
+
+ok, took = timed(SlowGather(), 1, 0)
+check("without head the first request of an epoch waits the gather", (ok, took >= 0.5), (True, True))
+ok, took = timed(SlowGather(), 1, 0, head=True)
+check("with head it goes at once", (ok, took < 0.2), (True, True))
+
+# A sibling that landed first is waiting out the gather when the head arrives:
+# the head ends the gather, goes first, and the sibling follows straight after.
+o = SlowGather()
+order, lock = [], threading.Lock()
+def sib():
+    if o.acquire(7, 5):
+        with lock: order.append(5)
+        o.release(7)
+def head():
+    time.sleep(0.05)
+    if o.acquire(7, 4, head=True):
+        with lock: order.append(4)
+        time.sleep(0.02); o.release(7)
+t0 = time.monotonic()
+ts = [threading.Thread(target=sib), threading.Thread(target=head)]
+for t in ts: t.start()
+for t in ts: t.join(5)
+check("the head goes before a sibling that arrived earlier", order, [4, 5])
+check("and neither waited out the gather", time.monotonic() - t0 < 0.4, True)
+check("a head with no epoch is an ordinary untagged request",
+      timed(SlowGather(), None, None, head=True)[0], True)
+
+print("\n=== a request that already has its turn can ask if it was superseded ===")
+o = SpeakOrder()
+o.acquire(3, 1, head=True)
+check("not while its own epoch is the newest", o.is_superseded(3), False)
+o.cancel(3)
+check("a stop supersedes the chunk that is being synthesised", o.is_superseded(3), True)
+o.release(3)
+o = SpeakOrder()
+o.acquire(3, 1, head=True)
+threading.Thread(target=lambda: o.acquire(4, 1)).start()   # the jump, waiting its turn
+time.sleep(0.1)
+check("so does a newer read, while the old chunk is still running", o.is_superseded(3), True)
+o.release(3)
+time.sleep(0.3); o.release(4)
+check("the newer read itself is not superseded", o.is_superseded(4), False)
+check("and a request with no epoch never is", o.is_superseded(None), False)
+
 print(f"\n{'='*64}\n  {PASS} passed, {FAIL} failed\n{'='*64}")
 sys.exit(1 if FAIL else 0)

@@ -219,8 +219,10 @@ def _():
           L.apply_learned_rules("zorblaxes and zorblax remain"), "zorblaxes and  remain")
 
 
-@section("3. autotune speed is a trim, and today's speeds are kept")
+@section("3. autotune leaves speed alone")
 def _():
+    # Speed used to be tuned per profile as a trim, speed_mod. It is not tuned
+    # at all now: the evidence below would have moved it, and must not.
     L.set_active_voice("speedtest")
     L.set_autotune(True)
     prof = "simple|medium|clean|plain"
@@ -245,10 +247,11 @@ def _():
     conn.close()
     heard_before = L.resolve_profile_param(kept, "speed_mod", 1.0)
     L._last_autotune_ts = 0
-    L.run_autotune_cycle()
-    mod = L.resolve_profile_param(prof, "speed_mod", 1.0)
-    check("a new trim starts at 1.0 and steps once, not from the 1.38 median", mod, 0.99)
-    check("an existing trim with no new evidence is untouched",
+    acts = L.run_autotune_cycle()
+    check("clear evidence about speed starts no trim",
+          "speed_mod" in (store().get(L._vk(f"prof:{prof}")) or {}), False)
+    check("and the cycle reports no speed change", [a for a in acts if "speed" in a], [])
+    check("a stored trim is not written to either",
           L.resolve_profile_param(kept, "speed_mod", 1.0), heard_before)
     check("the tuner no longer writes temperature",
           "temperature" in (store().get(L._vk(f"prof:{prof}")) or {}), False)

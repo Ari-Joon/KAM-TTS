@@ -91,11 +91,14 @@ ns = {}
 exec(compile(ast.Module([fn], []), "server._read_from", "exec"), ns)
 rf = ns["_read_from"]
 check("a full request", rf({"read_id": "r1", "index": 3, "read_total": 9, "read_ts": 12.5, "epoch": 77}),
-      {"id": "r1", "index": 3, "total": 9, "ts": 12.5, "epoch": 77.0})
+      {"id": "r1", "index": 3, "total": 9, "ts": 12.5, "epoch": 77.0, "head": False})
+check("the chunk a run starts on says so",
+      rf({"read_id": "r1", "index": 3, "epoch": 77, "head": True})["head"], True)
+check("and only a real true counts", rf({"read_id": "r1", "head": "yes"})["head"], False)
 check("no read id means no read", rf({"index": 3}), None)
 check("junk values become None, never an error",
       rf({"read_id": "r1", "index": "x", "read_total": None, "read_ts": "nope", "epoch": "?"}),
-      {"id": "r1", "index": None, "total": None, "ts": None, "epoch": None})
+      {"id": "r1", "index": None, "total": None, "ts": None, "epoch": None, "head": False})
 
 shutil.rmtree(HERE, ignore_errors=True)
 print(f"\n{'='*64}\n  {PASS} passed, {FAIL} failed\n{'='*64}")

@@ -488,6 +488,26 @@ def _load_or_create_token():
 KAM_TOKEN = _load_or_create_token()
 CORS(app, resources={r"/*": {"origins": _EXTENSION_ORIGINS}}, supports_credentials=False)
 
+# The port the server listens on, in one place: the bind and the
+# duplicate-instance probe in __main__ and the Host check below all read it.
+KAM_PORT = 5050
+
+# --- Host check ---
+# GET /token needs no token, by design, since it is how the extension gets one,
+# and CORS is what stops a web page reading the reply. CORS goes by origin,
+# though, and a page can make its own hostname resolve to 127.0.0.1 (DNS
+# rebinding). The browser then treats this server as part of the page's own
+# site, the read is same-origin, CORS never comes into it, and the page has the
+# token. What such a request cannot do is name this server: the browser puts
+# the attacker's hostname in the Host header. So a request that is not
+# addressed to this machine by a loopback name on this port is refused before
+# anything else looks at it, the preflight and /health included.
+_ALLOWED_HOSTS = frozenset(f"{h}:{KAM_PORT}" for h in ("127.0.0.1", "localhost", "[::1]"))
+
+
+def _host_allowed(host):
+    return (host or "").strip().lower() in _ALLOWED_HOSTS
+
 @app.route("/token", methods=["GET"])
 def get_token():
     """Hands the per-install token to the extension. CORS restricts READING
@@ -496,6 +516,13 @@ def get_token():
 
 @app.before_request
 def _require_token():
+    _host = request.headers.get("Host")
+    if not _host_allowed(_host):
+        # The header is whatever the caller sent, so it is cut short and
+        # printed as a literal.
+        print(f"  [WARN] rejected request to {request.path} (Host {str(_host)[:60]!r} "
+              f"is not this server)")
+        return jsonify({"error": "forbidden host"}), 403
     # OPTIONS preflights carry no custom headers by design; /health is a
     # harmless status ping and /token is how clients bootstrap their auth.
     if request.method == "OPTIONS" or request.path in ("/health", "/token"):
@@ -508,6 +535,29 @@ def _require_token():
 _dedup_cache  = {}
 _dedup_lock   = _threading.Lock()
 _DEDUP_WINDOW = 15.0
+
+# --- Private reads ---
+# A /speak that carries "private": true is for text the user does not want
+# kept: an incognito tab, or the popup's private switch. The chunk is still
+# spoken, counted and open to feedback, but its words are not written anywhere:
+# not to the database (see log_chunk), not to the history, and not to the
+# console, which the dashboard shows and the log file keeps.
+#
+# The flag lives on the request's own thread rather than being passed down,
+# because the lines that echo text are spread through the whole pipeline, from
+# the cleaning rules to the dedup cache, and one that was missed would leak. A
+# line that shows chunk text asks _echo for it.
+_private_read = _threading.local()
+
+
+def _is_private():
+    return bool(getattr(_private_read, "on", False))
+
+
+def _echo(text, limit=60):
+    """Chunk text as a log line may show it: its first characters, or the
+    word "(private)" when the chunk being handled is from a private read."""
+    return "(private)" if _is_private() else str(text)[:limit]
 
 import time as _time
 
@@ -937,6 +987,7 @@ def load_model():
     use_ds = (DEV.backend == "cuda" and _ds_probe.find_spec("deepspeed") is not None)
 
     tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+    _STARTUP_TIMINGS["load_s"] = round(_time.time() - t0, 2)
     print(f"[STARTUP] Model weights loaded in {_time.time()-t0:.1f}s"
           + (" (DeepSpeed available)" if use_ds else ""))
 
@@ -949,7 +1000,9 @@ def load_model():
         except Exception as e:
             print(f"[STARTUP] DeepSpeed enable skipped: {e}")
 
+    _t_lat = _time.time()
     _load_active_latents()
+    _STARTUP_TIMINGS["latent_s"] = round(_time.time() - _t_lat, 2)
 
     # I deliberately don't call torch.cuda.empty_cache() here. The
     # standalone benchmark (which runs inference in ~3s) never does, and
@@ -1003,6 +1056,11 @@ def _report_reference_coverage():
 _WARMUP_TEXT = ("The quick brown fox jumps over the lazy dog. "
                 "She uses Python, JavaScript, and SQL daily.")
 
+# How long the last model load, latent restore and warm-up took, in seconds.
+# Together they are what waking from standby costs on this machine, which is
+# what _apply_hardware_adaptation weighs a standby timeout against.
+_STARTUP_TIMINGS = {"load_s": None, "latent_s": None, "warm_s": None}
+
 def _warm_model():
     """Compile the per-process CUDA and cuDNN kernels for the autoregressive
     path. Those caches die with the process, so this has to run on every fresh
@@ -1018,6 +1076,7 @@ def _warm_model():
                 temperature=0.33, repetition_penalty=4.1,
                 top_k=45, top_p=0.90, do_sample=True, num_beams=1, speed=1.20,
             )
+        _STARTUP_TIMINGS["warm_s"] = round(_time.time() - t0, 2)
         print(f"[STARTUP] Model warmed in {_time.time()-t0:.1f}s")
     except Exception as e:
         print(f"[STARTUP] Warmup failed (non-fatal): {e}")
@@ -1043,24 +1102,39 @@ def _reload_model():
         load_model()
 
 
-def evict_model():
+def evict_model(idle_only=False):
     """Drop the XTTS model from VRAM and enter STANDBY. The server keeps running
-    and listening; the next synthesis request wakes it. Idempotent."""
+    and listening; the next synthesis request wakes it. Idempotent.
+
+    The inference lock is held while the model is dropped. It was not, so a
+    request that arrived just as the timeout fired could pass its "is the model
+    ready" check and then find the model gone from under it. The lock order,
+    standby then inference, is the one _reload_model uses.
+
+    idle_only is the idle monitor's call. Having waited for the lock it looks
+    at the clock again, since a request that came in meanwhile reset it (see
+    generate_speech, which touches the clock before it checks the model), and
+    then the model is not idle after all."""
     global tts, gpt_cond_latent, speaker_embedding, _model_state
     with _standby_lock:
         if _model_state != "ready":
             return
-        print("[STANDBY] Idle timeout reached — evicting model from VRAM")
-        try:
-            tts = None
-            gpt_cond_latent = None
-            speaker_embedding = None
-            import gc as _gc
-            _gc.collect()
-            _device.empty_cache(DEV)   # correct call for whichever backend is live
-        except Exception as e:
-            print(f"[STANDBY] evict error: {e}")
-        _model_state = "standby"
+        with _inference_lock:
+            if idle_only and (_IDLE_TIMEOUT_SEC <= 0
+                              or _time.time() - _last_synth_ts < _IDLE_TIMEOUT_SEC):
+                return
+            print("[STANDBY] Idle timeout reached — evicting model from VRAM" if idle_only
+                  else "[STANDBY] Evicting model from VRAM")
+            try:
+                tts = None
+                gpt_cond_latent = None
+                speaker_embedding = None
+                import gc as _gc
+                _gc.collect()
+                _device.empty_cache(DEV)   # correct call for whichever backend is live
+            except Exception as e:
+                print(f"[STANDBY] evict error: {e}")
+            _model_state = "standby"
         _stage("standby")
         print("[STANDBY] Now in standby — minimal resources, ready to wake")
 
@@ -1108,7 +1182,7 @@ def _idle_monitor():
                 continue
             idle = _time.time() - _last_synth_ts
             if idle >= _IDLE_TIMEOUT_SEC:
-                evict_model()
+                evict_model(idle_only=True)
         except Exception as e:
             print(f"[STANDBY] idle monitor error: {e}")
 
@@ -1191,6 +1265,8 @@ def _write_detected_profile(facts):
     payload["measured_at"] = _time.time()
     payload["source"] = "auto"        # vs "profiler" when the tool wrote it
     payload["rtf"] = None             # unknown until the profiler runs
+    # The load and warm-up this process has just been through are known, though.
+    payload.update({k: v for k, v in _STARTUP_TIMINGS.items() if v is not None})
     try:
         _write_json_atomic(_hw_profile_path(), payload, indent=2)
         print("[HW] Wrote a hardware profile from auto-detection.")
@@ -1228,6 +1304,41 @@ def _load_hardware_profile():
     return _write_detected_profile(facts)
 
 
+def _record_startup_timings():
+    """Put this start's measured load and warm-up times into the saved profile.
+
+    _apply_hardware_adaptation reads load_s and warm_s to tell a machine that
+    is slow to wake, which deserves a long standby timeout, but nothing ever
+    wrote them. The server's own benchmark copied them from the previous
+    profile, which never had them either, so they stayed null and that branch
+    could not fire on any install.
+
+    Only a profile that already exists and belongs to this machine is touched.
+    On a first boot the benchmark or the auto-detection writes it, and both
+    now include the timings themselves. Returns True when the file changed."""
+    measured = {k: v for k, v in _STARTUP_TIMINGS.items() if v is not None}
+    if not measured:
+        return False
+    try:
+        with open(_hw_profile_path(), encoding="utf-8") as f:
+            hp = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(hp, dict) or not _profile_matches_machine(hp, _detect_machine_now()):
+        return False
+    if all(hp.get(k) == v for k, v in measured.items()):
+        return False
+    hp.update(measured)
+    try:
+        _write_json_atomic(_hw_profile_path(), hp, indent=2)
+    except Exception as e:
+        print(f"[HW] could not save the startup timings: {e}")
+        return False
+    print("[HW] Startup timings recorded: "
+          + ", ".join(f"{k} {v:.1f}s" for k, v in measured.items()))
+    return True
+
+
 def _apply_hardware_adaptation():
     """Tune defaults to the measured machine so KAM runs well on modest hardware
     as well as fast hardware.
@@ -1238,6 +1349,8 @@ def _apply_hardware_adaptation():
 
       1. Idle standby     If VRAM is scarce it helps to release the model sooner,
                           though a slow cold start makes eviction more expensive.
+                          With no accelerator there is no VRAM to release, so
+                          the model simply stays loaded.
       2. Prefetch depth   When synthesis is slower than playback (RTF >= 1) a
                           deeper buffer hides the gap, and when it's much faster
                           a shallow buffer wastes less VRAM.
@@ -1257,7 +1370,14 @@ def _apply_hardware_adaptation():
 
     # 1. Idle standby (only if the user has not chosen one).
     if _learner.get_setting("idle_timeout_sec", None) is None:
-        if vram and vram < 6:
+        if not DEV.is_accelerated:
+            # Standby exists to hand VRAM back. On CPU there is none, so an
+            # eviction bought nothing and the next read paid a full reload,
+            # on the hardware where a reload is slowest.
+            _IDLE_TIMEOUT_SEC = 0
+            notes.append("always on (no accelerator, so standby frees no VRAM "
+                         "and waking costs a full reload)")
+        elif vram and vram < 6:
             _IDLE_TIMEOUT_SEC = 600            # 10 min, to reclaim scarce VRAM
             notes.append(f"standby 10 min ({vram} GB VRAM is limited)")
         elif wake and wake > 25:
@@ -1381,8 +1501,11 @@ def _run_benchmark(source="server"):
         # them, since they describe waking from standby and I can't re-measure
         # them without restarting the process.
         prev = _HW_PROFILE_CACHE or {}
-        perf.setdefault("load_s", prev.get("load_s"))
-        perf.setdefault("warm_s", prev.get("warm_s"))
+        for _k in ("load_s", "latent_s", "warm_s"):
+            # This process's own load and warm-up when it measured them, since
+            # the previous profile only has them if an earlier start did.
+            _own = _STARTUP_TIMINGS.get(_k)
+            perf.setdefault(_k, _own if _own is not None else prev.get(_k))
 
         payload = _bench.build_profile(DEV, perf, source=source)
         _bench.save_profile(_hw_profile_path(), payload,
@@ -1548,6 +1671,10 @@ def _run_startup():
     # Adapt defaults to the measured machine (defers to any explicit user setting).
     _stage("adapting")
     try:
+        _record_startup_timings()
+    except Exception as e:
+        print(f"[HW] startup timings not recorded: {e}")
+    try:
         _apply_hardware_adaptation()
     except Exception as e:
         print(f"[HW] adaptation skipped: {e}")
@@ -1654,7 +1781,8 @@ def apply_math_rules(text: str) -> str:
     for expr, spoken in _load_math_rules():
         if expr in text:
             text = text.replace(expr, f" {spoken} ")
-            print(f"[MATH] applied taught reading: {expr[:24]} → {spoken[:34]}")
+            print(f"[MATH] applied taught reading: "
+                  f"{_echo(f'{expr[:24]} → {spoken[:34]}')}")
     return text
 
 
@@ -3595,45 +3723,83 @@ def _soft_limit(audio):
     return audio
 
 
-def process_audio(wav_data, silence_ms: int = 80, text_len: int = 0):
+# --- Dead air at chunk boundaries ---
+# How much near-silence the trim leaves before and after the speech, in
+# milliseconds, for the chunk types that end in the middle of a sentence.
+#
+# The pause table above gives mid_clause 4 ms, meaning "run straight on", but
+# the trim kept whatever tail XTTS produced up to 350 ms, and only cut it back
+# to 150 ms beyond that. Measured on the real model, a mid-clause chunk ends
+# with 100 to 200 ms of tail, so every one of them was kept whole and a
+# sentence split over two chunks had that much dead air in the middle of it.
+# These two types now get a budget, and the trim acts whenever it is exceeded.
+#
+# Everything else is left exactly as it was: a sentence, a question or a
+# heading keeps the natural pause the model gave it.
+_TRIM_KEEP_MS = {
+    #                lead  tail
+    'mid_clause':    (20,  40),
+    'parenthetical': (20,  40),
+}
+
+
+def process_audio(wav_data, silence_ms: int = 80, text_len: int = 0,
+                  sentence_type: Optional[str] = None, speed: float = 1.0):
     """Runaway guard, dead-air trim, normalise, then gentle fades.
 
     The trim is deliberately conservative, using a relative threshold, generous
     padding, and only the lead and any excess trailing silence. An earlier and
     more aggressive energy trim cut actual words so I removed it. This one can't
-    do that, since it only removes silence sitting well clear of any speech."""
+    do that, since it only removes silence sitting well clear of any speech:
+    whatever the budget, the cut is made after the last sample above 1% of the
+    chunk's peak (-40 dB), never before it, and the fades at the end of this
+    function land on the cut, inside the silence that is kept, so the new edge
+    cannot click.
+
+    sentence_type picks the budget (see _TRIM_KEEP_MS). speed is the speed the
+    chunk was made at, which the runaway limit needs."""
     gap   = silence_ms / 1000.0
     SR    = 24000
     audio = np.array(wav_data, dtype=np.float32)
 
-    # Runaway guard at twice the expected duration, generous enough that it can
-    # never cut real speech
-    if text_len > 0:
-        max_samples = int(text_len * 0.070 * SR * 2.0)
-        if len(audio) > max_samples:
-            audio = audio[:max_samples]
+    athresh = float(np.max(np.abs(audio))) * 0.01 if audio.size else 0.0
+    loud = np.flatnonzero(np.abs(audio) > athresh) if athresh > 0 else np.array([], dtype=int)
+
+    # Runaway guard. It uses the same limit as the output check that decides
+    # whether to retry, measured the same way from the first sound, so a chunk
+    # that passed the check is never cut here. It used to be twice the expected
+    # duration of the untrimmed audio at speed 1.0 with no allowance, which on
+    # a one-word heading was shorter than a clean reading of it.
+    if text_len > 0 and loud.size:
+        last = int(loud[0]) + int(_aq.runaway_limit_s(text_len, speed) * SR)
+        if len(audio) > last:
+            audio = audio[:last]
+            loud = loud[loud < last]
 
     # Dead-air trim. XTTS often emits 100-300ms of silence before speech starts
     # and a long tail after it ends; both pad every chunk boundary and make
     # playback feel sluggish. Threshold is 1% of the chunk's own peak.
-    if len(audio) > SR // 4:
-        athresh = float(np.max(np.abs(audio))) * 0.01
-        if athresh > 0:
-            loud = np.flatnonzero(np.abs(audio) > athresh)
-            if loud.size:
-                lead_pad  = int(SR * 0.060)   # keep 60ms before first sound
-                trail_pad = int(SR * 0.150)   # keep 150ms after last sound
-                start = max(0, int(loud[0]) - lead_pad)
-                # Only trim the lead when it saves a meaningful amount (>80ms).
-                if start < int(SR * 0.080):
-                    start = 0
-                # Cap only EXCESS tail: act when more than 350ms of silence
-                # follows the last sound, and keep 150ms of it.
-                end = len(audio)
-                tail_silence = len(audio) - int(loud[-1])
-                if tail_silence > int(SR * 0.350):
-                    end = min(len(audio), int(loud[-1]) + trail_pad)
-                audio = audio[start:end]
+    if len(audio) > SR // 4 and loud.size:
+        budget = _TRIM_KEEP_MS.get(sentence_type or "")
+        if budget:
+            # Mid-sentence: keep the budget and no more, however little the
+            # excess is, since this boundary is meant to be inaudible.
+            start = max(0, int(loud[0]) - int(SR * budget[0] / 1000.0))
+            end = min(len(audio), int(loud[-1]) + 1 + int(SR * budget[1] / 1000.0))
+        else:
+            lead_pad  = int(SR * 0.060)   # keep 60ms before first sound
+            trail_pad = int(SR * 0.150)   # keep 150ms after last sound
+            start = max(0, int(loud[0]) - lead_pad)
+            # Only trim the lead when it saves a meaningful amount (>80ms).
+            if start < int(SR * 0.080):
+                start = 0
+            # Cap only EXCESS tail: act when more than 350ms of silence
+            # follows the last sound, and keep 150ms of it.
+            end = len(audio)
+            tail_silence = len(audio) - int(loud[-1])
+            if tail_silence > int(SR * 0.350):
+                end = min(len(audio), int(loud[-1]) + trail_pad)
+        audio = audio[start:end]
 
     # savgol_filter raises when the window exceeds the signal, which a very
     # short chunk can hit, like a one-word heading or a stray fragment. That used
@@ -3674,6 +3840,66 @@ _RETRY_TEMP_FACTOR   = 0.65   # multiply temperature by this on each retry
 _MIN_RETRY_TEMP      = 0.15   # never go colder than this: it starts to sound flat
 _RETRY_REP_BUMP      = 0.6    # add to repetition_penalty (targets the loop case)
 
+
+def _retry_temperature(current, original):
+    """The temperature for the attempt after a rejected one: cooler, down to
+    the floor, and never warmer than the chunk started at.
+
+    The floor used to be applied on its own, so a chunk whose learned
+    temperature was already below it was retried warmer: one that failed at
+    0.12 went again at 0.15, which is the opposite of what a retry is for. A
+    chunk that starts under the floor is now retried where it started, with
+    only the repetition penalty raised."""
+    return round(min(original, max(_MIN_RETRY_TEMP, current * _RETRY_TEMP_FACTOR)), 3)
+
+
+# --- Stopping a synthesis that nobody is waiting for ---
+class _Superseded(Exception):
+    """Raised inside synthesis when a newer read, a jump or a stop has replaced
+    the read this chunk belongs to."""
+
+
+# (list class, criteria class) once built; False when transformers offers none.
+_stop_classes = None
+
+
+def _stop_when_superseded(epoch):
+    """Extra keyword arguments for inference that end generation within one
+    token of the chunk's epoch being superseded.
+
+    XTTS generates through the transformers generate API and passes extra
+    keywords straight to it, so a stopping criterion reaches the token loop.
+    Without it, a stop or a jump had to wait out the whole of the chunk that
+    was being made, up to several seconds, before the new read's first chunk
+    could start. The classes are built on first use, since transformers is
+    only present where the model is. A request with no epoch gets nothing."""
+    global _stop_classes
+    if epoch is None:
+        return {}
+    if _stop_classes is None:
+        try:
+            from transformers import StoppingCriteria, StoppingCriteriaList  # type: ignore
+
+            class _StopWhenSuperseded(StoppingCriteria):
+                def __init__(self, epoch):
+                    self.epoch = epoch
+
+                def __call__(self, input_ids, scores, **kwargs):
+                    return torch.full((input_ids.shape[0],),
+                                      _speak_order.is_superseded(self.epoch),
+                                      dtype=torch.bool, device=input_ids.device)
+
+            _stop_classes = (StoppingCriteriaList, _StopWhenSuperseded)
+        except Exception as e:
+            _stop_classes = False
+            print(f"  {C.WARN}[SPEAK]{C.RESET} a running synthesis cannot be interrupted "
+                  f"on this install ({type(e).__name__}: {str(e)[:80]}); it will finish "
+                  f"its attempt first")
+    if not _stop_classes:
+        return {}
+    _list, _criterion = _stop_classes
+    return {"stopping_criteria": _list([_criterion(epoch)])}
+
 # Running tally of what was caught, per problem type. Surfaced by
 # /quality/rejections so the hallucination rate is a number, not an impression.
 _rejections = _collections.Counter()
@@ -3686,10 +3912,17 @@ def _record_rejection(problem):
         _rejections["total"] += 1
 
 
-def generate_speech(text, position: Optional[str] = None):
+def generate_speech(text, position: Optional[str] = None, epoch=None):
     """Synthesise speech for a single cleaned text chunk. position is an
     optional document-structure hint ('heading' or 'paragraph_end') forwarded
-    from the reader."""
+    from the reader. epoch is the read the chunk belongs to, when it has one:
+    if that read is stopped or replaced while the chunk is being made, this
+    raises _Superseded instead of finishing it."""
+
+    # The idle clock is reset before the model is looked at, not after, so the
+    # idle monitor, which re-reads the clock once it holds the locks, can never
+    # evict the model between this request's check and its inference.
+    _touch_synth_activity()   # real work → reset the idle clock
 
     # If the model was evicted while idle I wake it, meaning reload and rewarm,
     # before doing anything else, since serving against a half-loaded model would
@@ -3697,7 +3930,6 @@ def generate_speech(text, position: Optional[str] = None):
     # the first chunk after a long pause, then normal speed resumes.
     if _model_state != "ready" or tts is None:
         wake_model()
-    _touch_synth_activity()   # real work → reset the idle clock
 
     # Apply any user-taught punctuation/phrasing correction before prosody.
     text = apply_punct_corrections(text)
@@ -3746,6 +3978,7 @@ def generate_speech(text, position: Optional[str] = None):
     # technical chunk slows future dense chunks without touching simple ones
     # (the old per-type rate store made one report shift nearly everything).
     _synth_temp = _LIVE_SETTINGS["temperature"]
+    _synth_dial = 1.0
     _synth_speed = _LIVE_SETTINGS["speed"]
     _synth_rep = _LIVE_SETTINGS["repetition_penalty"]
     _synth_topk = _LIVE_SETTINGS["top_k"]
@@ -3771,9 +4004,12 @@ def generate_speech(text, position: Optional[str] = None):
 
         # Temperature: resolve the most specific learned profile (sentence type +
         # complexity + length + punctuation + lexis) that has enough evidence,
-        # else fall back to coarser buckets / legacy per-type.
+        # else fall back to coarser buckets / legacy per-type. The live slider
+        # is the dial over whatever is found (see learner.py), and the factor
+        # is kept with the chunk so learning can take it back out later.
         _synth_temp = _learner.resolve_profile_temperature(
             _profile["keys"], _LIVE_SETTINGS["temperature"])
+        _synth_dial = _learner.temperature_dial(_LIVE_SETTINGS["temperature"])
         # rep_penalty and top_k: prefer an autotuned per-profile value, else the
         # per-sentence-type learned value, else the live default.
         _synth_rep = _learner.resolve_profile_param(_pstr, "repetition_penalty",
@@ -3784,10 +4020,12 @@ def generate_speech(text, position: Optional[str] = None):
                 _LIVE_SETTINGS["top_k"], 1, 100, integer=True)))
         # top_p: autotuned per-profile if learned, else the live default.
         _synth_topp = _learner.resolve_profile_param(_pstr, "top_p", _LIVE_SETTINGS["top_p"])
-        # speed: band-based pacing modifier, then any autotuned per-profile trim.
+        # speed: the live speed shaded by the band's pacing modifier, and
+        # nothing else. A per-profile trim used to be multiplied on as well,
+        # which is how thirteen profiles came to play at up to 1.6x beside
+        # neighbours at 1.1x (see _AUTOTUNE_PARAMS in learner.py).
         _base_speed = _LIVE_SETTINGS["speed"] * _learner.get_rate_modifier(_profile["band"])
-        _speed_mod = _learner.resolve_profile_param(_pstr, "speed_mod", 1.0)
-        _synth_speed = round(max(0.5, min(2.0, _base_speed * _speed_mod)), 3)
+        _synth_speed = round(max(0.5, min(2.0, _base_speed)), 3)
     except Exception as e:
         # Falling back to live settings is correct, but doing it SILENTLY hid
         # the fact that learned parameters had stopped being applied at all.
@@ -3813,9 +4051,21 @@ def generate_speech(text, position: Optional[str] = None):
         # re-synthesised with a colder, steadier setting instead of being sent.
         # Each attempt costs one more inference on a chunk that was going to be
         # wrong anyway, and the retry is heavily biased toward succeeding.
+        #
+        # Generation is also bounded now. A real runaway used to run to the
+        # library's 605-token limit, about 28 seconds of audio, before the
+        # check got to throw it away. The ceiling sits just above the length
+        # the check rejects, so it costs a passing chunk nothing and ends a
+        # runaway as soon as it is one.
         outputs = None
         attempt_temp, attempt_rep = _synth_temp, _synth_rep
+        _ceiling = _aq.token_ceiling(len(text), _synth_speed)
+        _stop = _stop_when_superseded(epoch)
         for attempt in range(_MAX_QUALITY_RETRIES + 1):
+            # A stop or a jump while an earlier attempt ran, or while this
+            # chunk waited for the model: nobody is listening for it any more.
+            if _speak_order.is_superseded(epoch):
+                raise _Superseded()
             with _inference_lock, torch.inference_mode():
                 outputs = tts.synthesizer.tts_model.inference(
                     text=text,
@@ -3829,8 +4079,17 @@ def generate_speech(text, position: Optional[str] = None):
                     do_sample=True,
                     num_beams=1,
                     speed=_synth_speed,
+                    max_new_tokens=_ceiling,
+                    **_stop,
                 )
-            check = _aq.check_output(outputs["wav"], len(text), _synth_speed)
+            # Checked again before the audio is judged: if the stopping
+            # criterion cut it short, what came back is a fragment, and a
+            # fragment must not be scored, recorded as a rejection or retried.
+            if _speak_order.is_superseded(epoch):
+                raise _Superseded()
+            check = _aq.check_output(
+                outputs["wav"], len(text), _synth_speed,
+                capped=_aq.hit_token_ceiling(len(outputs["wav"]), _ceiling, _synth_speed))
             ctx.output_check = check.as_dict()
             if check.ok:
                 if attempt:
@@ -3867,8 +4126,7 @@ def generate_speech(text, position: Optional[str] = None):
             # Cool the sampler: lower temperature makes the model far less
             # likely to wander, and a higher repetition penalty directly
             # discourages the looping case.
-            attempt_temp = round(max(_MIN_RETRY_TEMP,
-                                     attempt_temp * _RETRY_TEMP_FACTOR), 3)
+            attempt_temp = _retry_temperature(attempt_temp, _synth_temp)
             attempt_rep = round(min(10.0, attempt_rep + _RETRY_REP_BUMP), 2)
             print(f"  {C.RETRY}[QUALITY]{C.RESET} {check.problem}: {check.detail}")
             print(f"  {C.RETRY}[QUALITY]{C.RESET} re-synthesising at "
@@ -3890,6 +4148,9 @@ def generate_speech(text, position: Optional[str] = None):
         "top_k": _synth_topk,
         "repetition_penalty": _synth_rep,
         "speed": _synth_speed,
+        # live / anchor when the chunk was made, so a later verdict can turn
+        # the temperature above back into the units learning is stored in.
+        "temperature_dial": _synth_dial,
     }
     # Attach per-chunk performance to the context so log_chunk can persist it.
     # audio_ms / synth_ms give a REAL-TIME FACTOR per chunk shape, rather than
@@ -4069,12 +4330,43 @@ def _silence_response():
     return send_file(buf, mimetype="audio/wav", as_attachment=False)
 
 
+def _dedup_key(text):
+    """What makes two requests "the same chunk" for the dedup cache.
+
+    It was the text alone, so replaying a sentence within the window after
+    changing the speed, switching voice or filing a too-fast report returned
+    the audio made before the change, which looked like the change had done
+    nothing. The key now carries what decides how the text is spoken: the
+    active voice, the live speed and the three band rate modifiers."""
+    rates = "/".join(str(_learner.get_rate_modifier(b)) for b in ("simple", "normal", "dense"))
+    return hashlib.md5("\x00".join(
+        (_ACTIVE_VOICE, str(_LIVE_SETTINGS["speed"]), rates, text)).encode()).hexdigest()
+
+
+def _superseded_reply(chunk_no, when="a newer read began"):
+    """The 409 a chunk gets when its read has been stopped or replaced."""
+    print(f"  {C.SKIP}[SUPERSEDED]{C.RESET} "
+          f"{('#' + str(chunk_no) + ' ') if chunk_no is not None else ''}{when}")
+    return jsonify({"superseded": True}), 409
+
+
 @app.route("/speak", methods=["POST"])
 def speak():
     data = request.get_json()
     if not data or "text" not in data:
         return jsonify({"error": "No text provided"}), 400
+    # Anything truthy counts, so a client that sends "true" as a string still
+    # gets a private read rather than a logged one.
+    _private_read.on = bool(data.get("private"))
+    try:
+        return _speak_chunk(data)
+    finally:
+        _private_read.on = False
 
+
+def _speak_chunk(data):
+    """Everything /speak does for one chunk, with the private flag already set
+    for this thread by speak()."""
     raw = data["text"].strip()
     if not raw:
         return jsonify({"error": "Text is empty"}), 400
@@ -4087,7 +4379,7 @@ def speak():
     # A whole-chunk SUPPRESS rule: the user asked for this content to be
     # skipped, so honour it with silence rather than synthesising the sentinel.
     if text == _learner.SUPPRESS_SENTINEL:
-        print(f"  {C.SKIP}[SUPPRESS]{C.RESET} user rule silences: {clean_display_text(raw)[:60]}")
+        print(f"  {C.SKIP}[SUPPRESS]{C.RESET} user rule silences: {_echo(clean_display_text(raw))}")
         return _silence_response()
 
     if not text:
@@ -4121,7 +4413,7 @@ def speak():
         text = text[_om.end():].strip()
         if text and text[0].islower():
             text = text[0].upper() + text[1:]
-        print(f"  {C.WARN}[ORPHAN]{C.RESET} → {repr(text)}")
+        print(f"  {C.WARN}[ORPHAN]{C.RESET} → {_echo(repr(text), 200)}")
         if not text or len(text) < 3:
             return _silence_response()
 
@@ -4129,13 +4421,14 @@ def speak():
     if looks_like_code(text):
         _converted = _speak_code_chunk(text)
         if _converted and _converted != text:
-            print(f"  {C.SKIP}[CODE] {repr(text[:40])} → {repr(_converted[:40])}{C.RESET}")
+            print(f"  {C.SKIP}[CODE] "
+                  f"{_echo(f'{repr(text[:40])} → {repr(_converted[:40])}', 100)}{C.RESET}")
             text = _converted
 
     # Short-chunk gate, so I skip inference for trivially short text since it
     # gives XTTS no prosodic context and wastes a GPU call.
     if len(text) < 3:
-        print(f"  {C.SKIP}[SKIP] too short ({len(text)}c): {repr(text)}{C.RESET}")
+        print(f"  {C.SKIP}[SKIP] too short ({len(text)}c): {_echo(repr(text))}{C.RESET}")
         return _silence_response()
 
     # A chunk the user skipped from the feed. The skip verdict files its rule
@@ -4144,7 +4437,7 @@ def speak():
     # apply_learned_rules matches text patterns and could never see it.
     _cid = hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:16]
     if _learner.is_suppressed_chunk(_cid):
-        print(f"  {C.SKIP}[SUPPRESS]{C.RESET} skipped by the user: {text[:60]}")
+        print(f"  {C.SKIP}[SUPPRESS]{C.RESET} skipped by the user: {_echo(text)}")
         return _silence_response()
 
     # Thread-safe dedup, which stops prefetch races synthesising the same chunk
@@ -4156,7 +4449,7 @@ def speak():
     # suppressed, skipped as too short, or failed synthesis left a permanent
     # "in flight, no audio yet" marker: the next request for the same text sat
     # in the wait loop below for a full 12 seconds before giving up.
-    _h = hashlib.md5(text.encode()).hexdigest()
+    _h = _dedup_key(text)
     _reserved = False
     _w = 0.0
     while True:
@@ -4171,7 +4464,7 @@ def speak():
                 _reserved = True
                 break
             if _e[1] is not None:
-                print(f"  {C.DEDUP}[DEDUP] cached: {text[:50]}{C.RESET}")
+                print(f"  {C.DEDUP}[DEDUP] cached: {_echo(text, 50)}{C.RESET}")
                 return send_file(io.BytesIO(_e[1]), mimetype="audio/wav")
         if _w >= 12.0:
             break
@@ -4182,10 +4475,9 @@ def speak():
         # since been stopped or replaced is turned away before it reaches the
         # GPU; the extension has already abandoned the request.
         _epoch = _read.get("epoch") if _read else None
-        if not _speak_order.acquire(_epoch, _read.get("index") if _read else None):
-            print(f"  {C.SKIP}[SUPERSEDED]{C.RESET} {('#' + str(_chunk_no) + ' ') if _chunk_no else ''}"
-                  f"a newer read began: {text[:50]}")
-            return jsonify({"superseded": True}), 409
+        if not _speak_order.acquire(_epoch, _read.get("index") if _read else None,
+                                    head=bool(_read and _read.get("head"))):
+            return _superseded_reply(_chunk_no, f"a newer read began: {_echo(text, 50)}")
         try:
             return _synthesise_and_log(text, raw, _position, _chunk_no, _h, _read)
         finally:
@@ -4201,7 +4493,9 @@ def speak():
 def _read_from(data):
     """Where this chunk sits in what is being read, from the request. The
     extension sends the read's id, its start time, the chunk's position and the
-    read's length, plus an epoch that changes on every new read, jump and stop.
+    read's length, plus an epoch that changes on every new read, jump and stop,
+    and head: true on the request for the chunk a run starts on, which is first
+    in line by definition (see speak_order.py).
     Anything missing or malformed means no read, never an error."""
     try:
         rid = data.get("read_id")
@@ -4216,7 +4510,7 @@ def _read_from(data):
                 return None
         return {"id": str(rid)[:64], "index": _int(data.get("index")),
                 "total": _int(data.get("read_total")), "ts": _num(data.get("read_ts")),
-                "epoch": _num(data.get("epoch"))}
+                "epoch": _num(data.get("epoch")), "head": data.get("head") is True}
     except Exception:
         return None
 
@@ -4237,12 +4531,21 @@ def speak_cancel():
 def _synthesise_and_log(text, raw, position, chunk_no, dedup_key, read=None):
     """Synthesise one prepared chunk, persist everything known about it, and
     return the audio response. Split out of speak() so the dedup reservation
-    can be released in a finally block around the whole of it."""
+    can be released in a finally block around the whole of it.
+
+    A chunk whose read is stopped or replaced while it is being made comes
+    back as the same 409 a waiting chunk gets, and leaves nothing behind: it
+    is not logged, not queued for listen-back and not put in the dedup cache.
+    It used to be finished, logged and analysed like any other, so a stop
+    filled the feed with chunks nobody had heard and Whisper spent its time
+    scoring them."""
     global _analysis_counter
+    _private = _is_private()
+    _epoch = read.get("epoch") if read else None
 
     _tag = f"#{chunk_no} " if chunk_no is not None else ""
     print(f"  {C.OK}{C.BOLD}[TTS]{C.RESET} {C.DIM}{_tag}({len(text)}c){C.RESET} "
-          f"{text[:90]}{'…' if len(text) > 90 else ''}")
+          f"{_echo(text, 90)}{'…' if len(text) > 90 and not _private else ''}")
 
     # --- Synthesis, with two escalating recovery attempts ---
     # Every attempt is recorded: which one it was, what failed, and why. A chunk
@@ -4255,38 +4558,51 @@ def _synthesise_and_log(text, raw, position, chunk_no, dedup_key, read=None):
         ("retry_after_model_reload", "Retry failed — reloading model", _reload_model),
     )
     try:
-        wav_data, ctx = generate_speech(text, position)
+        wav_data, ctx = generate_speech(text, position, _epoch)
+    except _Superseded:
+        return _superseded_reply(chunk_no, "stopped while it was being synthesised")
     except ValueError as ve:
         # The text cleaned to nothing, which isn't a failure, there's just
         # nothing to say.
         print(f"  {C.SKIP}[SKIP] {ve}{C.RESET}")
         _learner.log_error(text, error_type="EMPTY", stage="clean", read=read,
-                           message=str(ve), fatal=False)
+                           message=str(ve), fatal=False, private=_private)
         return _silence_response()
     except Exception as first_err:
         attempts.append({"attempt": 1, "stage": "inference",
                          "type": type(first_err).__name__,
                          "message": str(first_err)[:300]})
-        print(f"\n  {C.ERR}{C.BOLD}[ERROR]{C.RESET} {str(first_err)[:120]}")
+        # An error message can quote the text it failed on, so for a private
+        # read only its type is shown.
+        print(f"\n  {C.ERR}{C.BOLD}[ERROR]{C.RESET} "
+              f"{type(first_err).__name__ + ' (private)' if _private else str(first_err)[:120]}")
         for n, (label, note, before) in enumerate(recoveries, start=2):
+            # No point clearing caches or reloading the model for a chunk
+            # that has been stopped in the meantime.
+            if _speak_order.is_superseded(_epoch):
+                return _superseded_reply(chunk_no, "stopped while it was being retried")
             try:
                 _device.empty_cache(DEV)
                 if before is not None:
                     before()
                 print(f"  {C.RETRY}[RETRY]{C.RESET} {note}")
-                wav_data, ctx = generate_speech(text, position)
+                wav_data, ctx = generate_speech(text, position, _epoch)
                 break
+            except _Superseded:
+                return _superseded_reply(chunk_no, "stopped while it was being retried")
             except Exception as retry_err:
                 attempts.append({"attempt": n, "stage": label,
                                  "type": type(retry_err).__name__,
                                  "message": str(retry_err)[:300]})
         if ctx is None:
             last = attempts[-1]
-            print(f"  {C.ERR}{C.BOLD}[FATAL]{C.RESET} {last['type']}: {last['message'][:120]}")
+            print(f"  {C.ERR}{C.BOLD}[FATAL]{C.RESET} {last['type']}"
+                  + (" (private)" if _private else f": {last['message'][:120]}"))
             chunk_id = _learner.log_error(
                 text, error_type=last["type"], stage=last["stage"],
                 message=last["message"], attempts=attempts,
-                display_text=clean_display_text(raw), fatal=True, read=read)
+                display_text=clean_display_text(raw), fatal=True, read=read,
+                private=_private)
             # Return the id alongside the error so the failure is addressable:
             # GET /diagnose/<id> explains exactly what happened to this chunk.
             return jsonify({"error": last["message"], "error_type": last["type"],
@@ -4296,7 +4612,14 @@ def _synthesise_and_log(text, raw, position, chunk_no, dedup_key, read=None):
         ctx.failure = attempts[-1]
         print(f"  {C.OK}[RECOVERED]{C.RESET} after {len(attempts)} failed attempt(s)")
 
-    audio_int16 = process_audio(wav_data, silence_ms=ctx.silence_ms, text_len=len(text))
+    # Stopped or jumped away from during the last attempt. This is the last
+    # point before the chunk starts leaving traces, so it is asked once more.
+    if _speak_order.is_superseded(_epoch):
+        return _superseded_reply(chunk_no, "stopped just as it finished synthesising")
+
+    audio_int16 = process_audio(wav_data, silence_ms=ctx.silence_ms, text_len=len(text),
+                                sentence_type=ctx.sentence_type,
+                                speed=(ctx.used_params or {}).get("speed") or 1.0)
     buf = io.BytesIO()
     wav.write(buf, 24000, audio_int16)
     _wb = buf.getvalue()
@@ -4316,7 +4639,7 @@ def _synthesise_and_log(text, raw, position, chunk_no, dedup_key, read=None):
     _facets = (ctx.profile or {}).get("facets") or {"math": False, "primary": "prose", "count": 0}
     _has_math = bool(_facets.get("math"))
     if _has_math:
-        print(f"[MATH] equation/symbol chunk: {(_display or raw)[:70]}")
+        print(f"[MATH] equation/symbol chunk: {_echo(_display or raw, 70)}")
     _other = [k for k in ("list", "definition", "code", "quote", "citation") if _facets.get(k)]
     if _other:
         print(f"[CHUNK] facets: {', '.join(_other)}")
@@ -4337,7 +4660,7 @@ def _synthesise_and_log(text, raw, position, chunk_no, dedup_key, read=None):
             text, ctx.sentence_type, ctx.silence_ms, read=read,
             wav_bytes=_analysis_wav, display_text=_display,
             synth_params=ctx.used_params,
-            has_math=_has_math,
+            has_math=_has_math, private=_private,
             # The fingerprint resolved at synthesis time, passed in rather than
             # recomputed, so what the autotuner reads back matches what chose
             # these parameters.
@@ -4702,6 +5025,44 @@ def boundary_rules():
     except Exception as e:
         return jsonify({"error": str(e), "fragments": []}), 500
 
+def _flag_reply(res):
+    """A flag action's answer: 200 when done, 404 for a flag that is not there
+    and 400 for input that was refused, each with a message to show."""
+    code = 200 if res.get("ok") else (404 if res.pop("not_found", False) else 400)
+    return jsonify(res), code
+
+
+@app.route("/rules/flags", methods=["GET"])
+def flag_rules_route():
+    """Reported words and phrases that were only ever counted, most hits first,
+    for the dashboard's "needs attention" list."""
+    try:
+        return jsonify({"flags": _learner.get_flag_rules()})
+    except Exception as e:
+        return jsonify({"error": str(e), "flags": []}), 500
+
+
+@app.route("/rules/flags/<int:flag_id>/fix", methods=["POST"])
+def flag_fix_route(flag_id):
+    """Say how a flagged word should sound: {"say": "C.N.F"}. Makes or updates
+    the pronunciation rule and switches the flag off."""
+    d = request.get_json(silent=True)
+    say = d.get("say") if isinstance(d, dict) else None
+    try:
+        return _flag_reply(_learner.fix_flag_rule(flag_id, say))
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"The fix could not be saved ({e})."}), 500
+
+
+@app.route("/rules/flags/<int:flag_id>/dismiss", methods=["POST"])
+def flag_dismiss_route(flag_id):
+    """Switch a flag off without teaching anything."""
+    try:
+        return _flag_reply(_learner.dismiss_flag_rule(flag_id))
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"The flag could not be dismissed ({e})."}), 500
+
+
 @app.route("/report/rules", methods=["POST"])
 def add_rule_route():
     d = request.json or {}
@@ -4755,8 +5116,17 @@ def delete_rule_route(rule_id):
 
 @app.route("/settings", methods=["GET"])
 def get_settings():
-    """Return current live inference settings."""
-    return jsonify(_LIVE_SETTINGS)
+    """Return current live inference settings, and what the temperature one
+    means now that it is a dial over the learned values: temperature_anchor is
+    where the slider stood when the dial began, temperature_dial is live /
+    anchor, and temperature_example is one learned value with what it becomes
+    under the dial, so the UI can show "0.33 learned, 0.40 used"."""
+    out = dict(_LIVE_SETTINGS)
+    try:
+        out.update(_learner.temperature_dial_info(_LIVE_SETTINGS["temperature"]))
+    except Exception as e:
+        print(f"[SETTINGS] temperature dial details unavailable: {e}")
+    return jsonify(out)
 
 @app.route("/ai/insights", methods=["GET"])
 def ai_insights_route():
@@ -5723,8 +6093,8 @@ if __name__ == "__main__":
     _probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     try:
         _probe.settimeout(0.5)
-        if _probe.connect_ex(("127.0.0.1", 5050)) == 0:
-            print("[STARTUP] Port 5050 already in use — another server is running. Exiting.", flush=True)
+        if _probe.connect_ex(("127.0.0.1", KAM_PORT)) == 0:
+            print(f"[STARTUP] Port {KAM_PORT} already in use — another server is running. Exiting.", flush=True)
             _stage("duplicate-aborted")
             import sys as _sx
             _sx.exit(0)
@@ -5769,7 +6139,7 @@ if __name__ == "__main__":
 
     BAR = "=" * 50
     print(f"\n{C.OK}{C.BOLD}{BAR}{C.RESET}")
-    print(f"  {C.OK}{C.BOLD}TTS Server  →  http://localhost:5050{C.RESET}")
+    print(f"  {C.OK}{C.BOLD}TTS Server  →  http://localhost:{KAM_PORT}{C.RESET}")
     print(f"  {C.DIM}Pronunciation store: {STORE_PATH}{C.RESET}")
     print(f"{C.OK}{C.BOLD}{BAR}{C.RESET}")
     print(f"  {C.OK}{C.BOLD}Model is ready.{C.RESET}\n")
@@ -5814,7 +6184,7 @@ if __name__ == "__main__":
     # Explicit marker the native-messaging host watches for to flip the
     # dashboard power button to "Model Ready". Keep the literal text in sync
     # with kam_host.py READY_MARKERS.
-    print("[STARTUP] MODEL READY — serving on http://127.0.0.1:5050", flush=True)
+    print(f"[STARTUP] MODEL READY — serving on http://127.0.0.1:{KAM_PORT}", flush=True)
 
     # Buffering-proof readiness signal: write a sentinel file the host can poll.
     # stdout can be block-buffered when launched via a pipe, so the host watches
@@ -5829,4 +6199,4 @@ if __name__ == "__main__":
     # module in a child process, which re-ran the whole startup (second model
     # load + duplicate banner). debug=False usually disables it, but we force it
     # off so a second server can never be spawned this way.
-    app.run(host="127.0.0.1", port=5050, debug=False, threaded=True, use_reloader=False)
+    app.run(host="127.0.0.1", port=KAM_PORT, debug=False, threaded=True, use_reloader=False)

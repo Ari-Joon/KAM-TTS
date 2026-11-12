@@ -24,6 +24,9 @@ So this is a small turnstile in front of synthesis:
   - The first request of an epoch waits a moment before starting, since its
     siblings are usually a few milliseconds behind it, and starting on
     whichever landed first is how the order went wrong in the first place.
+    The request for the chunk a run starts on says so (head), and it does not
+    wait: nothing in its epoch can come before it, so the 150 ms it used to
+    spend gathering was added to every start, jump and resume for nothing.
   - A request with no epoch (the benchmark, a direct API call) is never
     superseded and takes its turn in arrival order behind the current read.
 
@@ -62,6 +65,16 @@ class SpeakOrder:
     def _superseded(self, epoch):
         return epoch is not None and self._latest is not None and epoch < self._latest
 
+    def is_superseded(self, epoch):
+        """True once a newer read, a jump or a stop has replaced this epoch.
+
+        acquire() only answers this for a request that is still waiting. One
+        that already has its turn used to run to the end whatever happened
+        meanwhile, so synthesis asks again between attempts and before it
+        logs anything. A request with no epoch is never superseded."""
+        with self._cv:
+            return self._superseded(epoch)
+
     def _best(self):
         """The ticket that should go next, or None. The current read first, in
         position order; untagged requests after it, in arrival order."""
@@ -78,13 +91,18 @@ class SpeakOrder:
         return best
 
     # --- the turnstile ---
-    def acquire(self, epoch=None, index=None):
+    def acquire(self, epoch=None, index=None, head=False):
         """Block until it is this request's turn. Returns True to go ahead, or
-        False when a newer read has superseded it and it should not run."""
+        False when a newer read has superseded it and it should not run.
+
+        head marks the request for the chunk its run starts on. It is first in
+        line by definition, so the gather for its epoch ends as it arrives."""
         with self._cv:
             self._note_epoch(epoch)
             if self._superseded(epoch):
                 return False
+            if head and epoch is not None:
+                self._gathering_until.pop(epoch, None)
             self._seq += 1
             ticket = self._seq
             self._waiting[ticket] = (epoch, index, self._clock())

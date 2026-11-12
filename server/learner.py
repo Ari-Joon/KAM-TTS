@@ -373,7 +373,16 @@ def _run_migrations():
                      # the order chunks finish synthesising in is not the order
                      # they are read in.
                      "read_id TEXT", "read_index INTEGER", "read_total INTEGER",
-                     "read_ts REAL"):
+                     "read_ts REAL",
+                     # The master-dial factor (live temperature / anchor) in
+                     # force when the chunk was made. used_temperature is what
+                     # was heard, and learning stores values with the dial
+                     # taken back out, so it has to know what the dial was then
+                     # rather than what it is by the time a verdict arrives.
+                     "used_dial REAL",
+                     # A private read: the row is kept for feedback and timing
+                     # but its text is not.
+                     "private INTEGER"):
             try:
                 conn.execute(f"ALTER TABLE chunks ADD COLUMN {_col.split()[0]} {_col.split()[1]}")
             except Exception:
@@ -844,11 +853,16 @@ def _chunk_voice(chunk_id):
 
 def _analysis_worker():
     """
-    Background thread: dequeues (chunk_id, wav_bytes, text) tuples,
+    Background thread: dequeues (chunk_id, wav_bytes, text, private) tuples,
     runs Whisper + librosa analysis, writes results to DB.
 
     Defers all heavy work while synthesis is active so it never competes with
     the TTS thread for CPU/GIL.
+
+    A private chunk is scored like any other, from the text in the queue item,
+    which is the only place that text exists. Nothing made from its words is
+    printed or stored: the flags keep their names and counts but not the words,
+    and no pronunciation is learned from it, since a rule is a stored word.
     """
     global _WHISPER_MODEL, _whisper, _analysis_done
     while True:
@@ -859,7 +873,8 @@ def _analysis_worker():
             item = _analysis_queue.get(timeout=5)
             if item is None:
                 break
-            chunk_id, wav_bytes, text = item
+            chunk_id, wav_bytes, text = item[:3]
+            private = bool(item[3]) if len(item) > 3 else False
 
             # Needed by the composite score below to know which measures this
             # chunk is long enough for.
@@ -945,8 +960,9 @@ def _analysis_worker():
                     # transcript even after normalised and fuzzy matching.
                     skipped_words = _skipped_words(text, _in_trans)
                     if skipped_words:
-                        metrics["quality_flags"] = metrics.get("quality_flags", "") + \
-                            f"|WHISPER_SKIP:{','.join(skipped_words[:3])}"
+                        metrics["quality_flags"] = metrics.get("quality_flags", "") + (
+                            f"|WHISPER_SKIP:{len(skipped_words)}words" if private
+                            else f"|WHISPER_SKIP:{','.join(skipped_words[:3])}")
 
                     # Hallucinations: transcript words with no normalised or
                     # fuzzy counterpart in the original, minus Whisper's fillers.
@@ -957,7 +973,9 @@ def _analysis_worker():
                     if len(hallucinated) > 2:
                         metrics["quality_flags"] = metrics.get("quality_flags", "") + \
                             f"|HALLUCINATION:{len(hallucinated)}words"
-                        print(f"[LEARNER] Hallucination detected: {hallucinated[:3]}")
+                        print("[LEARNER] Hallucination detected: "
+                              + (f"{len(hallucinated)} words (private)" if private
+                                 else f"{hallucinated[:3]}"))
 
                     # --- Word-level alignment (Part 3) ---
                     # Whisper's word timestamps localise problems: which words
@@ -967,11 +985,21 @@ def _analysis_worker():
                         if _align.available:
                             metrics["align_confidence"] = _align.mean_confidence
                             _af = _alignment.summary_flags(_align)
+                            if private:
+                                # The same two flags, counting the words
+                                # rather than naming them.
+                                _af = "|".join(
+                                    f"{name}:{len(ws)}words" for name, ws in (
+                                        ("LOWCONF", _align.low_conf_words),
+                                        ("RUSHED", _align.rushed_words)) if ws)
                             if _af:
                                 metrics["quality_flags"] = metrics.get("quality_flags", "") + "|" + _af
                             if _align.low_conf_words or _align.rushed_words:
                                 print(f"[LEARNER] alignment: conf={_align.mean_confidence} "
-                                      f"low={_align.low_conf_words} rushed={_align.rushed_words}")
+                                      + (f"low={len(_align.low_conf_words)} "
+                                         f"rushed={len(_align.rushed_words)} (private)" if private
+                                         else f"low={_align.low_conf_words} "
+                                              f"rushed={_align.rushed_words}"))
                     except Exception as _ae:
                         print(f"[LEARNER] alignment skipped: {_ae}")
 
@@ -1175,7 +1203,10 @@ def _analysis_worker():
                     'HEIGHT','LEFT','RIGHT','CLASSIFICATION','CONTENTS','EXAMPLE',
                     'IMAGEBASED','MULTIMODAL','COGNITIVE','SERVICES','COGNITIVESERVICES',
                 }
-                for match in _re2.findall(r'WHISPER_SKIP:([^|]+)', flags_str):
+                # A private chunk teaches no pronunciation: the rule would be
+                # one of its words, stored and logged to the history.
+                for match in ([] if private
+                              else _re2.findall(r'WHISPER_SKIP:([^|]+)', flags_str)):
                     for word in match.split(','):
                         w_orig = word.strip()
                         word   = w_orig.upper()
@@ -1327,6 +1358,7 @@ _SYNTH_COLS = (
     "clause_count", "ends_mid", "emphasis_density", "has_math", "voice", "sentence_count",
     "primary_facet", "facet_count", "synth_ms", "duration_ms", "rtf", "retried",
     "is_fragment", "pos_available", "error_detail", "rejected", "output_check",
+    "used_dial", "private",
 )
 _SYNTH_COLS_MINIMAL = ("ts", "text", "sentence_type", "silence_ms", "char_count", "success")
 
@@ -1362,7 +1394,7 @@ def _set_read_position(conn, chunk_id, read):
 
 def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
               display_text=None, synth_params=None, prosody=None, has_math=False,
-              profile_str=None, read=None):
+              profile_str=None, read=None, private=False):
     """
     Called by server.py after every successful synthesis.
     Logs the chunk and queues background quality analysis.
@@ -1390,13 +1422,22 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
     under one address while resolve_profile_param() looked up another, which
     meant the closed loop never actually closed. I only recompute now as a
     fallback for callers with no profile to hand.
+
+    private is for a read the user asked not to be kept. The row is still
+    written, since feedback, solid marking and the timing statistics all hang
+    off it, and its id is still the hash of the real text so they keep working,
+    but the text column is left empty. The character count is kept because it
+    says nothing about what was read. Analysis still runs, from the text held
+    in memory here, and is told the chunk is private so it prints and stores
+    no words from it.
     """
     if chunk_id is None:
         # Stable content-addressed id: same spoken text -> same id -> dedupes.
         chunk_id = hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()[:16]
 
     # What the user sees: the original grammar, not the spoken form.
-    stored_text = display_text if display_text else text
+    shown_text = display_text if display_text else text
+    stored_text = "" if private else shown_text
 
     _profile_str = profile_str
     if _profile_str is None:
@@ -1408,11 +1449,17 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
 
     sp = synth_params or {}
     pz = prosody or {}
+    failure = pz.get("failure")
+    if private and failure and failure.get("stage") != "output_check":
+        # What failed before a retry worked is kept, but not its message: an
+        # exception can quote the text it choked on. The output check's own
+        # message is only durations, so that one stays.
+        failure = {k: v for k, v in failure.items() if k != "message"}
     with _db_lock:
         conn = _get_db()
         try:
             conn.execute(_upsert_sql(_SYNTH_COLS), (
-                  chunk_id, time.time(), stored_text, sentence_type, silence_ms, len(stored_text), 1,
+                  chunk_id, time.time(), stored_text, sentence_type, silence_ms, len(shown_text), 1,
                   _profile_str,
                   sp.get("temperature"), sp.get("top_p"), sp.get("top_k"),
                   sp.get("repetition_penalty"), sp.get("speed"),
@@ -1427,16 +1474,17 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
                   # A chunk that succeeded only after a retry keeps the record of
                   # what failed first, since that's the signal for "this shape of
                   # text is unstable on this machine".
-                  json.dumps(pz["failure"]) if pz.get("failure") else None,
+                  json.dumps(failure) if failure else None,
                   pz.get("rejected", 0),
-                  json.dumps(pz["output_check"]) if pz.get("output_check") else None))
+                  json.dumps(pz["output_check"]) if pz.get("output_check") else None,
+                  sp.get("temperature_dial"), 1 if private else 0))
         except Exception as e:
             # Schema mismatch (e.g. a migration didn't apply on this DB) must never
             # break synthesis. Fall back to the minimal, always-present columns.
             print(f"[LEARNER] log_chunk full insert failed ({e}); using minimal insert")
             conn.execute(_upsert_sql(_SYNTH_COLS_MINIMAL, clear_errors=False),
                          (chunk_id, time.time(), stored_text, sentence_type, silence_ms,
-                          len(stored_text), 1))
+                          len(shown_text), 1))
         _set_read_position(conn, chunk_id, read)
         conn.commit()
         conn.close()
@@ -1446,7 +1494,7 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
     if wav_bytes is not None:
         global _analysis_queued, _analysis_dropped
         try:
-            _analysis_queue.put_nowait((chunk_id, wav_bytes, text))
+            _analysis_queue.put_nowait((chunk_id, wav_bytes, text, bool(private)))
             with _analysis_stats_lock:
                 _analysis_queued += 1
         except queue.Full:
@@ -1466,7 +1514,7 @@ def log_chunk(text, sentence_type, silence_ms, wav_bytes=None, chunk_id=None,
 
 
 def log_error(text, error_type="ERROR", stage="inference", message="",
-              attempts=None, display_text=None, fatal=True, read=None):
+              attempts=None, display_text=None, fatal=True, read=None, private=False):
     """Record a synthesis failure with enough detail to diagnose it later.
 
     This used to write a row with a random uuid, sentence_type='ERROR' and
@@ -1477,10 +1525,20 @@ def log_error(text, error_type="ERROR", stage="inference", message="",
     the failure sits beside the successful attempts at the same text and
     GET /diagnose/<id> can report exactly what went wrong.
 
+    A private chunk keeps the type, the stage and the attempt count and drops
+    everything that could carry its words: the text, the error messages (a
+    tokeniser error can quote what it choked on) and the crash-token blacklist
+    below, which would file tokens from the text as rules.
+
     Returns the chunk_id so the caller can hand it to the client.
     """
     chunk_id = hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()[:16]
-    stored_text = display_text or text
+    shown_text = display_text or text
+    stored_text = "" if private else shown_text
+    if private:
+        message = ""
+        attempts = [{k: v for k, v in a.items() if k != "message"}
+                    for a in (attempts or []) if isinstance(a, dict)]
     detail = json.dumps({
         "stage": stage,
         "type": error_type,
@@ -1494,29 +1552,32 @@ def log_error(text, error_type="ERROR", stage="inference", message="",
             conn.execute("""
                 INSERT OR REPLACE INTO chunks
                     (id, ts, text, sentence_type, silence_ms, char_count,
-                     success, voice, error_type, error_stage, error_detail, retried)
-                VALUES (?, ?, ?, 'ERROR', 0, ?, 0, ?, ?, ?, ?, ?)
-            """, (chunk_id, time.time(), stored_text, len(stored_text or ""),
-                  _ACTIVE_VOICE, error_type, stage, detail, len(attempts or [])))
+                     success, voice, error_type, error_stage, error_detail, retried,
+                     private)
+                VALUES (?, ?, ?, 'ERROR', 0, ?, 0, ?, ?, ?, ?, ?, ?)
+            """, (chunk_id, time.time(), stored_text, len(shown_text or ""),
+                  _ACTIVE_VOICE, error_type, stage, detail, len(attempts or []),
+                  1 if private else 0))
         except Exception as e:
             print(f"[LEARNER] log_error full insert failed ({e}); using minimal insert")
             conn.execute("""
                 INSERT OR REPLACE INTO chunks
                     (id, ts, text, sentence_type, silence_ms, char_count, success)
                 VALUES (?, ?, ?, 'ERROR', 0, ?, 0)
-            """, (chunk_id, time.time(), stored_text, len(stored_text or "")))
+            """, (chunk_id, time.time(), stored_text, len(shown_text or "")))
         _set_read_position(conn, chunk_id, read)
         conn.commit()
         conn.close()
 
-    log_history("ERROR", f"{error_type} at {stage}: {(message or '')[:120]}", "auto")
+    log_history("ERROR", f"{error_type} at {stage}"
+                         + (" (private)" if private else f": {(message or '')[:120]}"), "auto")
 
     # Auto-blacklisting is destructive, since it permanently strips tokens from
     # all future speech, so it now runs only for the vocabulary crashes it was
     # written for and only when the chunk really did fail for good. It used to
     # run on every error including transient CUDA OOM, where the token had
     # nothing to do with the failure and real words were blacklisted as a result.
-    if fatal:
+    if fatal and not private:
         _auto_detect_crash_pattern(text, error_type, message)
     return chunk_id
 
@@ -1668,10 +1729,7 @@ def _apply_report(report_id, chunk_text, issue, token, expected, heard, action, 
 
     try:
         if action == "ADD_TO_STORE" and token and expected:
-            # Add to pronunciation store
-            _add_to_pronunciation_store(token.upper(), expected.lower().strip())
-            outcome = _add_rule("PRONUNCIATION", token, "store_override", expected,
-                                source="REPORT")
+            outcome = _teach_pronunciation(token, expected)
             result_msg = (f"'{token}' will now be said as '{expected}'"
                           + (", replacing the earlier correction" if outcome == "updated" else ""))
 
@@ -1898,6 +1956,18 @@ def _add_to_pronunciation_store(token, spoken):
         print(f"[LEARNER] Pronunciation store updated: {token} → {spoken}")
     except Exception as e:
         print(f"[LEARNER] Store update error: {e}")
+
+
+def _teach_pronunciation(token, spoken, action="store_override", source="REPORT"):
+    """Teach how a token is said: the pronunciation store and the rule, together.
+
+    The two are kept in step because deleting a pronunciation rule removes its
+    store entry as well, so a rule made without one, or the other way round,
+    half-survives its own deletion. A pronunciation report, a flag fixed from
+    the dashboard and the flag migration all come through here. Returns what
+    _add_rule returns: "new", "updated" or "same"."""
+    _add_to_pronunciation_store(token.upper(), spoken.lower().strip())
+    return _add_rule("PRONUNCIATION", token, action, spoken, source=source)
 
 
 def bump_counter(name, by=1):
@@ -2157,11 +2227,35 @@ def _settings_that_produced(row_mapping):
     return params if params["temperature"] is not None else None
 
 
-# How far approval pulls a profile key toward the temperature that earned it.
-# A thumbs-up uses the same 0.3 as record_good_settings; passive "solid" uses
-# the same 0.08 as the per-type pull in mark_session_solid.
+# How far approval pulls a learned value toward the temperature that earned it.
+#
+# These were fixed weights: 0.3 for a thumbs-up, 0.08 for passive "solid". A
+# fixed weight gives the newest sample the same say whether the value stands on
+# two confirmations or three hundred, and with 310 behind it one thumbs-up on a
+# cold chunk moved mid_clause from 0.293 to 0.250, and a second a minute later
+# to 0.220. So the weight now falls as the evidence grows, the way a running
+# mean's does: 1 / (n + 1), where n is what that key already has behind it.
+# It is capped at the old 0.3 so the first few samples still cannot swing a
+# value, and floored at 0.05 so a long-settled value can still follow a real
+# change in taste rather than freezing.
+#
+# Solid is the same curve scaled down by 0.08 / 0.3, so it stays gentler than
+# a thumbs-up at every n and is the old 0.08 exactly where a thumbs-up is the
+# old 0.3.
 _THUMBS_UP_ALPHA = 0.3
 _SOLID_ALPHA     = 0.08
+_ALPHA_FLOOR     = 0.05
+
+
+def _approval_alpha(entry, ceiling=_THUMBS_UP_ALPHA):
+    """The weight one more approval carries against a learned entry.
+
+    n is the entry's own evidence: confirm_count on a per-type entry, count on
+    a profile key. ceiling is _THUMBS_UP_ALPHA for a thumbs-up and _SOLID_ALPHA
+    for passive solid."""
+    n = (entry.get("confirm_count", 0) or 0) + (entry.get("count", 0) or 0)
+    thumbs = max(_ALPHA_FLOOR, min(_THUMBS_UP_ALPHA, 1.0 / (n + 1)))
+    return thumbs * (ceiling / _THUMBS_UP_ALPHA)
 
 
 def confirm_chunk_quality(chunk_id):
@@ -2175,8 +2269,8 @@ def confirm_chunk_quality(chunk_id):
         conn = _get_db()
         row = conn.execute(
             "SELECT sentence_type, pitch_variance, energy_tail, voice_consistency, "
-            "used_temperature, used_top_p, used_top_k, used_rep_penalty, used_speed "
-            "FROM chunks WHERE id=?", (chunk_id,)).fetchone()
+            "used_temperature, used_top_p, used_top_k, used_rep_penalty, used_speed, "
+            "used_dial FROM chunks WHERE id=?", (chunk_id,)).fetchone()
         conn.close()
     if not row:
         return {"reinforced": False, "reason": "chunk_not_found"}
@@ -2187,11 +2281,19 @@ def confirm_chunk_quality(chunk_id):
     voice_cons  = r["voice_consistency"]
 
     # The settings this chunk was made with, not the ones in force right now.
+    # A row from before the dial has no factor, and was made with none.
     good = _settings_that_produced(r)
+    dial = r.get("used_dial") or 1.0
     if good is None and _live_settings_ref:
         good = dict(_live_settings_ref)
+        dial = temperature_dial(good.get("temperature"))
         print(f"[LEARNER] chunk {chunk_id[:8]} has no stored parameters "
               f"(pre-dates per-chunk recording) — reinforcing live settings")
+    # What is learned from it: the same settings with the dial taken back out
+    # of the temperature, since the store holds learned units and synthesis
+    # will apply the dial again on the way out.
+    learn = (dict(good, temperature=stored_temperature(good.get("temperature"), dial))
+             if good else None)
 
     # The temperature the chunk was made with, pulled onto the profile keys
     # synthesis actually resolves. This does not depend on the acoustic
@@ -2200,7 +2302,8 @@ def confirm_chunk_quality(chunk_id):
         prof = lookup_chunk_profile(chunk_id, None)
         if prof.get("from_stored"):
             _reinforce_profile_temperatures(
-                [(prof["keys"], r["used_temperature"])], _THUMBS_UP_ALPHA, create=True)
+                [(prof["keys"], stored_temperature(r["used_temperature"], dial))],
+                _THUMBS_UP_ALPHA, create=True)
     except Exception as e:
         print(f"[LEARNER] profile reinforce skipped: {e}")
 
@@ -2209,9 +2312,9 @@ def confirm_chunk_quality(chunk_id):
         # acoustic baseline. We CAN still record the inference settings for
         # thumbs-up guidance, since temperature steering doesn't depend on the
         # prosody metrics. This makes an immediate post-playback thumbs-up count.
-        if good:
+        if learn:
             try:
-                record_good_settings(stype, good)
+                record_good_settings(stype, learn)
             except Exception as e:
                 print(f"[LEARNER] good_settings (pending) error: {e}")
         return {"reinforced": False, "reason": "metrics_pending",
@@ -2241,8 +2344,8 @@ def confirm_chunk_quality(chunk_id):
     # Thumbs-up guidance: remember the inference settings that produced this
     # approved chunk, keyed by sentence_type, so /speak can bias future chunks
     # of the same kind toward this known-good operating point.
-    if good:
-        record_good_settings(stype, good)
+    if learn:
+        record_good_settings(stype, learn)
 
     return {"reinforced": True, "sentence_type": stype,
             "reinforced_settings": good, "new_baseline": updated}
@@ -2331,14 +2434,16 @@ def _load_good_settings():
 def record_good_settings(sentence_type, settings):
     """Remember the inference settings of a confirmed-perfect chunk, keyed by
     sentence_type. EMA-blends with any prior good point so one outlier cannot
-    dominate. Called from confirm_chunk_quality."""
+    dominate. Called from confirm_chunk_quality, which passes the temperature
+    in learned units, with the dial already taken out."""
     if not settings:
         return
     stype = (sentence_type or "sentence").lower()
     with _good_settings_lock:
         store = dict(_load_good_settings())
         prev  = store.get(_vk(stype)) or {}
-        a = 0.3  # weight on the newest confirmed-good sample
+        # Weight on the newest confirmed-good sample, less the more there are.
+        a = _approval_alpha(prev)
         def ema(o, n):
             if n is None:
                 return o
@@ -2535,6 +2640,123 @@ def get_setting(key, default=None):
         return (_load_good_settings().get("settings") or {}).get(key, default)
     except Exception:
         return default
+
+
+# --- The temperature slider as a master dial ---
+# What is learned per fingerprint is an absolute temperature, and synthesis
+# used it in preference to the live slider. Nearly every chunk resolves to a
+# learned value, since the per-type entries alone cover every type in use, so
+# the slider had stopped doing anything: set to 0.45 on my install, the chunks
+# were made at a median of about 0.31 wherever it was moved.
+#
+# The slider is now a dial over what was learned:
+#
+#     effective = learned x (live / anchor), kept within 0.05 to 0.95
+#
+# The anchor is the live temperature the learned values were learned against.
+# It is fixed once, the first time the server registers its live settings, at
+# whatever the slider says then, so the factor is exactly 1 on the day this
+# lands and nothing sounds different until the slider is moved. A fresh
+# install anchors at its default the same way.
+#
+# Everything in good_settings stays in learned units. A chunk's
+# used_temperature is the effective value, so whatever learns from it takes
+# the dial back out first, with the factor recorded on the chunk when it was
+# made (used_dial), because the slider may have moved by the time a verdict
+# arrives. A step nudge, such as a report's 0.03, is a step in learned units
+# and needs no conversion.
+_TEMP_MIN, _TEMP_MAX = 0.05, 0.95
+_ANCHOR_SETTING = "temperature_anchor"
+
+
+def _clamp_temperature(t):
+    return round(max(_TEMP_MIN, min(_TEMP_MAX, float(t))), 3)
+
+
+def temperature_anchor():
+    """The live temperature the learned values are relative to, or None when
+    none has been fixed yet, which is a learner no server has registered its
+    live settings with. With no anchor the dial is 1 and nothing is scaled."""
+    try:
+        a = float(get_setting(_ANCHOR_SETTING))
+    except (TypeError, ValueError):
+        return None
+    return a if _TEMP_MIN <= a <= _TEMP_MAX else None
+
+
+def ensure_temperature_anchor(live_temperature):
+    """Fix the anchor at the live temperature, once, and return the anchor.
+
+    This is the migration to the dial. It changes no learned value: it records
+    where the slider stood when the dial began, so live / anchor is 1 from that
+    moment. An anchor that is already there is never moved, since moving it
+    would rescale every learned temperature at once."""
+    existing = temperature_anchor()
+    if existing is not None:
+        return existing
+    try:
+        anchor = _clamp_temperature(live_temperature)
+    except (TypeError, ValueError):
+        return None
+    set_setting(_ANCHOR_SETTING, anchor)
+    log_history("MIGRATION", f"temperature slider is now a dial over the learned values; "
+                             f"anchor fixed at {anchor}, where the slider stood, so "
+                             f"nothing sounds different until it is moved", "auto")
+    print(f"[LEARNER] Migration: temperature dial anchored at {anchor} "
+          f"(learned values are unchanged; the slider now scales them)")
+    return anchor
+
+
+def temperature_dial(live=None):
+    """The dial factor, live / anchor. live defaults to the server's live
+    temperature. 1.0 whenever either side is unknown."""
+    anchor = temperature_anchor()
+    if live is None:
+        live = (_live_settings_ref or {}).get("temperature")
+    try:
+        live = float(live)
+    except (TypeError, ValueError):
+        return 1.0
+    if anchor is None or live <= 0:
+        return 1.0
+    return round(live / anchor, 4)
+
+
+def effective_temperature(learned, dial):
+    """A learned temperature as synthesis will use it under this dial."""
+    if not dial or dial == 1.0:
+        return learned
+    return _clamp_temperature(learned * dial)
+
+
+def stored_temperature(effective, dial):
+    """The other way: take the dial back out of a temperature a chunk was made
+    at, so it can be learned from. None stays None."""
+    if effective is None or not dial or dial == 1.0:
+        return effective
+    return _clamp_temperature(effective / dial)
+
+
+def temperature_dial_info(live=None):
+    """The dial in the terms the UI needs to explain it: where the slider is,
+    where it stood when the dial began, the factor between them, and one
+    worked example taken from the most-confirmed learned value."""
+    if live is None:
+        live = (_live_settings_ref or {}).get("temperature")
+    anchor = temperature_anchor()
+    dial = temperature_dial(live)
+    # The per-type entries of the active voice, which is what the tuning panel
+    # already lists, so the example is a number the user can find there.
+    types = {k: v for k, v in get_learned_summary()["types"].items()
+             if not k.startswith("prof:")}
+    example = None
+    if types:
+        kind = max(types, key=lambda k: types[k].get("confirm_count", 0))
+        learned = types[kind]["temperature"]
+        example = {"kind": kind, "learned": learned,
+                   "effective": effective_temperature(learned, dial)}
+    return {"temperature_anchor": anchor, "temperature_dial": dial,
+            "temperature_example": example}
 
 
 # ---
@@ -2773,7 +2995,9 @@ def diagnose_chunk(chunk_id=None, chunk_text=None):
                            whether the spaCy layer ran and what it concluded
       what was done to it  the exact synth params used, and importantly where
                            they came from, whether that's a learned per-profile
-                           value, a legacy per-type value or the live defaults
+                           value, a legacy per-type value or the live defaults;
+                           for temperature, the learned value and the dial
+                           factor that scaled it, both then and now
       what came out        synthesis and audio ms, real-time factor, retry count
       how it sounded       Whisper accuracy plus the quality flags derived from
                            the transcript (WHISPER_SKIP, HALLUCINATION, LOWCONF,
@@ -2805,6 +3029,7 @@ def diagnose_chunk(chunk_id=None, chunk_text=None):
             r = dict(row)
             out["found"] = True
             out["text"] = r.get("text")
+            out["private"] = bool(r.get("private"))
             out["voice"] = r.get("voice")
             out["ts"] = r.get("ts")
 
@@ -2866,24 +3091,42 @@ def diagnose_chunk(chunk_id=None, chunk_text=None):
                 store_now = _load_good_settings()
                 entry = store_now.get(_vk(f"prof:{prof}")) or {}
                 # Temperature resolves through the sentence-type hierarchy, not
-                # this key, so its source is read from there.
+                # this key, so its source is read from there. It is a learned
+                # value times the dial, so both halves are shown: the factor
+                # the chunk was made under, and what the same chunk would get
+                # with the slider where it is now.
                 if prof.count("|") == 3:
                     keys = _profile_keys_from_parts(
                         (r.get("sentence_type") or "sentence").lower(),
                         *prof.split("|"), bool(r.get("has_math")))
-                    hit = next((k for k in keys
-                                if (store_now.get(_vk(f"prof:{k}")) or {}).get("count", 0) >= 2
-                                and (store_now.get(_vk(f"prof:{k}")) or {}).get("temperature") is not None),
-                               None)
-                    sources["temperature"] = (f"learned for {hit}" if hit
-                                              else "per-type or live settings")
+                    learned, src = _learned_temperature(keys, voice=r.get("voice"))
+                    live = (_live_settings_ref or {}).get("temperature")
+                    dial_now = temperature_dial(live)
+                    dial_then = r.get("used_dial") or 1.0
+                    used = r.get("used_temperature")
+                    out["temperature"] = {
+                        "used":             used,
+                        "dial_when_made":   dial_then,
+                        "used_in_learned_units": stored_temperature(used, dial_then),
+                        "learned_now":      learned,
+                        "learned_from":     src,
+                        "anchor":           temperature_anchor(),
+                        "live":             live,
+                        "dial_now":         dial_now,
+                        "would_use_now":    (effective_temperature(learned, dial_now)
+                                             if learned is not None else live),
+                    }
+                    sources["temperature"] = (
+                        f"learned {learned} for {src} x dial {dial_now}" if src
+                        else "live settings (nothing learned for this profile)")
                 for param, store_key in (("top_p", "top_p"),
                                          ("top_k", "top_k"),
-                                         ("repetition_penalty", "repetition_penalty"),
-                                         ("speed", "speed_mod")):
+                                         ("repetition_penalty", "repetition_penalty")):
                     sources[param] = ("learned for this profile"
                                       if entry.get(store_key) is not None
                                       else "live/default settings")
+                # Speed has no per-profile value any more (see _AUTOTUNE_PARAMS).
+                sources["speed"] = "live speed x the complexity band's rate modifier"
             out["param_sources"] = sources
 
             out["quality"] = {
@@ -3181,26 +3424,25 @@ def autotune_report():
 # the profile hierarchy fed by reports and the tuner fed by the same chunks, so
 # I took it out: temperature is learned by the hierarchy alone.
 #
-# speed is tuned as a trim. The evidence is the absolute speed each chunk was
-# made at, since that is what param_observations records and what the listener
-# heard, but what is stored and nudged is speed_mod, which synthesis multiplies
-# onto live speed x band rate. The bounds and step below apply to that trim.
+# Speed is not one of them either. It was tuned as a per-profile trim,
+# speed_mod, multiplied onto live speed x band rate, and two things were wrong
+# with that. An early version seeded the trim from the median of the absolute
+# speeds observed (around 1.38), so thirteen profiles were left playing at up to
+# 1.6x while everything else played at 1.07 to 1.15x, and the pace lurched from
+# one sentence to the next. And there was nothing to tune toward: Whisper
+# accuracy is flat from speed 1.1 to 1.5 (n=873), so a per-profile speed only
+# ever added unevenness. Speed is now the live slider times the band's rate
+# modifier and nothing else; _retire_speed_mods moves the old trims aside.
 _AUTOTUNE_PARAMS = {
     "top_p":       (0.50, 0.99, 0.01, False),
     "rep_penalty": (1.0, 10.0, 0.05, False),
     "top_k":       (5,   100,  1,    True),
-    "speed":       (0.7,  1.6,  0.01, False),
 }
 # Map param name → the profile-entry key it's stored under (what synthesis reads).
 _AUTOTUNE_STORE_KEY = {
     "top_p": "top_p", "rep_penalty": "repetition_penalty",
-    "top_k": "top_k", "speed": "speed_mod",
+    "top_k": "top_k",
 }
-# A param with no stored value yet starts here rather than at the median of its
-# observations. For speed that median is an absolute speed (around 1.38 on my
-# data), and storing it as a trim made a profile's first tuning step jump it to
-# live x band x 1.38, which is where the 1.5 to 1.6 speeds came from.
-_AUTOTUNE_SEED = {"speed": 1.0}
 # A checkpoint is the tripwire on one change. Once this many observations have
 # come in since it and quality has held, the change has proved itself and the
 # checkpoint closes, so that (profile, param) can be tuned again. Checkpoints
@@ -3208,7 +3450,7 @@ _AUTOTUNE_SEED = {"speed": 1.0}
 _AUTOTUNE_CKPT_CLOSE_N = 12
 # _profile_quality_stats stays general, so a param the tuner no longer moves
 # still gets a proper spread guard when it is judged; its range lives here.
-_ESTIMATOR_RANGES = {"temperature": (0.05, 0.95)}
+_ESTIMATOR_RANGES = {"temperature": (0.05, 0.95), "speed": (0.7, 1.6)}
 
 def _welch_t(low, high):
     """Welch's t for two samples that may have different variances.
@@ -3314,9 +3556,9 @@ def run_autotune_cycle():
         for ckey, ck in list(ckpts.items()):
             prof = ck.get("profile"); param = ck.get("param")
             if not prof or param not in _AUTOTUNE_STORE_KEY:
-                # Includes the temperature checkpoints from before temperature
-                # left the tuner; their values were never read, so there is
-                # nothing to roll back.
+                # Includes the temperature and speed checkpoints from before
+                # those left the tuner. Neither value is read by synthesis any
+                # more, so there is nothing to roll back.
                 ckpts.pop(ckey, None); continue
             recent = _recent_q(prof)
             if recent is not None and ck.get("q_before") is not None \
@@ -3352,8 +3594,6 @@ def run_autotune_cycle():
                 skey = _AUTOTUNE_STORE_KEY[param]
                 entry = dict(store.get(_vk(f"prof:{prof}")) or {})
                 cur = entry.get(skey)
-                if cur is None and param in _AUTOTUNE_SEED:
-                    cur = _AUTOTUNE_SEED[param]
                 if cur is None:
                     # No stored preference yet, so seed it from the median of
                     # what's actually been used for this param and profile.
@@ -3412,6 +3652,10 @@ def _adjust_profile_temperature(profile_keys, step, base_default=None, voice=Non
     the live slider at 0.45 a "more expressive" report wrote 0.36 and made the
     chunk flatter. base_default overrides that starting point.
 
+    The step and everything stored are in learned units, so the starting point
+    is too: the learned value synthesis would scale, or when there is none the
+    live slider with the dial taken out, which is the anchor.
+
     report=True is for a step the user asked for. Synthesis only trusts a key
     once its count reaches 2, so a single report on a new fingerprint used to
     change nothing audible; a report now lifts the specific key's count to at
@@ -3420,8 +3664,10 @@ def _adjust_profile_temperature(profile_keys, step, base_default=None, voice=Non
         return (None, None)
     with _good_settings_lock:
         if base_default is None:
-            live = (_live_settings_ref or {}).get("temperature", 0.33)
-            base_default = resolve_profile_temperature(profile_keys, live, voice=voice)
+            base_default, _src = _learned_temperature(profile_keys, voice=voice)
+            if base_default is None:
+                live = (_live_settings_ref or {}).get("temperature", 0.33)
+                base_default = stored_temperature(live, temperature_dial(live))
         store = dict(_load_good_settings())
         specific = profile_keys[0]
         results = {}
@@ -3462,10 +3708,14 @@ def _reinforce_profile_temperatures(samples, alpha, create, voice=None):
     eight types in use one always does. So approval reinforced a value nothing
     read. This works on the same prof: keys synthesis resolves.
 
-    samples is a list of (profile_keys, used_temperature). The most specific key
-    moves by alpha and each coarser one by half the previous, the same damping
-    _adjust_profile_temperature uses, and it is an EMA, so a value already at
-    the used temperature does not move. create=True (an explicit thumbs-up)
+    samples is a list of (profile_keys, temperature), the temperature in
+    learned units, so with the chunk's dial already taken out. alpha is the
+    most a sample may weigh, _THUMBS_UP_ALPHA or _SOLID_ALPHA; each key's own
+    weight comes from _approval_alpha, so it falls as that key's evidence
+    grows. The most specific key moves by that weight and each coarser one by
+    half the previous, the same damping _adjust_profile_temperature uses, and
+    it is an EMA, so a value already at the used temperature does not move.
+    create=True (an explicit thumbs-up)
     starts the specific key if it is missing and counts as evidence on it; passive
     "solid" only nudges keys that already exist and adds no count. Returns the
     number of keys changed."""
@@ -3476,16 +3726,17 @@ def _reinforce_profile_temperatures(samples, alpha, create, voice=None):
     with _good_settings_lock:
         store = dict(_load_good_settings())
         for keys, used_t in samples:
-            a = alpha
+            damp = 1.0
             for i, key in enumerate(keys):
                 pk = _vk(f"prof:{key}", voice)
                 entry = dict(store.get(pk) or {})
                 old = entry.get("temperature")
+                a = _approval_alpha(entry, alpha) * damp
+                damp *= 0.5
                 if old is None:
                     # Only the specific key is ever started; a coarser one with
                     # no value of its own is left for the evidence to build.
                     if not create or i > 0:
-                        a *= 0.5
                         continue
                     new_t = round(float(used_t), 3)
                 else:
@@ -3496,7 +3747,6 @@ def _reinforce_profile_temperatures(samples, alpha, create, voice=None):
                 entry["updated"] = datetime.now().isoformat()
                 store[pk] = entry
                 changed += 1
-                a *= 0.5
         global _good_settings_cache
         _good_settings_cache = store
         try:
@@ -3506,32 +3756,47 @@ def _reinforce_profile_temperatures(samples, alpha, create, voice=None):
     return changed
 
 
-def resolve_profile_temperature(profile_keys, current_temp, min_count=2, voice=None):
-    """Return the learned temperature for a chunk profile.
+def _learned_temperature(profile_keys, min_count=2, voice=None):
+    """The learned temperature for a chunk profile, in learned units, and the
+    store key it came from. (None, None) when nothing has been learned.
 
     I walk the key hierarchy from most specific down to coarsest and take the
-    first one with enough evidence behind it, meaning count >= min_count, and
-    fall back to current_temp if none of them qualify. That's what makes this
-    precise when the data is rich and still robust when it's thin, since a
-    rarely-seen fingerprint just defers to a broader learned bucket."""
+    first one with enough evidence behind it, meaning count >= min_count.
+    That's what makes this precise when the data is rich and still robust when
+    it's thin, since a rarely-seen fingerprint just defers to a broader learned
+    bucket."""
     if not profile_keys:
-        return current_temp
+        return None, None
     store = _load_good_settings()
     for key in profile_keys:
         entry = store.get(_vk(f"prof:{key}", voice))
         if entry and entry.get("temperature") is not None and entry.get("count", 0) >= min_count:
-            return entry["temperature"]
+            return entry["temperature"], f"prof:{key}"
     # Legacy fallback: the plain sentence_type entry (pre-profile learning).
     stype = profile_keys[-1].split("|")[0]
     legacy = store.get(_vk(stype, voice))
     if legacy and legacy.get("temperature") is not None:
-        return legacy["temperature"]
-    return current_temp
+        return legacy["temperature"], stype
+    return None, None
+
+
+def resolve_profile_temperature(profile_keys, current_temp, min_count=2, voice=None):
+    """Return the temperature to synthesise a chunk profile at.
+
+    current_temp is the live slider. When something has been learned for the
+    profile, the answer is that learned value scaled by the dial (see "The
+    temperature slider as a master dial"), so the slider moves every kind of
+    text together while each keeps its own learned offset. When nothing has
+    been learned it is the slider itself."""
+    learned, _src = _learned_temperature(profile_keys, min_count, voice)
+    if learned is None:
+        return current_temp
+    return effective_temperature(learned, temperature_dial(current_temp))
 
 
 def resolve_profile_param(profile_str, store_key, default):
     """Return an autotuned per-profile param (e.g. top_p, repetition_penalty,
-    top_k, speed_mod) from the coarse 'prof:<profile>' entry the autotuner writes.
+    top_k) from the coarse 'prof:<profile>' entry the autotuner writes.
     Falls back to `default` when the param hasn't been learned for this profile.
     profile_str is the 'band|length|punct|lexis' string stored on each chunk."""
     if not profile_str:
@@ -3550,7 +3815,9 @@ def _adjust_pref_temperature(sentence_type, step):
         entry = dict(store.get(_vk(stype)) or {})
         base = entry.get("temperature")
         if base is None:
-            base = 0.33
+            # In learned units the neutral value is the anchor, which the dial
+            # turns into the live slider. Without an anchor it is the old 0.33.
+            base = temperature_anchor() or 0.33
         new_t = round(max(0.05, min(0.95, base + step)), 3)
         entry["temperature"] = new_t
         entry["updated"] = datetime.now().isoformat()
@@ -4205,7 +4472,9 @@ def mark_session_solid(since_ts=None, played=None):
     stype_counts = {}
     # Per sentence type, the temperatures those solid chunks were ACTUALLY
     # synthesised with. Reinforcement below moves toward the mean of these
-    # rather than toward whatever the live slider currently reads.
+    # rather than toward whatever the live slider currently reads. They are
+    # held in learned units, each with its own chunk's dial taken out as it is
+    # read, since that is what the store they are blended into holds.
     stype_temps = {}
 
     solid = []   # (chunk id, used temperature), for the profile keys below
@@ -4227,7 +4496,7 @@ def mark_session_solid(since_ts=None, played=None):
             # currently has no verdict.
             for cid in played:
                 row = conn.execute(
-                    "SELECT sentence_type, user_feedback, used_temperature "
+                    "SELECT sentence_type, user_feedback, used_temperature, used_dial "
                     "FROM chunks WHERE id=?", (cid,)).fetchone()
                 if not row:
                     # Heard, but its row is gone: the chunk history was
@@ -4236,20 +4505,21 @@ def mark_session_solid(since_ts=None, played=None):
                     # counted and said, rather than vanishing silently.
                     missing += 1
                     continue
-                stype, fb, used_temp = row[0], row[1], row[2]
+                stype, fb = row[0], row[1]
+                used_temp = stored_temperature(row[2], row[3])
                 if fb:   # already perfect, negative or solid, so leave it
                     continue
                 conn.execute("UPDATE chunks SET user_feedback='solid' WHERE id=?", (cid,))
                 _digest(cid, stype, used_temp)
         elif since_ts is not None:
             rows = conn.execute("""
-                SELECT id, sentence_type, used_temperature FROM chunks
+                SELECT id, sentence_type, used_temperature, used_dial FROM chunks
                 WHERE ts >= ? AND success = 1 AND skipped = 0
                   AND (user_feedback IS NULL OR user_feedback = '')
             """, (since_ts,)).fetchall()
-            for cid, stype, used_temp in rows:
+            for cid, stype, used_temp, used_dial in rows:
                 conn.execute("UPDATE chunks SET user_feedback='solid' WHERE id=?", (cid,))
-                _digest(cid, stype, used_temp)
+                _digest(cid, stype, stored_temperature(used_temp, used_dial))
         conn.commit()
         conn.close()
 
@@ -4280,8 +4550,9 @@ def mark_session_solid(since_ts=None, played=None):
     # anchored to audio the user actually accepted.
     deltas = []   # (stype, before, after) for the legible history event
     if marked:
-        alpha = 0.08
         fallback_t = (_live_settings_ref or {}).get("temperature")
+        if fallback_t is not None:
+            fallback_t = stored_temperature(fallback_t, temperature_dial(fallback_t))
         with _good_settings_lock:
             store = dict(_load_good_settings())
             for stype in stype_counts:
@@ -4293,6 +4564,7 @@ def mark_session_solid(since_ts=None, played=None):
                     continue
                 entry = dict(store.get(_vk(stype)) or {})
                 prev = entry.get("temperature")
+                alpha = _approval_alpha(entry, _SOLID_ALPHA)
                 new_t = round(
                     target if prev is None else prev * (1 - alpha) + target * alpha, 3)
                 entry["temperature"] = new_t
@@ -4429,6 +4701,101 @@ def delete_rule(rule_id):
         conn.commit()
         conn.close()
     invalidate_rule_cache()
+
+
+# --- Flags: reports that were counted and never fixed ---
+# A FLAG rule changes nothing. It counts how often its pattern comes up again,
+# and until now nothing showed the count to anyone, so a word reported once kept
+# being said wrongly for as long as it kept being read: "CNF" was reported in
+# June with "C.N.F" as how it should sound, filed as a flag, and came up 314
+# more times. These three are what the dashboard's "needs attention" list is
+# built on: see the flags, fix one by saying how it should sound, or dismiss it.
+
+def _flag_report(conn, pattern):
+    """The most recent report a flag could have come from: one that named the
+    pattern as its token, or one with no token whose chunk began with it."""
+    return conn.execute(
+        "SELECT issue, expected FROM reports "
+        "WHERE token=? OR (COALESCE(token,'')='' AND substr(chunk_text,1,?)=?) "
+        "ORDER BY ts DESC, id DESC LIMIT 1",
+        (pattern, len(pattern), pattern)).fetchone()
+
+
+def get_flag_rules():
+    """Active FLAG rules, most hits first, each with the issue it was reported
+    as and, when the report said how it should sound, that as a hint."""
+    out = []
+    with _db_lock:
+        conn = _get_db()
+        try:
+            rows = conn.execute(
+                "SELECT id, pattern, hits, ts FROM rules "
+                "WHERE rule_type='FLAG' AND active=1 ORDER BY hits DESC, ts DESC").fetchall()
+            for rid, pattern, hits, ts in rows:
+                pattern = pattern or ""
+                rep = _flag_report(conn, pattern) if pattern else None
+                hint = ((rep[1] or "").strip() if rep else "")
+                out.append({"id": rid, "pattern": pattern, "hits": hits or 0,
+                            "issue": (rep[0] if rep else None), "ts": ts,
+                            # A hint that only repeats the word is no hint.
+                            "expected_hint": hint if hint.lower() != pattern.strip().lower() else ""})
+        finally:
+            conn.close()
+    return out
+
+
+def _active_flag(rule_id):
+    """(id, pattern, hits) of an active FLAG rule, or None for anything else,
+    so neither route can be pointed at a rule of another kind."""
+    try:
+        rid = int(rule_id)
+    except (TypeError, ValueError):
+        return None
+    with _db_lock:
+        conn = _get_db()
+        try:
+            row = conn.execute("SELECT id, pattern, hits FROM rules "
+                               "WHERE id=? AND rule_type='FLAG' AND active=1", (rid,)).fetchone()
+        finally:
+            conn.close()
+    return (row[0], row[1] or "", row[2] or 0) if row else None
+
+
+def fix_flag_rule(rule_id, say):
+    """Turn a flag into the pronunciation it was asking for, and switch the
+    flag off. Returns {"ok", "message"}, with "not_found" set when there is no
+    such active flag."""
+    flag = _active_flag(rule_id)
+    if not flag:
+        return {"ok": False, "not_found": True,
+                "message": "That flag is not there any more. It may already be fixed or dismissed."}
+    rid, pattern, hits = flag
+    say = (say if isinstance(say, str) else "").strip()
+    if not say:
+        return {"ok": False, "message": "Type how it should be said first, for example C.N.F."}
+    if len(say) > 200:
+        return {"ok": False, "message": "That is too long to be how one word or phrase is said."}
+    if say.lower() == pattern.strip().lower():
+        return {"ok": False, "message": f"'{say}' is what it already says. Type how it should "
+                                         f"sound instead, or dismiss the flag."}
+    outcome = _teach_pronunciation(pattern, say)
+    delete_rule(rid)
+    log_history("FLAG", f'fixed "{pattern}" → {say} ({hits} hits as a flag)', "user")
+    return {"ok": True, "pattern": pattern, "say": say,
+            "message": f"'{pattern}' will now be said as '{say}'"
+                       + (", replacing the earlier correction." if outcome == "updated" else ".")}
+
+
+def dismiss_flag_rule(rule_id):
+    """Switch a flag off without teaching anything. Deactivated, not deleted."""
+    flag = _active_flag(rule_id)
+    if not flag:
+        return {"ok": False, "not_found": True,
+                "message": "That flag is not there any more. It may already be fixed or dismissed."}
+    rid, pattern, hits = flag
+    delete_rule(rid)
+    log_history("FLAG", f'dismissed "{pattern[:60]}" ({hits} hits)', "user")
+    return {"ok": True, "pattern": pattern, "message": f"Dismissed '{pattern[:60]}'."}
 
 
 # Sentinel returned by apply_learned_rules when a SUPPRESS rule matches the
@@ -4626,6 +4993,151 @@ def _increment_rule_hits(rule_ids):
                     r["hits"] = (r.get("hits") or 0) + 1
 
 
+# --- Migrations of learned data ---
+# Both run once, at import, behind a marker in the counters table, the same way
+# _retire_dead_report_rules does. Neither deletes what it changes: the speed
+# trims are moved to a record of their own in good_settings, and a converted
+# flag is switched off, not removed.
+_SPEED_RETIRE_MARKER = "migration_retire_speed_mod_v1"
+_RETIRED_SPEED_KEY   = "_retired_speed_mod"
+_FLAG_FIX_MARKER     = "migration_flags_to_pronunciations_v1"
+# A token worth a pronunciation rule: a real word or acronym. Symbols such as
+# "*" and two-letter fragments such as "pi" would match far too much.
+_RE_WORDLIKE = re.compile(r"^[A-Za-z0-9]{3,}$")
+
+
+def _is_profile_key(key):
+    """A profile entry of any voice: prof:<...> or v:<voice>:prof:<...>."""
+    return key.startswith("prof:") or (key.startswith("v:") and ":prof:" in key)
+
+
+def _retire_speed_mods():
+    """Take every per-profile speed trim out of the profile entries, once.
+
+    Thirteen profiles carried a speed_mod of 1.14 to 1.39 left behind by the
+    seeding bug described at _AUTOTUNE_PARAMS, so their chunks played at up to
+    1.6x while the rest played at 1.07 to 1.15x. Synthesis no longer reads the
+    trim, and this removes the stored values so nothing else can pick them up.
+
+    Each one goes into good_settings under _retired_speed_mod, keyed by the
+    profile entry it came from, with the open speed checkpoints beside it, so
+    any of them can be put back by hand. Returns what was moved, or None when
+    it has already run."""
+    if get_counter(_SPEED_RETIRE_MARKER):
+        return None
+    moved, dropped = {}, {}
+    with _good_settings_lock:
+        store = dict(_load_good_settings())
+        for key, entry in list(store.items()):
+            if not isinstance(entry, dict):
+                continue
+            if _is_profile_key(key) and "speed_mod" in entry:
+                moved[key] = entry["speed_mod"]
+                store[key] = {k: v for k, v in entry.items() if k != "speed_mod"}
+            elif key == "_autotune_ckpt" or key.endswith(":_autotune_ckpt"):
+                speed = {ck: cv for ck, cv in entry.items()
+                         if isinstance(cv, dict) and cv.get("param") == "speed"}
+                if speed:
+                    dropped.update({f"{key}/{ck}": cv for ck, cv in speed.items()})
+                    store[key] = {ck: cv for ck, cv in entry.items() if ck not in speed}
+        if moved or dropped:
+            prior = store.get(_RETIRED_SPEED_KEY) or {}
+            store[_RETIRED_SPEED_KEY] = {
+                "ts": time.time(),
+                "retired": datetime.now().isoformat(),
+                "note": "per-profile speed trims removed; speed is live speed x band rate",
+                "profiles": {**(prior.get("profiles") or {}), **moved},
+                "checkpoints": {**(prior.get("checkpoints") or {}), **dropped},
+            }
+            # Written before the cache is swapped and before the marker is
+            # set, so a failed write leaves everything as it was to try again.
+            _write_json_atomic(_good_settings_path(), store, indent=2)
+            global _good_settings_cache
+            _good_settings_cache = store
+    set_counter(_SPEED_RETIRE_MARKER, 1)
+    if moved or dropped:
+        vals = sorted(moved.values())
+        span = f" ({vals[0]} to {vals[-1]})" if vals else ""
+        log_history("MIGRATION",
+                    f"removed {len(moved)} per-profile speed trim(s){span} and "
+                    f"{len(dropped)} open speed checkpoint(s); speed is now live speed x "
+                    f"band rate. Old values kept under {_RETIRED_SPEED_KEY}", "auto")
+        print(f"[LEARNER] Migration: removed {len(moved)} per-profile speed trim(s){span} "
+              f"and {len(dropped)} speed checkpoint(s); kept under {_RETIRED_SPEED_KEY}")
+    return {"profiles": moved, "checkpoints": dropped}
+
+
+def _convert_reported_flags():
+    """Make the pronunciation rule a flag was really asking for, once.
+
+    A pronunciation report that said how the word should sound was sometimes
+    filed as a flag, which only counts. Where an active flag's pattern is a
+    word-like token and the report behind it (issue PRONUNCIATION, token equal
+    to the pattern) gives a sound that differs from the token, the rule is made
+    through the same path a pronunciation report takes and the flag is switched
+    off. A token that already has an active pronunciation rule keeps that one,
+    since it is newer than the report, and only loses its flag.
+
+    Returns the list of (pattern, sound, hits) it converted, or None when it
+    has already run."""
+    if get_counter(_FLAG_FIX_MARKER):
+        return None
+    todo = []
+    with _db_lock:
+        conn = _get_db()
+        try:
+            flags = conn.execute("SELECT id, pattern, hits FROM rules "
+                                 "WHERE rule_type='FLAG' AND active=1").fetchall()
+            for fid, pattern, hits in flags:
+                pattern = pattern or ""
+                if not _RE_WORDLIKE.match(pattern):
+                    continue
+                said = [(e or "").strip() for (e,) in conn.execute(
+                    "SELECT expected FROM reports WHERE issue='PRONUNCIATION' AND token=? "
+                    "ORDER BY ts DESC, id DESC", (pattern,))]
+                # Newest first; one that only repeats the token says nothing.
+                sound = next((e for e in said if e and e.lower() != pattern.lower()), None)
+                if not sound:
+                    continue
+                has_rule = conn.execute(
+                    "SELECT 1 FROM rules WHERE rule_type='PRONUNCIATION' AND active=1 "
+                    "AND lower(pattern)=lower(?)", (pattern,)).fetchone()
+                todo.append((fid, pattern, hits or 0, sound, bool(has_rule)))
+        finally:
+            conn.close()
+    converted = []
+    for fid, pattern, hits, sound, has_rule in todo:
+        if not has_rule:
+            before = None
+            try:
+                if STORE_PATH.exists():
+                    before = json.loads(_read_text(STORE_PATH)).get(pattern.upper())
+            except Exception:
+                pass
+            _teach_pronunciation(pattern, sound)
+            log_history("MIGRATION",
+                        f'flag "{pattern}" ({hits} hits) became the pronunciation its report '
+                        f'asked for: {sound}'
+                        + (f' (the store said "{before}" before)' if before else "")
+                        + "; the flag is switched off, not deleted", "auto")
+            print(f"[LEARNER] Migration: flag '{pattern}' ({hits} hits) is now a "
+                  f"pronunciation rule → {sound}")
+            converted.append((pattern, sound, hits))
+        else:
+            log_history("MIGRATION", f'flag "{pattern}" ({hits} hits) switched off: it '
+                                     f'already has a pronunciation rule', "auto")
+        delete_rule(fid)
+    set_counter(_FLAG_FIX_MARKER, 1)
+    return converted
+
+
+for _migration in (_retire_speed_mods, _convert_reported_flags):
+    try:
+        _migration()
+    except Exception as _e:
+        print(f"[LEARNER] {_migration.__name__} skipped: {_e}")
+
+
 # Reference to the server's _LIVE_SETTINGS.
 #
 # It is read-only. Nothing in this module is allowed to assign into it.
@@ -4645,9 +5157,17 @@ _live_settings_ref = None
 
 def register_live_settings(settings_dict):
     """server.py calls this on startup to share the live settings dict, which is
-    read-only in this module. See the note above."""
+    read-only in this module. See the note above.
+
+    The first time it is called on an install is also when the temperature dial
+    gets its anchor, since this is the moment the learner first knows where the
+    slider stands: the saved default when there is one, else the factory value."""
     global _live_settings_ref
     _live_settings_ref = settings_dict
+    try:
+        ensure_temperature_anchor((settings_dict or {}).get("temperature"))
+    except Exception as e:
+        print(f"[LEARNER] temperature dial anchor skipped: {e}")
 
 print("[LEARNER] Quality monitor initialised — DB:", DB_PATH)
 print(f"[LEARNER] Whisper: {'available' if _WHISPER_OK else 'not installed (pip install openai-whisper)'}")
@@ -4673,7 +5193,11 @@ def get_chunk_feed(limit=20):
     The most recent issue breaks timestamp ties on rowid. Two reports made in
     quick succession can share a timestamp to the clock's resolution, and
     ordering on ts alone then returns whichever SQLite happens to meet first,
-    which showed up as a test that passed on one run and failed on the next."""
+    which showed up as a test that passed on one run and failed on the next.
+
+    private is 1 for a chunk from a private read. Its text is empty, by design,
+    and the flag is what lets the dashboard show a lock there instead of a
+    blank card."""
     with _db_lock:
         conn = _get_db()
         total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
@@ -4687,7 +5211,7 @@ def get_chunk_feed(limit=20):
                        AS report_count,
                    (SELECT r.issue FROM reports r WHERE r.chunk_id = c.id
                         ORDER BY r.ts DESC, r.rowid DESC LIMIT 1) AS report_issue
-                   , c.read_id, c.read_index, c.read_total
+                   , c.read_id, c.read_index, c.read_total, c.private
             FROM chunks c
             ORDER BY COALESCE(c.read_ts, c.ts) DESC,
                      COALESCE(c.read_index, 0) DESC,
@@ -4735,7 +5259,7 @@ def get_chunks_filtered(limit=100, offset=0, filter_type="all"):
                    char_count, success, skipped, quality_score,
                    quality_flags, whisper_accuracy, pitch_variance,
                    voice_consistency, energy_tail, ts, user_feedback, profile,
-                   error_type, error_stage, retried, primary_facet,
+                   error_type, error_stage, retried, primary_facet, private,
                    (SELECT COUNT(*) FROM chunks c2 WHERE c2.ts <= chunks.ts) AS seq
             FROM chunks WHERE {where}
             ORDER BY ts DESC LIMIT ? OFFSET ?
