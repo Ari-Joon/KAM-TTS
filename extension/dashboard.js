@@ -13,8 +13,10 @@ const ISSUE_ACTION_MAP = {
   PRONUNCIATION: { action: 'ADD_TO_STORE',     desc: 'Saves the correct pronunciation so this word is always read right from now on.' },
   HALLUCINATION: { action: 'BLACKLIST',        desc: 'With a word typed in, that word is blocked from every future read, so only type one the voice invented. With none, the temperature is lowered for this kind of sentence.' },
   SKIP:          { action: 'ADJUST_CHUNK',     desc: 'Needs the word that was dropped. Without it the report is only filed as a flag. The reply below says what the server changed.' },
-  TOO_FAST:      { action: 'ADJUST_RATE_DOWN', desc: 'Slows the speaking rate slightly for this kind of sentence, unless it is already at the slowest, which the reply will say.' },
-  TOO_SLOW:      { action: 'ADJUST_RATE_UP',   desc: 'Speeds the speaking rate slightly for this kind of sentence, unless it is already at the fastest, which the reply will say.' },
+  // Pace is learned per complexity band and nowhere else, so these no longer
+  // say "this kind of sentence", which was the per-profile trim that is gone.
+  TOO_FAST:      { action: 'ADJUST_RATE_DOWN', desc: 'Slows the reading pace slightly for text of this complexity (simple, typical or dense), on top of your speed slider, unless it is already at the slowest, which the reply will say.' },
+  TOO_SLOW:      { action: 'ADJUST_RATE_UP',   desc: 'Speeds the reading pace slightly for text of this complexity (simple, typical or dense), on top of your speed slider, unless it is already at the fastest, which the reply will say.' },
   ROBOTIC:       { action: 'ADJUST_TEMP_UP',   desc: 'Raises expressiveness so the voice sounds less flat and monotone.' },
   VOICE:         { action: 'ADJUST_TEMP_DOWN', desc: 'Lowers variability so the voice stays steady and stops drifting.' },
   EQUATION:      { action: 'MATH_OVERRIDE',    desc: 'Teaches how this equation or symbol should be read aloud, used from now on.' },
@@ -54,17 +56,27 @@ let _browserOffset = 0;
 // short-lived toast at the bottom of the screen so the user knows something
 // actually went wrong.
 let _toastEl = null;
+// The toast is made once, at load, before anything is said through it. A
+// screen reader only announces changes to a live region it already knows
+// about, so one made at the moment of the first message stayed silent for
+// that message. It never takes clicks either: it sits invisible over the
+// bottom of the page between messages, and used to swallow them there.
+function _ensureToast() {
+  if (_toastEl) return _toastEl;
+  _toastEl = document.createElement('div');
+  _toastEl.setAttribute('role', 'status');
+  _toastEl.setAttribute('aria-live', 'polite');
+  _toastEl.style.cssText =
+    'position:fixed;bottom:18px;left:50%;transform:translateX(-50%);' +
+    'background:#1a0a0a;color:#fca5a5;border:1px solid #dc2626;' +
+    'border-radius:6px;padding:10px 16px;font:12px/1.4 var(--font,sans-serif);' +
+    'z-index:99999;max-width:520px;box-shadow:0 6px 24px rgba(0,0,0,0.5);' +
+    'opacity:0;transition:opacity 0.2s;pointer-events:none';
+  document.body.appendChild(_toastEl);
+  return _toastEl;
+}
 function showToast(msg, kind = 'error') {
-  if (!_toastEl) {
-    _toastEl = document.createElement('div');
-    _toastEl.style.cssText =
-      'position:fixed;bottom:18px;left:50%;transform:translateX(-50%);' +
-      'background:#1a0a0a;color:#fca5a5;border:1px solid #dc2626;' +
-      'border-radius:6px;padding:10px 16px;font:12px/1.4 var(--font,sans-serif);' +
-      'z-index:99999;max-width:520px;box-shadow:0 6px 24px rgba(0,0,0,0.5);' +
-      'opacity:0;transition:opacity 0.2s';
-    document.body.appendChild(_toastEl);
-  }
+  _ensureToast();
   if (kind === 'info') {
     _toastEl.style.background = '#0a1a14';
     _toastEl.style.color      = '#86efac';
@@ -106,7 +118,11 @@ function showTab(name) {
   TABS.forEach(t => {
     const b = document.querySelector(`[data-tab="${t}"]`);
     const p = document.getElementById('panel-' + t);
-    if (b) b.classList.toggle('active', t === name);
+    if (b) {
+      b.classList.toggle('active', t === name);
+      // The gold fill is the only sign of which tab is open, so say it too.
+      b.setAttribute('aria-pressed', t === name ? 'true' : 'false');
+    }
     if (p) p.classList.toggle('active', t === name);
   });
   // The active-tab marker on <body> drives the layout overrides, so the AI tab
@@ -118,7 +134,7 @@ function showTab(name) {
   const rp = document.getElementById('right-panel');
   if (rp && name !== 'ai' && !rp.style.width) rp.style.width = '320px';
   if (name === 'stats')  refreshStats();
-  if (name === 'rules')  refreshRules();
+  if (name === 'rules')  { refreshRules(); refreshAttention(); }
   if (name === 'report') { refreshReports(); refreshChunkSelector(); }
   if (name === 'ai')     refreshAI();
   if (name === 'chunks') loadBrowser('low', 0);
@@ -138,6 +154,45 @@ const TAG_CLR = {
 };
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+// For text that goes inside a quoted attribute. esc() leaves quotes alone,
+// which is fine between tags, but a pattern or a chunk with a " in it closed
+// the attribute early and the rest of it was read as markup.
+function escAttr(s) {
+  return esc(s == null ? '' : s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// --- Private reads ---
+// A read marked private is still counted and can still be rated, but its text
+// was deliberately not kept, so the server sends the row with private set and
+// an empty chunk_text. The browser and AI lists come from other routes that
+// may only send the empty text, so an empty text is read the same way: there
+// is nothing else such a row could honestly show.
+const PRIVATE_LABEL = '🔒 Private read';
+function isPrivateRow(row) {
+  if (!row) return false;
+  return !!Number(row.private) || row.private === true || !String(row.chunk_text || '').trim();
+}
+// What stands where a chunk's text goes, for every list that shows one.
+function chunkTextHTML(row) {
+  return isPrivateRow(row) ? `<span class="private-read">${PRIVATE_LABEL}</span>`
+                           : esc((row && row.chunk_text) || '');
+}
+// The text block of a feed card. The text is the report control, so it is a
+// button by role and reachable by Tab. A private card gets neither, since
+// there is no text to carry into a report.
+function chunkTextBlock(row) {
+  return isPrivateRow(row)
+    ? `<div class="chunk-text">${chunkTextHTML(row)}</div>`
+    : `<div class="chunk-text" role="button" tabindex="0">${chunkTextHTML(row)}</div>`;
+}
+
+// Enter or Space on something that is a button by role rather than by
+// element, which is how a keyboard presses it. The sortable rule headers
+// count too, though they keep their column-header role.
+function keyActivates(key, el) {
+  if (key !== 'Enter' && key !== ' ' && key !== 'Spacebar') return false;
+  return !!(el && el.matches && el.matches('[role="button"][tabindex], th.rule-sort[tabindex]'));
 }
 
 // --- Plain-English rule explanations ---
@@ -276,13 +331,16 @@ function pollConsole() {
         }
         _logSince = d.cursor || (_logSince + d.lines.length);
       }
+      // Written only when it changes. The pill is a live region now, and
+      // setting the same text every three seconds reads as a change to some
+      // screen readers, which then announce "online" for ever.
       const el = document.getElementById('server-status');
-      if (el) { el.textContent='● online'; el.className='pill online'; }
+      if (el && el.textContent !== '● online') { el.textContent='● online'; el.className='pill online'; }
       if (typeof _markServerOnline === 'function') _markServerOnline(true);
     })
     .catch(()=>{
       const el=document.getElementById('server-status');
-      if(el){el.textContent='○ offline';el.className='pill offline';}
+      if(el && el.textContent !== '○ offline'){el.textContent='○ offline';el.className='pill offline';}
       if (typeof _markServerOnline === 'function') _markServerOnline(false);
     });
 }
@@ -386,10 +444,12 @@ function _chunkCardHTML(row, q, verdict) {
     +`<span class="chunk-badge">${row.char_count||0}c</span>`
     +(q!=null?`<span class="chunk-badge">${(q*100).toFixed(0)}%</span>`:'')
     +(row.quality_flags?`<span class="chunk-badge warn">${esc(row.quality_flags)}</span>`:'')
-    +`<button class="chunk-thumb${fbUp}" data-action="positive" data-chunk-id="${esc(row.chunk_id||'')}" title="Perfect chunk. Reinforce it">👍</button>`
-    +`<button class="chunk-thumb chunk-thumb-down${fbDown}" data-action="negative" data-chunk-id="${esc(row.chunk_id||'')}" title="Broken chunk. Log it as a hallucination">👎</button>`
+    // The thumbs are emoji alone, so each carries its meaning as a label, and
+    // whether it is the chosen one, which is otherwise only a colour.
+    +`<button class="chunk-thumb${fbUp}" data-action="positive" data-chunk-id="${escAttr(row.chunk_id||'')}" title="Perfect chunk. Reinforce it" aria-label="Perfect chunk. Reinforce it" aria-pressed="${verdict === 'up'}">👍</button>`
+    +`<button class="chunk-thumb chunk-thumb-down${fbDown}" data-action="negative" data-chunk-id="${escAttr(row.chunk_id||'')}" title="Broken chunk. Log it as a hallucination" aria-label="Broken chunk. Log it as a hallucination" aria-pressed="${verdict === 'down'}">👎</button>`
     +`</div>`
-    +`<div class="chunk-text">${esc(row.chunk_text||'')}</div>`
+    +chunkTextBlock(row)
     +(row.whisper_accuracy!=null?`<div class="chunk-quality">Whisper ${(row.whisper_accuracy*100).toFixed(0)}% · Pitch σ${row.pitch_variance!=null?row.pitch_variance:'—'}</div>`:'');
 }
 
@@ -403,6 +463,7 @@ function _setCardRated(card, state) {
   // _effectiveVerdict once the server reports the same verdict back.
   if (card.dataset.id) _pendingVerdict.set(card.dataset.id, state || null);
   card.classList.remove('rated-up', 'rated-down', 'just-rated');
+  _syncThumbPressed(card, state);
   if (!state) return;
   card.classList.add(state === 'up' ? 'rated-up' : 'rated-down');
   // Restart the flash animation. Removing the class and reading offsetWidth
@@ -410,6 +471,16 @@ function _setCardRated(card, state) {
   // and a second rating on the same card would not flash.
   void card.offsetWidth;
   card.classList.add('just-rated');
+}
+
+// Say which thumb is the chosen one, for a click that has not been redrawn
+// from the server yet. state is 'up', 'down', or null for neither.
+function _syncThumbPressed(card, state) {
+  if (!card || !card.querySelector) return;
+  const up = card.querySelector('.chunk-thumb:not(.chunk-thumb-down)');
+  const dn = card.querySelector('.chunk-thumb-down');
+  if (up) up.setAttribute('aria-pressed', state === 'up' ? 'true' : 'false');
+  if (dn) dn.setAttribute('aria-pressed', state === 'down' ? 'true' : 'false');
 }
 
 const _FEED_CAP = 40;   // cards kept in the DOM
@@ -437,6 +508,8 @@ function _setFeedPaused(paused) {
     btn.title = paused
       ? 'Resume the live feed'
       : 'Freeze the feed so you can read and rate without cards moving. New chunks keep arriving and appear when you resume.';
+    // The button is a glyph alone, so its name is kept in step with it.
+    btn.ariaLabel = paused ? 'Resume the live feed' : 'Pause the live feed';
   }
   if (badge) badge.style.display = paused ? '' : 'none';
 
@@ -526,10 +599,14 @@ function _renderChunkFeed(rows) {
     const q = row.quality_score;
     const cls = q==null ? '' : q>=0.75 ? 'quality-high' : q>=0.5 ? 'quality-mid' : 'quality-low';
     let card = existing.get(row.chunk_id);
+    const priv = isPrivateRow(row);
     if (!card) {
       card = document.createElement('div');
       card.dataset.id = row.chunk_id || '';
-      card.title = 'Click chunk text to report. Thumbs-up confirms good quality.';
+      // A private card has no text to report on, so it does not offer to.
+      card.title = priv
+        ? 'Private read. The text was not kept, so there is nothing to report on. The thumbs still rate it.'
+        : 'Click chunk text to report. Thumbs-up confirms good quality.';
       card.dataset.sig = '';
     }
     const verdict  = _effectiveVerdict(row);
@@ -544,7 +621,9 @@ function _renderChunkFeed(rows) {
       card.innerHTML = _chunkCardHTML(row, q, verdict);
       card.dataset.sig = sig;
     }
-    card.dataset.text = row.chunk_text || '';
+    // Empty for a private read, which is what stops a click on the card from
+    // opening a report with nothing in it.
+    card.dataset.text = priv ? '' : (row.chunk_text || '');
     // Preserve the pinned marker; refresh only the quality classes.
     // The rated marker prefers a click that is still in flight and otherwise
     // comes from the server's stored verdict, so a rating survives both the 3s
@@ -555,9 +634,9 @@ function _renderChunkFeed(rows) {
     // Anything reported is marked whatever its measured quality was, since a
     // report is the user saying it was wrong and that outranks the score.
     const want = 'chunk-card ' + cls + (pinned ? ' pinned' : '') + rated
-               + (reported ? ' reported' : '');
+               + (reported ? ' reported' : '') + (priv ? ' private' : '');
     if (card.className !== want) card.className = want;
-    if (reported && row.report_issue) {
+    if (reported && row.report_issue && !priv) {
       card.title = `Reported: ${row.report_issue}. Click the text to report again.`;
     }
 
@@ -641,7 +720,12 @@ function loadBrowser(filter, offset) {
         const cls=q==null?'':q>=0.75?'quality-high':q>=0.5?'quality-mid':'quality-low';
         const card=document.createElement('div');
         card.className='chunk-card '+cls+(row.success===0?' quality-low':'');
-        card.dataset.text=row.chunk_text||''; card.dataset.id=row.chunk_id||''; card.title='Click to select for report';
+        // A private read keeps its place in the list but has no text, so it
+        // cannot be picked for a report.
+        const priv=isPrivateRow(row);
+        card.className+=priv?' private':'';
+        card.dataset.text=priv?'':(row.chunk_text||''); card.dataset.id=row.chunk_id||'';
+        card.title=priv?'Private read. The text was not kept, so there is nothing to report on.':'Click to select for report';
         const flags=(row.quality_flags||'').split('|').filter(Boolean);
         card.innerHTML=
           `<div class="chunk-meta">`
@@ -655,7 +739,7 @@ function loadBrowser(filter, offset) {
           +(row.success===0?'<span class="chunk-badge" style="color:var(--red)">ERROR</span>':'')
           +(row.skipped?'<span class="chunk-badge" style="color:var(--dim)">SKIP</span>':'')
           +`</div>`
-          +`<div class="chunk-text">${esc(row.chunk_text||'')}</div>`
+          +chunkTextBlock(row)
           +`<div class="chunk-analysis">${explainChunkAnalysis(row)}</div>`;
         body.appendChild(card);
       });
@@ -777,13 +861,15 @@ const RULE_CLR = {
     +`<td style="color:var(--subtext);max-width:70px;overflow:hidden;text-overflow:ellipsis">${esc(r.value||r.action||'')}</td>`
     +`<td style="color:${srcClr[r.source]||'var(--dim)'}">${r.source||''}</td>`
     +`<td style="color:var(--dim)">${r.hits||0}</td>`
-    +`<td><button class="del-rule" data-id="${r.id}">✕</button></td>`
+    +`<td><button class="del-rule" data-id="${escAttr(r.id)}" aria-label="Delete the rule for ${escAttr(r.pattern||'')}">✕</button></td>`
     +`</tr>`
   ).join('');
-  // Reflect sort arrow on headers.
+  // Reflect sort arrow on headers, and say the same thing in aria-sort, since
+  // the arrow is all a sighted reader gets and a screen reader gets less.
   document.querySelectorAll('.rule-sort').forEach(th => {
     const base = th.textContent.replace(/[▾▴]/g,'').trim();
     th.textContent = th.dataset.sort === key ? `${base} ${dir<0?'▾':'▴'}` : base;
+    th.setAttribute('aria-sort', th.dataset.sort !== key ? 'none' : dir < 0 ? 'descending' : 'ascending');
   });
 }
 
@@ -839,7 +925,8 @@ function _renderRuleOrigins() {
   const section = (title, desc, list, tip) => {
     const id = 'ro-sec-' + (++n);
     return `<div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px">
-      <div class="ro-toggle" data-target="${id}" title="${esc(tip)}"
+      <div class="ro-toggle" data-target="${id}" title="${escAttr(tip)}"
+           role="button" tabindex="0" aria-expanded="false" aria-controls="${id}"
            style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none">
         <strong style="color:var(--text);font-size:10px">${title} (${list.length})</strong>
         <span class="ro-arrow" style="color:var(--dim);font-size:9px">▸</span>
@@ -869,6 +956,7 @@ function _renderRuleOrigins() {
       const open = body.style.display !== 'none';
       body.style.display = open ? 'none' : 'block';
       if (arrow) arrow.textContent = open ? '▸' : '▾';
+      t.setAttribute('aria-expanded', open ? 'false' : 'true');
     });
   });
 }
@@ -891,6 +979,174 @@ function addRule() {
       refreshRules();
       addLog(`[LEARNER] Manual rule added: ${type} — ${pattern}${value?' → '+value:''}`);
     }).catch(()=>{ addLog('[ERROR] Failed to add rule. Is the server offline?'); });
+}
+
+// --- Needs attention: reports that never became a fix ---
+// A flag is a word or phrase somebody reported that was only counted, never
+// fixed. The server goes on counting each time it comes up again, so the ones
+// with hits are the ones still being heard wrong. They sit at the top of the
+// Rules tab with a box to say how each should sound, because a flag nobody is
+// shown is a report that went nowhere.
+const ATTENTION_TOP = 10;      // rows shown before "show all"
+let _flagsCache   = [];
+let _flagsShowAll = false;
+
+// Which flags to show and in what order: most hits first, the newest first
+// among equals. By default only the ones that have come up again, and at most
+// ten of them. "Show all" adds the rest, which is the ones with no hits and
+// anything past the tenth. live is how many have come up again, which is the
+// number on the tab.
+function attentionPlan(flags, showAll) {
+  const all = (Array.isArray(flags) ? flags : [])
+    .filter(f => f && f.id != null && String(f.pattern == null ? '' : f.pattern).trim())
+    .slice()
+    .sort((a, b) => ((+b.hits || 0) - (+a.hits || 0)) || ((+b.ts || 0) - (+a.ts || 0)));
+  const live = all.filter(f => (+f.hits || 0) > 0).length;
+  // Sorted by hits, so the ones that have come up again are all at the front.
+  const top = all.slice(0, Math.min(live, ATTENTION_TOP));
+  return { rows: showAll ? all : top, rest: all.length - top.length, live, total: all.length };
+}
+
+// One flag: what was reported, how often it has come up since, and the fix.
+// Everything from the server is escaped, the pattern above all, since it is
+// text lifted from whatever page was being read.
+function attentionRowHTML(f) {
+  const n = +f.hits || 0;
+  const came = n > 0 ? `came up ${n} time${n === 1 ? '' : 's'}` : 'has not come up again';
+  const what = escAttr(f.pattern);
+  return `<div class="attn-row" data-flag-id="${escAttr(f.id)}">`
+    + `<div class="attn-head">`
+    +   `<span class="attn-pattern">${esc(f.pattern)}</span>`
+    +   `<span class="attn-hits">${came}</span>`
+    +   (f.issue ? `<span class="chunk-badge">${esc(f.issue)}</span>` : '')
+    + `</div>`
+    + `<div class="attn-act">`
+    +   `<input class="attn-say" type="text" value="${escAttr(f.expected_hint)}"`
+    +     ` placeholder="How should it be said? e.g. C.N.F" aria-label="How ${what} should be said">`
+    +   `<button class="attn-fix" type="button" aria-label="Fix ${what}">Fix</button>`
+    +   `<button class="attn-dismiss" type="button" aria-label="Dismiss ${what}">Dismiss</button>`
+    + `</div>`
+    + `</div>`;
+}
+
+// The whole block, or nothing at all when there are no flags, which is what
+// hides it.
+function attentionHTML(flags, showAll) {
+  const plan = attentionPlan(flags, showAll);
+  if (!plan.total) return '';
+  const more = !plan.rest ? ''
+    : `<button class="attn-more" type="button" aria-expanded="${showAll ? 'true' : 'false'}">`
+      + (showAll ? 'show fewer' : `show all (${plan.rest} more)`) + `</button>`;
+  return `<div class="section-title" style="margin-top:0">Needs attention `
+    + `<span style="color:var(--dim);font-size:8px;font-weight:400;text-transform:none;letter-spacing:0">reported, but never fixed</span></div>`
+    + (plan.rows.length ? plan.rows.map(attentionRowHTML).join('')
+                        : `<div class="attn-none">Nothing reported has come up again.</div>`)
+    + more;
+}
+
+// What Fix sends. Null when there is nothing to send, so an empty box never
+// reaches the server as a rule that says nothing.
+function attentionFixRequest(id, say) {
+  const s = String(say == null ? '' : say).trim();
+  if (id == null || id === '' || !s) return null;
+  return { path: `/rules/flags/${encodeURIComponent(id)}/fix`, method: 'POST', body: { say: s } };
+}
+function attentionDismissRequest(id) {
+  return { path: `/rules/flags/${encodeURIComponent(id)}/dismiss`, method: 'POST' };
+}
+
+// What the server said, and whether it worked. A refusal comes back as ok
+// false with a message or an error, and a server without the route answers
+// with an error and no ok at all, so both count as not done.
+function attentionReply(d, done) {
+  if (!d || d.ok === false || (d.ok == null && d.error)) {
+    return { ok: false, text: (d && (d.message || d.error)) || 'The server did not do that.' };
+  }
+  return { ok: true, text: d.message || done };
+}
+
+// The count on the Rules tab, shown only when something has come up again.
+function _setAttentionBadge(n) {
+  const b = document.getElementById('rules-attn-badge');
+  if (!b) return;
+  b.textContent = n > 0 ? String(n) : '';
+  b.hidden = !(n > 0);
+  const tab = b.closest ? b.closest('[data-tab]') : null;
+  if (!tab) return;
+  // The number alone would be read out as "Rules 3", so the tab says what it
+  // is a count of.
+  if (n > 0) tab.setAttribute('aria-label', `Rules. ${n} reported word${n === 1 ? '' : 's'} still to fix.`);
+  else tab.removeAttribute('aria-label');
+}
+
+function _renderAttention() {
+  const host = document.getElementById('rules-attention');
+  _setAttentionBadge(attentionPlan(_flagsCache, _flagsShowAll).live);
+  if (!host) return;
+  // Anything typed but not sent is carried across the redraw, since fixing one
+  // row redraws them all and would otherwise wipe the others.
+  const typed = {};
+  host.querySelectorAll('.attn-row').forEach(row => {
+    const inp = row.querySelector('.attn-say');
+    if (inp && inp.value !== inp.defaultValue) typed[row.dataset.flagId] = inp.value;
+  });
+  const html = attentionHTML(_flagsCache, _flagsShowAll);
+  host.innerHTML = html;
+  host.style.display = html ? 'block' : 'none';
+  host.querySelectorAll('.attn-row').forEach(row => {
+    const inp = row.querySelector('.attn-say');
+    if (inp && typed[row.dataset.flagId] != null) inp.value = typed[row.dataset.flagId];
+  });
+}
+
+// Asked for when the Rules tab is opened and when the server is first seen,
+// not on a timer: flags change when someone reports or fixes something, not
+// by themselves.
+function refreshAttention() {
+  return api('/rules/flags').then(d => {
+    _flagsCache = (d && Array.isArray(d.flags)) ? d.flags : [];
+    _renderAttention();
+  }).catch(() => {
+    // An older server has no such route and one that is off cannot answer.
+    // Either way there is nothing to show, so the block hides and says nothing.
+    _flagsCache = [];
+    _renderAttention();
+  });
+}
+
+function _attentionFix(id, say, btn) {
+  const req = attentionFixRequest(id, say);
+  if (!req) { showToast('Type how it should be said first, for example C.N.F'); return Promise.resolve(false); }
+  if (btn) btn.disabled = true;
+  return api(req.path, req.method, req.body).then(d => {
+    const r = attentionReply(d, 'Fix saved.');
+    showToast(r.text, r.ok ? 'info' : 'error');
+    if (!r.ok) { if (btn) btn.disabled = false; return false; }
+    // The flag is a rule now, so both lists have changed.
+    refreshAttention();
+    refreshRules();
+    return true;
+  }).catch(err => {
+    if (btn) btn.disabled = false;
+    showToast('Could not save the fix: ' + ((err && err.message) || 'is the server offline?'));
+    return false;
+  });
+}
+
+function _attentionDismiss(id, btn) {
+  const req = attentionDismissRequest(id);
+  if (btn) btn.disabled = true;
+  return api(req.path, req.method).then(d => {
+    const r = attentionReply(d, '');
+    if (!r.ok) { if (btn) btn.disabled = false; showToast(r.text); return false; }
+    _flagsCache = _flagsCache.filter(f => String(f.id) !== String(id));
+    _renderAttention();
+    return true;
+  }).catch(err => {
+    if (btn) btn.disabled = false;
+    showToast('Could not dismiss it: ' + ((err && err.message) || 'is the server offline?'));
+    return false;
+  });
 }
 
 // --- Reports list ---
@@ -1141,6 +1397,8 @@ function toggleAiSection(id) {
   if (!body) return;
   const collapsed = body.classList.toggle('collapsed');
   if (arrow) arrow.classList.toggle('open', !collapsed);
+  const head = sec.querySelector('.ai-section-header');
+  if (head) head.ariaExpanded = collapsed ? 'false' : 'true';
 }
 
 // Where the volume slider starts. storedGain is playbackGain from
@@ -1157,6 +1415,15 @@ function volumeStartPct(storedGain, legacyPct) {
     return { pct: Math.max(0, Math.min(600, p)), migrate: true };
   }
   return { pct: 100, migrate: false };
+}
+
+// Whether the dashboard should open when a read starts, from what is stored
+// under kamOpenDashboardOnRead. It always has opened, so a key that was never
+// written means yes, and only a stored false turns it off. The worker reads
+// the same key the same way.
+function openOnReadFromStore(d) {
+  const v = d ? d.kamOpenDashboardOnRead : undefined;
+  return v === undefined || v === null ? true : !!v;
 }
 
 // The section headers are rebuilt with innerHTML on every refresh and used to
@@ -1298,9 +1565,9 @@ function _renderAiFeed(chunks) {
     const full = r.chunk_text || '';
 
     return `
-      <div class="ai-chunk-analysis ${qCls}" data-chunk-id="${esc(r.chunk_id||'')}" data-full-text="${esc(full)}">
+      <div class="ai-chunk-analysis ${qCls}" data-chunk-id="${escAttr(r.chunk_id||'')}" data-full-text="${escAttr(full)}">
         <div class="ai-chunk-head">${numBadge}</div>
-        <div class="ai-text-preview">${esc(full)}</div>
+        <div class="ai-text-preview">${chunkTextHTML(r)}</div>
         <div class="ai-metrics">
           <span class="ai-metric ${qMetricCls}">Q: ${qPct}</span>
           ${waPct}${pvStr}${flags}
@@ -1364,7 +1631,7 @@ function refreshAI(silent) {
 
 
       <div class="ai-section" id="ai-sec-stats">
-        <div class="ai-section-header" data-ai-toggle="ai-sec-stats">
+        <div class="ai-section-header" data-ai-toggle="ai-sec-stats" role="button" tabindex="0" aria-expanded="true">
           <span class="ai-section-title">📊 Whisper Analysis</span>
           <span class="ai-collapse-arrow open">▶</span>
         </div>
@@ -1382,7 +1649,7 @@ function refreshAI(silent) {
       </div>
 
       <div class="ai-section" id="ai-sec-insights">
-        <div class="ai-section-header" data-ai-toggle="ai-sec-insights">
+        <div class="ai-section-header" data-ai-toggle="ai-sec-insights" role="button" tabindex="0" aria-expanded="true">
           <span class="ai-section-title">🔬 Quality Insights</span>
           <span class="ai-collapse-arrow open">▶</span>
         </div>
@@ -1425,6 +1692,18 @@ function refreshAI(silent) {
     _aiLastSig = '';
   });
 }
+
+// --- Keyboard ---
+// The section headers, the rule sort headers and the chunk text are all
+// clickable <div>s and <th>s, which a keyboard could neither reach nor press.
+// They carry a tabindex now, and this presses them: Enter or Space becomes
+// the click their own listeners already handle. Space is stopped from doing
+// its usual job, which is to scroll the panel.
+document.addEventListener('keydown', e => {
+  if (!keyActivates(e.key, e.target)) return;
+  e.preventDefault();
+  e.target.click();
+});
 
 // --- Message from background ---
 chrome.runtime.onMessage.addListener((req)=>{
@@ -1485,8 +1764,10 @@ function _renderAiInsights() {
       h += `<div class="ai-ins-title">Splitter health</div>`
         + `<div class="ai-stat-row"><span>Chunks with 2+ sentences (missed boundary)</span>`
         + `<span class="${d.splitter.pct>5?'warn':'ok'}">${d.splitter.pct}%</span></div>`
-        + (d.splitter.examples||[]).map(t =>
-            `<div style="font-size:9px;color:var(--dim);padding:1px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t)}">· ${esc(t.substring(0,80))}</div>`).join('');
+        // An example from a private read arrives with no text, and a bare dot
+        // says nothing, so those are left out.
+        + (d.splitter.examples||[]).filter(t => t && String(t).trim()).map(t =>
+            `<div style="font-size:9px;color:var(--dim);padding:1px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escAttr(t)}">· ${esc(String(t).substring(0,80))}</div>`).join('');
     }
     if (d.report_outcomes && d.report_outcomes.length) {
       h += `<div class="ai-ins-title">Did your reports work?</div>`
@@ -1526,6 +1807,8 @@ function _renderAiInsights() {
 
 document.addEventListener('DOMContentLoaded',()=>{
 
+  _ensureToast();   // the live region has to exist before its first message
+
   // --- Voice profiles ---
   const vPill = document.getElementById('voice-pill');
   const vMenu = document.getElementById('voice-menu');
@@ -1550,10 +1833,10 @@ document.addEventListener('DOMContentLoaded',()=>{
         return `<div style="display:flex;align-items:center;gap:6px;padding:4px 6px;border:1px solid var(--border);border-radius:5px;${v.active?'background:var(--bg3)':''}">
            <span style="flex:1;color:var(--text);font-size:10px">${esc(v.voice_id)}${v.active?' <span style="color:var(--green)">●</span>':''}</span>
            <span style="color:var(--dim);font-size:9px">${v.clips} clip${v.clips===1?'':'s'}</span>
-           ${v.active?'':`<button class="voice-use" data-id="${esc(v.voice_id)}" ${v.clips?'':'disabled'} title="${v.clips?'Switch to this voice':'No clips recorded yet'}" style="${_vbtn};padding:2px 7px">Use</button>`}
-           <button class="voice-files" data-id="${esc(v.voice_id)}" title="Open this voice's clip folder to add or edit recordings" style="${_vbtn}">📁</button>
-           ${base?'':`<button class="voice-rename" data-id="${esc(v.voice_id)}" title="Rename this voice, moving its clips and everything it has learned" style="${_vbtn}">✎</button>`}
-           <button class="voice-delete" data-id="${esc(v.voice_id)}" ${del?'':'disabled'} title="${base?'The default voice cannot be deleted':v.active?'This is the voice being spoken — switch to another one first':'Delete this voice, its clips and its learning'}" style="${_vbtn}${del?'':';opacity:.35;cursor:default'}">🗑</button>
+           ${v.active?'':`<button class="voice-use" data-id="${escAttr(v.voice_id)}" ${v.clips?'':'disabled'} title="${v.clips?'Switch to this voice':'No clips recorded yet'}" style="${_vbtn};padding:2px 7px">Use</button>`}
+           <button class="voice-files" data-id="${escAttr(v.voice_id)}" title="Open this voice's clip folder to add or edit recordings" aria-label="Open the clip folder for ${escAttr(v.voice_id)}" style="${_vbtn}">📁</button>
+           ${base?'':`<button class="voice-rename" data-id="${escAttr(v.voice_id)}" title="Rename this voice, moving its clips and everything it has learned" aria-label="Rename the voice ${escAttr(v.voice_id)}" style="${_vbtn}">✎</button>`}
+           <button class="voice-delete" data-id="${escAttr(v.voice_id)}" aria-label="Delete the voice ${escAttr(v.voice_id)}" ${del?'':'disabled'} title="${base?'The default voice cannot be deleted':v.active?'This is the voice being spoken — switch to another one first':'Delete this voice, its clips and its learning'}" style="${_vbtn}${del?'':';opacity:.35;cursor:default'}">🗑</button>
          </div>`; }).join('');
     }).catch(()=>_vSay('Server offline — voices unavailable.'));
   }
@@ -1955,6 +2238,11 @@ document.addEventListener('DOMContentLoaded',()=>{
     //   loading  an animated ring while the server boots and the model loads
     //   on       solid green with no animation, so the model is ready and serving
     btn.classList.add(state === 'on' ? 'on' : state === 'loading' ? 'loading' : 'off');
+    // The state is a colour and a ring, so the button's name carries it too.
+    btn.setAttribute('aria-label',
+        state === 'on'      ? 'Local server is on. Press to stop it.'
+      : state === 'loading' ? 'Local server is starting or stopping.'
+                            : 'Local server is off. Press to start it.');
   }
 
   // Ground-truth sync: the console poll (which actually talks to the server)
@@ -1962,13 +2250,21 @@ document.addEventListener('DOMContentLoaded',()=>{
   // started. I don't override an in-progress 'loading' animation with off,
   // so a deliberate start still shows the ring until it's actually up.
   let _midToggle = false;
+  // Whether the last poll reached the server. The flags behind the count on
+  // the Rules tab are asked for once each time the server comes into view, so
+  // the count is there without opening the tab and without a timer of its own.
+  let _seenOnline = false;
   window._markServerOnline = function (online) {
     if (online) {
       _serverRunning = true; _serverReady = true; _midToggle = false;
       _setPower('on');
-    } else if (!_midToggle) {
-      _serverRunning = false; _serverReady = false;
-      _setPower('off');
+      if (!_seenOnline) { _seenOnline = true; refreshAttention(); }
+    } else {
+      _seenOnline = false;
+      if (!_midToggle) {
+        _serverRunning = false; _serverReady = false;
+        _setPower('off');
+      }
     }
   };
 
@@ -2396,7 +2692,8 @@ document.addEventListener('DOMContentLoaded',()=>{
       function _section(title, bodyHtml, hint, openByDefault) {
         const id = 'lrn-sec-' + (++_secId);
         return `<div style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px">
-          <div class="lrn-toggle" data-target="${id}" title="${esc(hint||'')}"
+          <div class="lrn-toggle" data-target="${id}" title="${escAttr(hint||'')}"
+               role="button" tabindex="0" aria-expanded="${openByDefault?'true':'false'}" aria-controls="${id}"
                style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none">
             <strong style="color:var(--text);font-size:10px">${esc(title)}</strong>
             <span class="lrn-arrow" style="color:var(--dim);font-size:9px">${openByDefault?'▾':'▸'}</span>
@@ -2412,7 +2709,9 @@ document.addEventListener('DOMContentLoaded',()=>{
         const mod = e.rate_mod != null ? e.rate_mod : 1.0;
         const pct = Math.round((mod - 1) * 100);
         const word = pct === 0 ? 'unchanged' : (pct < 0 ? `${Math.abs(pct)}% slower` : `${pct}% faster`);
-        const tip = `Reading pace KAM learned for ${esc(e.label||b)} chunks, from your "too fast"/"too slow" reports.`;
+        // Single quotes inside, since this sits in title="..." and a double
+        // one ended the attribute at the first quoted word.
+        const tip = `Reading pace KAM learned for ${escAttr(e.label||b)} chunks, from your 'too fast' and 'too slow' reports. What you hear is your speed slider times this.`;
         return `<div title="${tip}"><strong style="color:var(--text)">${esc(e.label || b)}</strong> chunks: ${word}</div>`;
       }).join('');
 
@@ -2435,14 +2734,14 @@ document.addEventListener('DOMContentLoaded',()=>{
         let body = '';
         if (plain.length) {
           body += `<div style="margin-bottom:5px">` + plain.map(p =>
-            `<div title="Baseline steadiness for all ${esc(p.desc)} chunks."`
+            `<div title="Baseline steadiness for all ${escAttr(p.desc)} chunks."`
             + ` style="display:flex;justify-content:space-between;gap:8px">`
             + `<span style="color:var(--subtext)">${esc(p.desc)}</span>`
             + `<span style="color:var(--indigo)">${p.temp}</span></div>`).join('') + `</div>`;
         }
         Object.keys(groups).sort().forEach(stype => {
           const rows = groups[stype].sort((a,b) => a.desc.localeCompare(b.desc)).map(r =>
-            `<div title="Learned voice steadiness for ${esc(stype)} chunks that are ${esc(r.desc)}. Lower = steadier and more literal; higher = more expressive."`
+            `<div title="Learned voice steadiness for ${escAttr(stype)} chunks that are ${escAttr(r.desc)}, before the Temperature slider scales it. Lower = steadier and more literal; higher = more expressive."`
             + ` style="display:flex;justify-content:space-between;gap:8px;padding:1px 0">`
             + `<span style="color:var(--subtext);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.desc)}</span>`
             + `<span style="color:var(--indigo);flex-shrink:0">${r.temp}</span></div>`).join('');
@@ -2454,7 +2753,7 @@ document.addEventListener('DOMContentLoaded',()=>{
         html += _section(
           `Voice steadiness · ${tkeys.length} learned profile${tkeys.length===1?'':'s'}`,
           body,
-          'Temperature KAM learned per chunk fingerprint. Each line is a distinct sentence shape it has evidence for.',
+          'Temperature KAM learned per chunk fingerprint. Each line is a distinct sentence shape it has evidence for. The Temperature slider is a master dial that scales all of these together.',
           false);
       }
 
@@ -2468,6 +2767,7 @@ document.addEventListener('DOMContentLoaded',()=>{
           const open = body.style.display !== 'none';
           body.style.display = open ? 'none' : 'block';
           if (arrow) arrow.textContent = open ? '▸' : '▾';
+          t.setAttribute('aria-expanded', open ? 'false' : 'true');
         });
       });
     }).catch(() => { el.textContent = 'Server offline.'; });
@@ -2489,7 +2789,11 @@ document.addEventListener('DOMContentLoaded',()=>{
     clearTimeout(_tuneT);
     _tuneT = setTimeout(() => {
       api('/settings', 'POST', { [key]: value })
-        .then(() => _tuneStatus(`${key} = ${value} · applies to next chunk`))
+        // Temperature is the master dial now: it scales what KAM learned for
+        // each kind of text, so it is not reported as the value that is used.
+        .then(() => _tuneStatus(key === 'temperature'
+          ? `temperature dial = ${value} · scales the learned values from the next chunk`
+          : `${key} = ${value} · applies to next chunk`))
         .catch(() => _tuneStatus('Could not reach server.'));
     }, 150);
   }
@@ -2619,6 +2923,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     const cur = document.body.getAttribute('data-theme') || 'arian';
     document.querySelectorAll('.theme-btn').forEach(b => {
       b.classList.toggle('active', b.dataset.theme === cur);
+      b.setAttribute('aria-pressed', b.dataset.theme === cur ? 'true' : 'false');
     });
   }
   _syncThemeButtons();
@@ -2725,6 +3030,19 @@ document.addEventListener('DOMContentLoaded',()=>{
     applyThemeCustomisations(t);
     _syncCustPickers(t);
   })();
+  // --- Open the dashboard when a read starts ---
+  // The worker decides whether to open this page, from kamOpenDashboardOnRead
+  // in chrome.storage.local. This box only reads and writes that key.
+  const openOnRead = document.getElementById('set-open-on-read');
+  if (openOnRead) {
+    try {
+      chrome.storage.local.get('kamOpenDashboardOnRead', d => { openOnRead.checked = openOnReadFromStore(d); });
+    } catch (e) { openOnRead.checked = true; }
+    openOnRead.addEventListener('change', () => {
+      try { chrome.storage.local.set({ kamOpenDashboardOnRead: openOnRead.checked }); } catch (e) {}
+    });
+  }
+
   // React to theme changes from popup or other surfaces.
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
@@ -2733,6 +3051,10 @@ document.addEventListener('DOMContentLoaded',()=>{
         _syncThemeButtons();
         applyThemeCustomisations(changes.playerTheme.newValue || 'arian');
         _syncCustPickers(changes.playerTheme.newValue || 'arian');
+      }
+      // Changed somewhere else, the popup say, so the box follows.
+      if (area === 'local' && changes.kamOpenDashboardOnRead && openOnRead) {
+        openOnRead.checked = openOnReadFromStore({ kamOpenDashboardOnRead: changes.kamOpenDashboardOnRead.newValue });
       }
     });
   } catch {}
@@ -2795,6 +3117,27 @@ document.addEventListener('DOMContentLoaded',()=>{
   const addBtn=document.getElementById('btn-add-rule'); if(addBtn) addBtn.addEventListener('click',addRule);
   const rtbl=document.getElementById('rules-tbody');
   if(rtbl) rtbl.addEventListener('click',e=>{ if(e.target.classList.contains('del-rule')) deleteRule(Number(e.target.dataset.id)); });
+
+  // Needs attention. The rows are rebuilt on every refresh, so one listener on
+  // the block handles Fix, Dismiss and the show-all toggle for all of them.
+  const attn = document.getElementById('rules-attention');
+  if (attn) {
+    const _sayOf = row => { const inp = row.querySelector('.attn-say'); return inp ? inp.value : ''; };
+    attn.addEventListener('click', e => {
+      if (e.target.closest('.attn-more')) { _flagsShowAll = !_flagsShowAll; _renderAttention(); return; }
+      const row = e.target.closest('.attn-row');
+      if (!row) return;
+      const fix = e.target.closest('.attn-fix'), dis = e.target.closest('.attn-dismiss');
+      if (fix) _attentionFix(row.dataset.flagId, _sayOf(row), fix);
+      else if (dis) _attentionDismiss(row.dataset.flagId, dis);
+    });
+    // Enter in the box is Fix, which is what anyone typing into it expects.
+    attn.addEventListener('keydown', e => {
+      if (e.key !== 'Enter' || !e.target.classList || !e.target.classList.contains('attn-say')) return;
+      const row = e.target.closest('.attn-row');
+      if (row) _attentionFix(row.dataset.flagId, e.target.value, row.querySelector('.attn-fix'));
+    });
+  }
 
   // Filter buttons in chunks tab
   document.querySelectorAll('.filter-btn').forEach(btn=>{
@@ -2932,7 +3275,10 @@ document.addEventListener('DOMContentLoaded',()=>{
   function _setSelectMode(on) {
     _feedSelectMode = on;
     if (_feedMassBar) _feedMassBar.style.display = on ? 'flex' : 'none';
-    if (_feedSelToggle) _feedSelToggle.style.background = on ? 'var(--indigo)' : 'transparent';
+    if (_feedSelToggle) {
+      _feedSelToggle.style.background = on ? 'var(--indigo)' : 'transparent';
+      _feedSelToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
     if (cfeed) cfeed.style.userSelect = on ? 'none' : '';
     if (!on) _clearSelection();
   }
@@ -2942,8 +3288,8 @@ document.addEventListener('DOMContentLoaded',()=>{
     if (!card) return;
     const up = card.querySelector('.chunk-thumb:not(.chunk-thumb-down)');
     const dn = card.querySelector('.chunk-thumb-down');
-    if (verdict === 'sounded_perfect') { up && up.classList.add('confirmed'); dn && dn.classList.remove('rejected'); }
-    else if (verdict === 'sounded_wrong') { dn && dn.classList.add('rejected'); up && up.classList.remove('confirmed'); }
+    if (verdict === 'sounded_perfect') { up && up.classList.add('confirmed'); dn && dn.classList.remove('rejected'); _syncThumbPressed(card, 'up'); }
+    else if (verdict === 'sounded_wrong') { dn && dn.classList.add('rejected'); up && up.classList.remove('confirmed'); _syncThumbPressed(card, 'down'); }
   }
   function _massVerdict(verdict) {
     const items = _selectedCards().map(c => ({ card: c, id: c.dataset.id })).filter(x => x.id);

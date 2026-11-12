@@ -67,7 +67,14 @@ runs about twice as fast as playback.
   XTTS fails, meaning runaway babble, a looped fragment or a sentence cut off
   mid-word, and is re-synthesised at a steadier temperature rather than played.
 - **Local and private** — everything runs on your machine; per-install API
-  token, localhost-only server, nothing leaves your computer.
+  token, localhost-only server, nothing leaves your computer. A **Private
+  read** (the toggle in the popup, and always in an incognito window) keeps
+  the text out of the chunk history altogether.
+- **Start a read from the page** — right-click for *Read selection*, *Read
+  from here* or *Read this page*, with no popup open. The bar at the top of
+  the page shows progress, and says why if something could not be read.
+- **Pick up where you left off** — stop, close the browser or lose the server
+  mid-read, and the popup offers to resume at the chunk you reached.
 
 > **Licensing / commercial use.** KAM TTS builds on XTTS-v2. Verify the licence
 > of the exact model weights you use before any commercial use — some XTTS-v2
@@ -431,6 +438,10 @@ currently being spoken cannot be deleted until you switch away from it.
   a separate app from the main API rather than the same one behind a filter, and
   takes a random per-session key that is not the API token. It closes itself
   after twenty minutes. See **Scanning a page with your phone** above.
+- A request is refused unless it is addressed to this machine by a loopback
+  name (`127.0.0.1`, `localhost` or `[::1]`) on the server's port. That closes
+  DNS rebinding, where a web page points its own hostname at `127.0.0.1` to
+  get round CORS and read the token.
 - Override with the `KAM_TOKEN` or `KAM_EXTENSION_ID` environment variables for
   custom setups.
 - The only request KAM TTS makes on its own account is the update check: the

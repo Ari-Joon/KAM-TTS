@@ -143,11 +143,21 @@
     .speed-label { font-size: 11px; color: var(--pop-text-dim); }
     #speed-value { font-size: 11px; color: var(--pop-text); font-weight: 600; }
     #temp-value  { font-size: 11px; color: var(--pop-text); font-weight: 600; }
-    .hint { font-size: 9px; color: #888; }
+    .hint { font-size: 10px; color: #888; }
     input[type="range"] { width: 100%; margin-bottom: 12px; }
     #speed-slider { accent-color: var(--pop-accent); }
     #temp-slider  { accent-color: #ef4444; }
     .footer { font-size: 10px; color: var(--pop-text-muted); text-align: center; margin-bottom: 10px; opacity: 0.6; }
+    /* The saved-read line and the private toggle, both in the status bar's
+       quiet style so they sit in the popup without adding a new look. */
+    .resume-bar { display: none; align-items: center; gap: 8px; background: var(--pop-bg-soft); border-radius: 8px; padding: 6px 10px; margin-bottom: 12px; font-size: 11px; color: var(--pop-text-dim); }
+    .resume-bar span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .resume-bar button { flex: none; width: auto; padding: 4px 10px; font-size: 11px; border-radius: 6px; background: var(--pop-bg-softer); border: 1px solid var(--pop-border); color: var(--pop-text-dim); }
+    .resume-bar button:hover { background: var(--pop-accent); color: var(--pop-on-accent); border-color: var(--pop-accent); }
+    #resume-dismiss { padding: 4px 8px; }
+    .private-row { display: flex; align-items: center; gap: 6px; width: fit-content; margin: -4px 0 12px; font-size: 11px; color: var(--pop-text-dim); cursor: pointer; }
+    .private-row input { margin: 0; accent-color: var(--pop-accent); cursor: pointer; }
+    #private-lock { display: none; }
     .error-msg { display: none; background: var(--pop-danger-bg); border: 1px solid var(--pop-danger-br); border-radius: 6px; padding: 8px 10px; font-size: 11px; color: var(--pop-danger-t); margin-bottom: 10px; }
 
     /* --- Quality feedback bar --- */
@@ -189,7 +199,7 @@
        divider, so controls never crowd each other (consistent 14px gaps). */
     .cust-section { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--pop-border); }
     .cust-section:last-child { padding-bottom: 0; margin-bottom: 0; border-bottom: none; }
-    #settings-panel .section-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: var(--pop-text-muted); margin: 0 0 8px; }
+    #settings-panel .section-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--pop-text-muted); margin: 0 0 8px; }
     .theme-picker { display: flex; gap: 6px; }
     .theme-btn {
       flex: 1; padding: 7px 4px; background: var(--pop-bg); border: 1px solid var(--pop-border);
@@ -217,35 +227,46 @@
   <div class="status-bar">
     <div class="status-dot" id="status-dot"></div>
     <div class="status-body">
-      <span id="status-text">Checking server...</span>
-      <span id="status-step"></span>
+      <span id="status-text" aria-live="polite">Checking server...</span>
+      <span id="status-step" aria-live="polite"></span>
       <div id="status-prog"><i></i></div>
     </div>
-    <button id="status-start" title="Start or stop the KAM TTS server">⏻</button>
+    <button id="status-start" title="Start or stop the KAM TTS server" aria-label="Start or stop the KAM TTS server">⏻</button>
   </div>
 
-  <div class="mode-tabs">
-    <div class="tab active" id="tab-selection">Selected Text</div>
-    <div class="tab" id="tab-page">Read Page</div>
-    <div class="tab" id="tab-custom">Custom Text</div>
+  <div class="mode-tabs" role="tablist" aria-label="What to read">
+    <div class="tab active" id="tab-selection" role="tab" tabindex="0" aria-selected="true">Selected Text</div>
+    <div class="tab" id="tab-page" role="tab" tabindex="0" aria-selected="false">Read Page</div>
+    <div class="tab" id="tab-custom" role="tab" tabindex="0" aria-selected="false">Custom Text</div>
   </div>
 
   <div id="custom-text-area">
-    <textarea id="custom-input" placeholder="Type anything to hear in your voice..."></textarea>
+    <textarea id="custom-input" aria-label="Text to read" placeholder="Type anything to hear in your voice..."></textarea>
   </div>
 
-  <div class="error-msg" id="error-msg"></div>
+  <div class="error-msg" id="error-msg" aria-live="polite"></div>
+
+  <!-- A read that was left part-way, offered back when nothing is playing -->
+  <div class="resume-bar" id="resume-bar">
+    <span id="resume-text"></span>
+    <button id="resume-btn" type="button">Resume</button>
+    <button id="resume-dismiss" type="button" title="Forget this saved read" aria-label="Forget this saved read">×</button>
+  </div>
 
   <div class="controls">
     <button id="speak-btn">▶ Speak</button>
-    <button id="stop-btn" title="Stop">■</button>
+    <button id="stop-btn" title="Stop" aria-label="Stop">■</button>
   </div>
+
+  <label class="private-row" title="The text of a private read is not kept in the chunk history.">
+    <input type="checkbox" id="private-read"> Private read
+  </label>
 
   <div class="player-bar" id="player-bar">
     <div class="player-top">
-      <span class="player-label" id="player-label">Reading 1 of 1</span>
+      <span class="player-label"><span id="private-lock" role="img" aria-label="Private read" title="Private read: its text is not kept in the chunk history.">🔒 </span><span id="player-label">Reading 1 of 1</span></span>
       <div class="player-controls">
-        <button id="btn-pause" title="Pause/Resume">⏸</button>
+        <button id="btn-pause" title="Pause/Resume" aria-label="Pause or resume">⏸</button>
       </div>
     </div>
     <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
@@ -257,21 +278,21 @@
   <div class="fb-bar" id="feedback-bar">
     <span>Rate this chunk:</span>
     <div class="fb-btns">
-      <button class="fb-up"   id="fb-up-btn">👍</button>
-      <button class="fb-down" id="fb-down-btn">👎</button>
+      <button class="fb-up"   id="fb-up-btn" title="This chunk sounded right" aria-label="This chunk sounded right">👍</button>
+      <button class="fb-down" id="fb-down-btn" title="Report a problem with this chunk" aria-label="Report a problem with this chunk">👎</button>
     </div>
   </div>
   <div class="speed-row">
-    <span class="speed-label" title="Adjusts speech rate — takes effect on next chunk">Speech <span class="hint">· speed</span></span>
+    <span class="speed-label" title="Adjusts speech rate. Applies from the next chunk.">Speech <span class="hint">· speed</span></span>
     <span id="speed-value">1.0x</span>
   </div>
-  <input type="range" id="speed-slider" min="0.5" max="2.0" step="0.05" value="1.0" />
+  <input type="range" id="speed-slider" aria-label="Speech speed" min="0.5" max="2.0" step="0.05" value="1.0" />
 
   <div class="speed-row">
-    <span class="speed-label" title="Higher = more expressive/varied. Lower = more precise/robotic. Takes effect on next chunk, no reload needed.">Temperature <span class="hint">· speech diversity</span></span>
+    <span class="speed-label" title="Expressiveness scales what KAM has learned for each kind of text. Higher is more expressive and varied, lower is more precise and even. Applies from the next chunk.">Expressiveness <span class="hint">· scales what KAM has learned</span></span>
     <span id="temp-value">0.33</span>
   </div>
-  <input type="range" id="temp-slider" min="0.05" max="0.90" step="0.01" value="0.33" />
+  <input type="range" id="temp-slider" aria-label="Expressiveness" min="0.05" max="0.90" step="0.01" value="0.33" />
 
 
   <!-- Themes & Customisation -->
@@ -293,7 +314,7 @@
     <div class="cust-section">
       <div class="section-label" id="cust-theme-name">Highlight colour</div>
       <div class="overlay-row">
-        <input id="ov-hl-colour" type="color" value="#f5c518">
+        <input id="ov-hl-colour" type="color" aria-label="Highlight colour" value="#f5c518">
         <span class="val" id="ov-hl-colour-val">#f5c518</span>
       </div>
     </div>
@@ -301,14 +322,14 @@
     <div class="cust-section">
       <div class="section-label">Header bar colour</div>
       <div class="overlay-row">
-        <input id="ov-bar-colour" type="color" value="#0f0f0f">
+        <input id="ov-bar-colour" type="color" aria-label="Header bar colour" value="#0f0f0f">
         <span class="val" id="ov-bar-colour-val">#0f0f0f</span>
       </div>
     </div>
     <div class="cust-section">
       <div class="section-label">Reading overlay · text size</div>
       <div class="overlay-row">
-        <input id="ov-size" type="range" min="10" max="20" step="1" value="12">
+        <input id="ov-size" type="range" aria-label="Reading overlay text size" min="10" max="20" step="1" value="12">
         <span class="val" id="ov-size-val">12px</span>
       </div>
     </div>
@@ -321,6 +342,10 @@
 
   <div class="footer">Server: localhost:5050</div>
 
+  <!-- Accents and symbols into speakable words; the chunker reads it to decide
+       what there is to say, so it has to load first. -->
+  <script src="textnorm.js"></script>
+  <script src="reader-core.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

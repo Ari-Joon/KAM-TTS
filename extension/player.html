@@ -197,6 +197,19 @@
       white-space: nowrap; flex-shrink: 0;
     }
     .tab-btn.active { background: var(--indigo); border-color: var(--indigo); color: #000; font-weight: 700; }
+    /* The count on the Rules tab: reported words that keep coming up and still
+       have no fix. It wears the FLAG rule colours, since that is what these
+       are, and those read on the gold of an open tab as well as on a closed
+       one. It is 12px tall and hangs from the top of the tab's own line, so
+       the tab is no taller with the count than without; the 1px nudge centres
+       it by eye and, being relative, moves nothing else. */
+    .tab-count {
+      display: inline-block; margin-left: 5px; padding: 0 5px; border-radius: 4px;
+      font-size: 9px; font-weight: 600; line-height: 10px; vertical-align: top;
+      position: relative; top: 1px;
+      color: #fcd34d; background: #1a1400; border: 1px solid #d97706;
+    }
+    .tab-count[hidden] { display: none; }
     /* Settings cog and theme picker dropdown.
        Cog sits to the LEFT of the tab buttons inside #topbar-right.
        The dropdown anchors to the cog's right edge so it never
@@ -619,6 +632,10 @@
       font-family: var(--chunkfont, var(--font));
       font-size: var(--chunkfont-size, 11px);
     }
+    /* A private read: the text was not kept, so the label stands in for it in
+       the dim text style, and the card stops inviting a click it cannot use. */
+    .private-read { color: var(--dim); }
+    .chunk-card.private:hover { cursor: default; }
     .chunk-quality { font-size: 10px; color: var(--dim); margin-top: 4px; }
     .chunk-analysis { font-size: 10px; color: var(--text); line-height: 1.8; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
     .an-tag { font-size: 9px; font-weight: 700; letter-spacing: 0.5px; padding: 1px 6px; border-radius: 3px; text-transform: uppercase; background: #333; color: #fff; }
@@ -673,6 +690,39 @@
     .rule-sort:hover { color: var(--indigo); }
     .del-rule { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 11px; }
     .del-rule:hover { color: var(--red); }
+
+    /* --- Needs attention (top of the Rules tab) --- */
+    /* Reported words that were only counted. The box and its controls borrow
+       the Add Rule form's, so the two read as one family. */
+    #rules-attention { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
+    .attn-row { padding: 6px 0; border-bottom: 1px solid var(--border); }
+    .attn-row:last-of-type { border-bottom: none; padding-bottom: 0; }
+    .attn-head { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+    .attn-pattern { color: var(--text); font-size: 10px; font-weight: 600; word-break: break-word; }
+    .attn-hits { color: var(--dim); font-size: 9px; }
+    .attn-act { display: flex; gap: 5px; margin-top: 5px; }
+    .attn-say {
+      flex: 1; min-width: 0; background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 4px; padding: 4px;
+      font-family: var(--font); font-size: 10px; outline: none;
+    }
+    .attn-say:focus { border-color: var(--indigo); }
+    .attn-fix {
+      flex-shrink: 0; background: var(--indigo); color: #000; font-weight: 700; border: none;
+      border-radius: 4px; padding: 5px 10px; cursor: pointer; font-family: var(--font); font-size: 10px;
+    }
+    .attn-dismiss {
+      flex-shrink: 0; background: transparent; border: 1px solid var(--border); color: var(--dim);
+      border-radius: 4px; padding: 4px 8px; cursor: pointer; font-family: var(--font); font-size: 10px;
+    }
+    .attn-dismiss:hover { color: var(--red); border-color: var(--red); }
+    .attn-fix:disabled, .attn-dismiss:disabled { opacity: 0.4; cursor: default; }
+    .attn-more {
+      background: none; border: none; color: var(--dim); cursor: pointer;
+      font-family: var(--font); font-size: 9px; padding: 6px 0 0;
+    }
+    .attn-more:hover { color: var(--indigo); }
+    .attn-none { color: var(--dim); font-size: 10px; }
 
     /* --- Filter buttons --- */
     .filter-btn { flex:none; background:var(--bg3); border:1px solid var(--border); color:var(--subtext); padding:3px 8px; border-radius:4px; cursor:pointer; font-family:var(--font); font-size:9px; }
@@ -990,15 +1040,15 @@
 <!-- Top bar -->
 <div id="topbar">
   <h1>⬡ KAM TTS</h1>
-  <button id="power-btn" type="button" title="Start / stop the local server">
+  <button id="power-btn" type="button" title="Start / stop the local server" aria-label="Start or stop the local server">
     <svg class="power-arc-svg" viewBox="0 0 24 24" aria-hidden="true">
       <circle id="power-arc" cx="12" cy="12" r="9" fill="none"
               stroke="var(--green)" stroke-width="2.1" stroke-linecap="round"
               transform="rotate(-90 12 12)"></circle>
     </svg>
-    <span class="power-glyph">⏻</span>
+    <span class="power-glyph" aria-hidden="true">⏻</span>
   </button>
-  <span class="pill offline" id="server-status">connecting…</span>
+  <span class="pill offline" id="server-status" role="status" aria-live="polite">connecting…</span>
   <span style="color:var(--dim);font-size:10px" id="chunk-counter">0 chunks</span>
   <!-- Voice profile selector -->
   <div id="voice-wrap" style="position:relative;display:inline-block;margin-left:10px">
@@ -1018,7 +1068,7 @@
   <!-- Scan a page with the phone. The listener the phone reaches only exists
        while this panel has a session open; closing it takes the port down. -->
   <div id="scan-wrap" style="position:relative;display:inline-block;margin-left:8px">
-    <button id="scan-pill" title="Read a page from a photo taken on your phone"
+    <button id="scan-pill" title="Read a page from a photo taken on your phone" aria-label="Scan a page with your phone"
       style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;color:var(--subtext);cursor:pointer;font-family:var(--font);font-size:10px;padding:3px 10px">📷 Scan ▾</button>
     <div id="scan-panel" style="display:none;position:absolute;top:26px;left:0;z-index:50;width:330px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.5);padding:10px">
       <div style="font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Scan from phone</div>
@@ -1062,7 +1112,7 @@
       </div>
     </div>
   </div>
-  <button id="rec-open" type="button" title="Record voice clips"
+  <button id="rec-open" type="button" title="Record voice clips" aria-label="Record voice clips"
     style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;color:var(--subtext);cursor:pointer;font-family:var(--font);font-size:10px;margin-left:6px;padding:3px 10px">● Record</button>
   <div id="topbar-right">
     <button id="upd-btn" type="button" title="Check for updates" aria-label="Check for updates">
@@ -1070,13 +1120,15 @@
       <svg class="upd-get" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5v11"/><path d="M7.5 10 12 14.5 16.5 10"/><path d="M4.5 20h15"/></svg>
       <span class="upd-label"></span>
     </button>
-    <button id="ui-font-cog" class="tab-btn" type="button" data-menu="uifont">Fonts</button>
-    <button id="tts-tune-cog" class="tab-btn" type="button" data-menu="tune">Speech Tuning</button>
-    <button id="settings-cog" class="tab-btn" type="button" data-menu="themes">Themes</button>
+    <button id="ui-font-cog" class="tab-btn" type="button" data-menu="uifont" aria-haspopup="dialog">Fonts</button>
+    <button id="tts-tune-cog" class="tab-btn" type="button" data-menu="tune" aria-haspopup="dialog">Speech Tuning</button>
+    <button id="settings-cog" class="tab-btn" type="button" data-menu="themes" aria-haspopup="dialog"
+      title="Themes, colours and dashboard settings" aria-label="Themes and settings">Themes</button>
     <button class="tab-btn active" data-tab="console">Console Legend</button>
     <button class="tab-btn" data-tab="chunks">Live Feed</button>
     <button class="tab-btn" data-tab="report">Report</button>
-    <button class="tab-btn" data-tab="rules">Rules</button>
+    <button class="tab-btn" data-tab="rules">Rules<span id="rules-attn-badge" class="tab-count" hidden
+      title="Reported words that keep coming up and still have no fix"></span></button>
     <button class="tab-btn" data-tab="stats">Stats</button>
     <button class="tab-btn" data-tab="ai">AI</button>
   </div>
@@ -1236,7 +1288,7 @@
 
   <div id="settings-panel" role="dialog" aria-label="Settings">
     <h3>Theme</h3>
-    <div class="theme-picker" role="tablist">
+    <div class="theme-picker" role="group" aria-label="Theme">
       <button class="theme-btn" data-theme="arian" type="button">Arian</button>
       <button class="theme-btn" data-theme="light" type="button">Light</button>
       <button class="theme-btn" data-theme="dark"  type="button">Dark</button>
@@ -1254,6 +1306,16 @@
       <label class="cust-row"><span>Accent</span><input type="color" data-var="--indigo"></label>
     </div>
     <button id="cust-reset" type="button">↺ Reset this theme</button>
+
+    <!-- Read by the worker from chrome.storage.local (kamOpenDashboardOnRead),
+         where a key that was never written means yes. The label is given no
+         width of its own, so the sentence wraps inside the panel instead of
+         making it wider than the theme buttons do. -->
+    <h3 style="margin-top:14px">Reading</h3>
+    <label style="display:flex;align-items:flex-start;gap:8px;width:0;min-width:100%;font-size:11px;color:var(--subtext);line-height:1.4;cursor:pointer">
+      <input type="checkbox" id="set-open-on-read" checked style="accent-color:var(--indigo);margin:1px 0 0;flex-shrink:0;cursor:pointer">
+      <span>Open this dashboard when a read starts</span>
+    </label>
   </div>
 
   <!-- The TTS Tuning dropdown, holding the live XTTS inference parameters with an
@@ -1266,17 +1328,18 @@
 
     <div class="tune-param">
       <div class="tune-row">
-        <span class="tune-name">Temperature</span>
-        <input id="tp-temp" type="range" min="0.05" max="0.95" step="0.01">
+        <span class="tune-name" title="A master dial. It scales the temperature KAM has learned for each kind of text, rather than replacing it.">Temperature</span>
+        <input id="tp-temp" type="range" min="0.05" max="0.95" step="0.01" aria-label="Temperature, a master dial over the learned values"
+          title="A master dial. It scales the temperature KAM has learned for each kind of text, rather than replacing it.">
         <span class="tune-val" id="tp-temp-v">—</span>
       </div>
-      <div class="tune-desc">How adventurous the voice is. <strong>Low</strong> (~0.2) = precise, steady, can sound flat. <strong>High</strong> (~0.7) = expressive and varied, but risks slips or drift. Sweet spot for reading: 0.30–0.45.</div>
+      <div class="tune-desc">The <strong>master dial</strong> for how adventurous the voice is. KAM learns a temperature of its own for each kind of text, and this dial <strong>scales</strong> those learned values up or down together rather than replacing them. <strong>Low</strong> (~0.2) = precise, steady, can sound flat. <strong>High</strong> (~0.7) = expressive and varied, but risks slips or drift. Sweet spot for reading: 0.30–0.45.</div>
     </div>
 
     <div class="tune-param">
       <div class="tune-row">
         <span class="tune-name">Top-K</span>
-        <input id="tp-topk" type="range" min="1" max="100" step="1">
+        <input id="tp-topk" type="range" min="1" max="100" step="1" aria-label="Top-K">
         <span class="tune-val" id="tp-topk-v">—</span>
       </div>
       <div class="tune-desc">How many candidate sounds the model may choose from at each step. <strong>Lower</strong> = safer, more repetitive. <strong>Higher</strong> = more natural variety. Typical: 30–60.</div>
@@ -1285,7 +1348,7 @@
     <div class="tune-param">
       <div class="tune-row">
         <span class="tune-name">Top-P</span>
-        <input id="tp-topp" type="range" min="0.1" max="1.0" step="0.01">
+        <input id="tp-topp" type="range" min="0.1" max="1.0" step="0.01" aria-label="Top-P">
         <span class="tune-val" id="tp-topp-v">—</span>
       </div>
       <div class="tune-desc">Keeps only the most likely options that together cover this probability mass. <strong>0.9</strong> trims unlikely, odd sounds while keeping natural range. Lower = tighter/safer, higher = looser.</div>
@@ -1294,7 +1357,7 @@
     <div class="tune-param">
       <div class="tune-row">
         <span class="tune-name">Repetition penalty</span>
-        <input id="tp-rep" type="range" min="1.0" max="10.0" step="0.1">
+        <input id="tp-rep" type="range" min="1.0" max="10.0" step="0.1" aria-label="Repetition penalty">
         <span class="tune-val" id="tp-rep-v">—</span>
       </div>
       <div class="tune-desc">Discourages the voice from looping or stuttering on the same sound. <strong>Higher</strong> = fewer repeats but can clip pacing; <strong>too low</strong> = stutters. Typical: 3–5.</div>
@@ -1303,7 +1366,7 @@
     <div class="tune-param">
       <div class="tune-row">
         <span class="tune-name">Volume</span>
-        <input id="tp-vol" type="range" min="0" max="600" step="5">
+        <input id="tp-vol" type="range" min="0" max="600" step="5" aria-label="Volume">
         <span class="tune-val" id="tp-vol-v">—</span>
       </div>
       <div class="tune-desc">Playback loudness of the spoken audio. Local playback only — doesn't change the model. 0% mutes, 100% is unaltered, above 100% boosts (up to 600%) with soft-clip + limiter so louder never distorts.</div>
@@ -1331,7 +1394,7 @@
         <button id="tp-reset-rates" type="button" style="font-size:9px;padding:2px 8px">↺ Reset learned rates</button>
       </div>
       <div id="tp-learned" style="font-size:10px;color:var(--dim);line-height:1.7;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-top:4px">Loading…</div>
-      <div class="tune-desc">What your reports have taught the model. Rate modifiers shade your chosen speed by chunk complexity, so dense technical text can play slower than simple text. Temperatures apply per sentence type. Reset clears rate learning only.</div>
+      <div class="tune-desc">What your reports have taught the model. Pace is learned per complexity band only (simple, typical, dense): what you hear is your speed slider times the pace for the band, so dense technical text can play slower than simple text. Temperatures are learned per kind of sentence, and the Temperature dial above scales them together. Reset clears rate learning only.</div>
     </div>
 
     <div class="tune-card">
@@ -1384,7 +1447,7 @@
     <div id="console-header">
       <span class="dot"></span>
       Live Server Console
-      <button id="clear-btn">⌫ clear</button>
+      <button id="clear-btn" aria-label="Clear the console and reset the chunk stats">⌫ clear</button>
     </div>
     <div id="console-log"></div>
   </div>
@@ -1393,7 +1456,7 @@
       <span class="dot ai"></span>
       AI Analysis Feed
       <span id="ai-feed-count"></span>
-      <button id="ai-feed-refresh" title="Refresh now">↻</button>
+      <button id="ai-feed-refresh" title="Refresh now" aria-label="Refresh the AI analysis feed">↻</button>
     </div>
     <div id="ai-feed-body">
       <div class="ai-empty">Loading…</div>
@@ -1559,8 +1622,8 @@
       <div class="rpanel-body" style="padding:0;display:flex;flex-direction:column;gap:0">
       <!-- Bottom pane, the live feed, which stays visible -->
       <div style="display:flex;align-items:center;gap:6px;padding:4px 8px;flex-shrink:0;background:var(--bg2);border-bottom:1px solid var(--border)">
-        <button id="feed-select-toggle" title="Select chunks to mass-rate" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--subtext);cursor:pointer;font-size:11px;line-height:1;padding:2px 5px">☑</button>
-        <button id="feed-pause" title="Freeze the feed so you can read and rate without cards moving. New chunks keep arriving and appear when you resume." style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--subtext);cursor:pointer;font-size:11px;line-height:1;padding:2px 5px">⏸</button>
+        <button id="feed-select-toggle" title="Select chunks to mass-rate" aria-label="Select chunks to mass-rate" aria-pressed="false" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--subtext);cursor:pointer;font-size:11px;line-height:1;padding:2px 5px">☑</button>
+        <button id="feed-pause" title="Freeze the feed so you can read and rate without cards moving. New chunks keep arriving and appear when you resume." aria-label="Pause the live feed" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--subtext);cursor:pointer;font-size:11px;line-height:1;padding:2px 5px">⏸</button>
         <span style="font-size:9px;color:var(--subtext);font-weight:600;letter-spacing:1px;text-transform:uppercase">Live feed — click to report</span>
         <span id="feed-paused-badge" style="display:none;margin-left:auto;font-size:9px;font-weight:700;letter-spacing:0.5px;color:#000;background:var(--accent,#f5c518);border-radius:3px;padding:1px 6px">PAUSED</span>
       </div>
@@ -1570,7 +1633,7 @@
         <button id="feed-mass-perfect" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:#4ade80;cursor:pointer;font-size:10px;padding:2px 6px">👍 Perfect</button>
         <button id="feed-mass-halluc" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:#fca5a5;cursor:pointer;font-size:10px;padding:2px 6px">👎 Hallucination</button>
         <button id="feed-sel-all" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--dim);cursor:pointer;font-size:10px;padding:2px 6px">All</button>
-        <button id="feed-sel-cancel" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--dim);cursor:pointer;font-size:10px;padding:2px 6px">✕</button>
+        <button id="feed-sel-cancel" aria-label="Leave select mode" style="background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--dim);cursor:pointer;font-size:10px;padding:2px 6px">✕</button>
       </div>
       <div id="chunks-body" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:4px 8px;min-height:80px"></div>
     </div>
@@ -1598,7 +1661,7 @@
         </div>
 
         <div class="form-group" style="margin-top:4px">
-          <label>Issue type</label>
+          <label for="r-issue">Issue type</label>
           <select id="r-issue">
             <option value="PRONUNCIATION">🗣  Mispronounced a word / acronym</option>
             <option value="HALLUCINATION">💭  Hallucinations (said words that weren't there)</option>
@@ -1615,20 +1678,20 @@
           </select>
         </div>
         <div class="form-group">
-          <label id="r-token-label">Problem token (word / abbreviation)</label>
+          <label id="r-token-label" for="r-token">Problem token (word / abbreviation)</label>
           <input id="r-token" placeholder="e.g.  API" />
           <div id="r-token-hint" style="display:none;font-size:10px;color:var(--dim);line-height:1.5;margin-top:4px"></div>
         </div>
         <div class="form-group">
-          <label>Should sound like</label>
+          <label for="r-expected">Should sound like</label>
           <input id="r-expected" placeholder="e.g.  A.P.I.  or  application programming interface" />
         </div>
         <div class="form-group">
-          <label>Actually sounded like</label>
+          <label for="r-heard">Actually sounded like</label>
           <input id="r-heard" placeholder="e.g.  what you actually heard (wrong pronunciation)" />
         </div>
         <div class="form-group">
-          <label>Action</label>
+          <label for="r-action">Action</label>
           <select id="r-action">
             <option value="AUTO">✨  Auto (recommended). Picks the fix for you</option>
             <option value="ADD_TO_STORE">📖  Add to pronunciation store</option>
@@ -1640,7 +1703,7 @@
           <div id="r-action-preview" style="font-size:10px;color:var(--dim);line-height:1.5;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-top:6px"></div>
         </div>
         <div class="form-group">
-          <label>Confidence</label>
+          <label for="r-confidence">Confidence</label>
           <select id="r-confidence">
             <option value="HIGH">🟢  High. Apply this fix immediately</option>
             <option value="MEDIUM">🟡  Medium. Apply once 2 matching reports agree</option>
@@ -1702,16 +1765,16 @@
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">describe e.g. too flat / rushed</span></div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">🚩 Flag pattern for review</span></div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🟡 Medium</span></div>
-          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">Use the Temperature slider in the popup to adjust expressiveness live. Report is for persistent patterns.</div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">Use the Temperature slider to adjust expressiveness live. It is a master dial that scales what KAM has learned for each kind of text. Report is for persistent patterns.</div>
           <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">⚡ TOO FAST / TOO SLOW</div>
-          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">Speech rate was consistently wrong on a specific chunk. For general speed use the popup Speed slider first.</div>
+          <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">Speech rate was consistently wrong for text of one complexity (simple, typical or dense). The report nudges the pace learned for that band, which multiplies your Speed slider. For general speed use the popup Speed slider first.</div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">⚡ Too fast / too slow</span></div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Problem token:</span><span style="color:#666">(leave blank)</span></div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Should sound like:</span><span style="color:#666">(leave blank)</span></div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Actually sounded like:</span><span style="color:#fbbf24">too fast / too slow</span></div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Action:</span><span style="color:var(--text)">🚩 Flag pattern for review</span></div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Confidence:</span><span style="color:var(--text)">🔴 Low — use speed slider for general adjustment</span></div>
-          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">Only report if a specific chunk type is always wrong. Otherwise adjust Speed slider in the popup.</div>
+          <div style="color:#888;font-size:9px;margin-top:2px;margin-bottom:4px;font-style:italic">Only report if text of one complexity is always wrong, for example dense text always rushed. Otherwise adjust Speed slider in the popup.</div>
           <div style="color:#f5c518;font-size:9px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-top:12px;margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid #333">🎤 VOICE DRIFTED / SOUNDS WRONG</div>
           <div style="font-size:9px;color:#bbb;margin-bottom:5px;line-height:1.5">The cloned voice sounded noticeably different mid-session — drifted from your baseline voice profile.</div>
           <div style="display:flex;margin-bottom:2px"><span style="color:#777;min-width:130px;flex-shrink:0">Issue type:</span><span style="color:var(--text)">🎤 Voice sounds wrong / drifted</span></div>
@@ -1748,6 +1811,10 @@
         </button>
       </div>
       <div class="rpanel-body" style="display:flex;flex-direction:column;gap:10px">
+        <!-- Needs attention: words that were reported, only counted, and keep
+             coming up. Filled by dashboard.js when the tab opens, and hidden
+             altogether when there are none. -->
+        <div id="rules-attention" style="display:none"></div>
         <!-- Add rule form -->
         <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px">
           <div class="section-title" style="margin-top:0">Add Rule Manually</div>
@@ -1772,12 +1839,12 @@
         <div style="overflow-x:auto">
           <table class="rules-table">
             <thead><tr>
-              <th class="rule-sort" data-sort="ts">Date ▾</th>
-              <th class="rule-sort" data-sort="pattern">Pattern</th>
-              <th class="rule-sort" data-sort="rule_type">Type</th>
+              <th class="rule-sort" data-sort="ts" tabindex="0" title="Sort by date">Date ▾</th>
+              <th class="rule-sort" data-sort="pattern" tabindex="0" title="Sort by pattern">Pattern</th>
+              <th class="rule-sort" data-sort="rule_type" tabindex="0" title="Sort by type">Type</th>
               <th>Value</th>
-              <th class="rule-sort" data-sort="source">Src</th>
-              <th class="rule-sort" data-sort="hits">Hits</th>
+              <th class="rule-sort" data-sort="source" tabindex="0" title="Sort by source">Src</th>
+              <th class="rule-sort" data-sort="hits" tabindex="0" title="Sort by hits">Hits</th>
               <th></th>
             </tr></thead>
             <tbody id="rules-tbody"><tr><td colspan="7" style="color:var(--dim)">Loading…</td></tr></tbody>
@@ -1859,7 +1926,7 @@
         <div><span class="lg-def"><strong style="color:var(--text)">short / medium / long</strong> — chunk length in words</span></div>
         <div><span class="lg-def"><strong style="color:var(--text)">clean / comma-heavy / complex</strong> — punctuation shape, which drives pausing</span></div>
         <div><span class="lg-def"><strong style="color:var(--text)">plain / technical / symbolic</strong> — wording difficulty, which drives pronunciation care</span></div>
-        <div><span class="lg-def" style="margin-top:3px;display:block">KAM learns voice settings <em>per fingerprint</em>, so a fix for dense comma-heavy sentences doesn't disturb short plain ones.</span></div>
+        <div><span class="lg-def" style="margin-top:3px;display:block">KAM learns the voice's temperature <em>per fingerprint</em>, so a fix for dense comma-heavy sentences doesn't disturb short plain ones. Reading pace is learned per complexity band only, and multiplies your speed slider.</span></div>
 
         <div class="lg-sec-title">Hardware</div>
         <div id="legend-hardware"><span class="lg-def">Checking…</span></div>
@@ -1874,7 +1941,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <span style="font-size:11px;color:var(--text);font-weight:600">🤖 Autonomous self-tuning</span>
           <label style="position:relative;display:inline-block;width:38px;height:20px">
-            <input type="checkbox" id="autotune-toggle" class="kam-switch-input">
+            <input type="checkbox" id="autotune-toggle" class="kam-switch-input" aria-label="Autonomous self-tuning">
             <span id="autotune-slider" class="kam-switch"></span>
           </label>
         </div>

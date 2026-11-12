@@ -312,9 +312,19 @@ document.addEventListener("DOMContentLoaded", () => {
   const fbDown = document.getElementById("fb-down-btn");
   if (fbUp)   fbUp.addEventListener("click", thumbsUp);
   if (fbDown) fbDown.addEventListener("click", thumbsDown);
-  document.getElementById("tab-selection").addEventListener("click", () => setMode("selection"));
-  document.getElementById("tab-custom").addEventListener("click", () => setMode("custom"));
-  document.getElementById("tab-page").addEventListener("click", () => setMode("page"));
+  // The mode tabs are divs, so a click was the only way to use them. They are
+  // focusable now (role and tabindex are in popup.html), and Enter or Space
+  // picks the one in focus, as it would for a real tab.
+  ["selection", "custom", "page"].forEach(m => {
+    const tab = document.getElementById(`tab-${m}`);
+    tab.addEventListener("click", () => setMode(m));
+    tab.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setMode(m); }
+    });
+  });
+  initCustomDraft();
+  initPrivateToggle();
+  initResumeBar();
   document.getElementById("speed-slider").addEventListener("input", (e) => updateSpeed(e.target.value));
   document.getElementById("temp-slider").addEventListener("input", (e) => updateTemperature(e.target.value));
   document.getElementById("btn-pause").addEventListener("click", () => {
@@ -353,11 +363,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
 function checkIfPlaying() {
   chrome.runtime.sendMessage({ action: "getStatus" }, (response) => {
+    void chrome.runtime.lastError;   // a worker that is not up yet is not an error here
     if (response && response.isPlaying) {
       allChunks         = response.chunks || [];
       currentChunkIndex = response.currentChunkIndex || 0;
       _chunkIds         = Object.assign({}, response.chunkIds || {});
       showPlayer(true);
+      showPrivateLock(response.private === true);
+      paintResume(null);
       updatePlayerLabel(currentChunkIndex + 1, allChunks.length);
       updateProgressFill(currentChunkIndex + 1, allChunks.length);
       renderTextView(allChunks, currentChunkIndex);
@@ -365,6 +378,15 @@ function checkIfPlaying() {
       const paused = response.isPaused;
       document.getElementById("btn-pause").textContent    = paused ? "▶" : "⏸";
       document.getElementById("btn-pause").classList.toggle("paused", paused);
+    } else {
+      // A read the server failed is not playing either, and the worker keeps
+      // the reason, so a popup opened afterwards can still say what happened.
+      if (response && response.error && response.error.message) {
+        _playbackErrorShown = true;
+        showError(response.error.message);
+      }
+      // Nothing is playing, so a read that was left part-way can be offered back.
+      checkResume();
     }
   });
 }
@@ -375,6 +397,20 @@ chrome.runtime.onMessage.addListener((request) => {
     updatePlayerLabel(request.current, request.total);
     updateActiveChunk(currentChunkIndex);
     updateProgressFill(request.current, request.total);
+    // The read is moving again, so a line saying it had stopped is out of date.
+    if (_playbackErrorShown) { _playbackErrorShown = false; hideError(); }
+  }
+  // The server stopped answering part-way through. The worker halts the read
+  // and keeps its place, so the player and the chunk list stay as they are,
+  // the reason is shown, and the Resume line is offered to carry on from the
+  // same chunk. A silent stall used to look exactly like a read that finished.
+  // Speak is freed as well, so starting something else is still possible.
+  if (request.action === "playbackError") {
+    _playbackErrorShown = true;
+    showError(request.message || "The server stopped answering. Press Resume to carry on.");
+    const speakBtn = document.getElementById("speak-btn");
+    if (speakBtn) speakBtn.disabled = !_serverOnline;
+    checkResume();
   }
   if (request.action === "playbackFinished") {
     showPlayer(false);
@@ -397,6 +433,114 @@ chrome.runtime.onMessage.addListener((request) => {
     _showFeedbackButtons();
   }
 });
+
+// True while the error line is showing a playbackError from the worker.
+let _playbackErrorShown = false;
+
+// --- Resume where you left off ---
+// The worker keeps the position of a read that was stopped part-way and gives
+// it back through getResume. The line is built here so it can be tested: the
+// position goes first, because the title is what gets cut off when the two do
+// not fit. A worker that does not know the action answers with nothing, and
+// then there is nothing to show.
+function resumeLine(resume) {
+  if (!resume || !(resume.total > 0)) return "";
+  const at    = Math.min(Math.max((parseInt(resume.index, 10) || 0) + 1, 1), resume.total);
+  const title = String(resume.title || "").replace(/\s+/g, " ").trim();
+  return `Left off at ${at} of ${resume.total}` + (title ? ` · ${title}` : "");
+}
+
+function paintResume(resume) {
+  const bar  = document.getElementById("resume-bar");
+  const text = document.getElementById("resume-text");
+  if (!bar || !text) return;
+  const line = resumeLine(resume);
+  bar.style.display = line ? "flex" : "none";
+  text.textContent  = line;
+  text.title        = line ? [resume.title, resume.url].filter(Boolean).join("\n") : "";
+}
+
+function checkResume() {
+  try {
+    chrome.runtime.sendMessage({ action: "getResume" }, (response) => {
+      if (chrome.runtime.lastError) { paintResume(null); return; }
+      paintResume(response && response.resume);
+    });
+  } catch (e) { /* no worker to ask, so no line */ }
+}
+
+function initResumeBar() {
+  const go   = document.getElementById("resume-btn");
+  const drop = document.getElementById("resume-dismiss");
+  if (go) go.addEventListener("click", () => {
+    paintResume(null);
+    hideError();
+    _playbackErrorShown = false;
+    // The worker is told the speed on the slider and the tab in front, which
+    // it uses when the page the read came from is no longer open.
+    const slider = document.getElementById("speed-slider");
+    const speed  = slider ? parseFloat(slider.value) : undefined;
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      void chrome.runtime.lastError;
+      const tabId = tabs && tabs[0] ? tabs[0].id : undefined;
+      chrome.runtime.sendMessage({ action: "resumeRead", speed, tabId }, () => {
+        void chrome.runtime.lastError;
+        // The worker starts the read itself, so the player is filled in from
+        // its status. Asked twice, since the first answer can come before the
+        // read has begun.
+        checkIfPlaying();
+        setTimeout(checkIfPlaying, 800);
+      });
+    });
+  });
+  if (drop) drop.addEventListener("click", () => {
+    paintResume(null);
+    chrome.runtime.sendMessage({ action: "forgetResume" }, () => { void chrome.runtime.lastError; });
+  });
+}
+
+// --- Private reads ---
+// A private read is one whose text the server does not keep in the chunk
+// history. The toggle is remembered, and a read from an incognito tab is
+// private whatever the toggle says.
+function initPrivateToggle() {
+  const box = document.getElementById("private-read");
+  if (!box) return;
+  chrome.storage.local.get({ kamPrivateRead: false }, c => {
+    box.checked = !!(c && c.kamPrivateRead);
+  });
+  box.addEventListener("change", () => {
+    chrome.storage.local.set({ kamPrivateRead: box.checked });
+  });
+}
+
+function showPrivateLock(on) {
+  const lock = document.getElementById("private-lock");
+  if (lock) lock.style.display = on ? "inline" : "none";
+}
+
+// --- Waking a sleeping model ---
+// The server drops the voice model after a while idle, and the first chunk
+// then waits for it to load. Opening the popup is a fair sign that a read is
+// coming, so I ask for the wake now. It is tried once per popup, it never
+// holds the UI up, and a failure is not worth a message, since the read wakes
+// the model anyway.
+let _prewakeTried = false;
+function prewakeModel() {
+  if (_prewakeTried) return;
+  _prewakeTried = true;
+  kamFetch(`${SERVER}/standby`, {})
+    .then(r => (r.ok ? r.json() : null))
+    .then(s => {
+      if (!s || s.state !== "standby") return null;
+      return kamFetch(`${SERVER}/standby`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wake: true })
+      });
+    })
+    .catch(() => {});
+}
 
 // --- Quality feedback ---
 let _lastChunkId   = null;
@@ -480,6 +624,7 @@ async function checkServer() {
   }
   _serverOnline = online;
   paintStatus();
+  if (online) prewakeModel();
   // Every 3 seconds while the popup is open, online or not. Polling only while
   // offline meant a server stopped with the popup open went on reading
   // "online", and there was nothing to offer a stop from. One timer at a time,
@@ -589,10 +734,13 @@ function paintStatus() {
   else _asked.stopAt = 0;
 
   dot.className = "status-dot" + (v.dot === "online" ? " online" : v.dot === "offline" ? " offline" : "");
-  txt.textContent = v.text;
+  // Both lines are aria-live, and this runs every three seconds, so the text
+  // is only written when it has changed. Writing the same words again would
+  // have a screen reader announce "Server online" over and over.
+  if (txt.textContent !== v.text) txt.textContent = v.text;
   if (step) {
     step.style.display = v.step ? "block" : "none";
-    step.textContent   = v.step;
+    if (step.textContent !== v.step) step.textContent = v.step;
   }
   if (prog) {
     const show = v.pct !== null && v.pct !== undefined;
@@ -605,6 +753,7 @@ function paintStatus() {
     btn.textContent = v.button === "stop" ? "■" : "⏻";
     btn.disabled = v.disabled;
     btn.title = v.title;
+    btn.setAttribute("aria-label", v.title);   // the button is a bare symbol
   }
   if (speak) speak.disabled = !_serverOnline;
 }
@@ -668,10 +817,59 @@ document.addEventListener("DOMContentLoaded", () => {
 function setMode(mode) {
   currentMode = mode;
   ["selection", "custom", "page"].forEach(m => {
-    document.getElementById(`tab-${m}`).classList.toggle("active", m === mode);
+    const tab = document.getElementById(`tab-${m}`);
+    tab.classList.toggle("active", m === mode);
+    tab.setAttribute("aria-selected", m === mode ? "true" : "false");
   });
   document.getElementById("custom-text-area").style.display = mode === "custom" ? "block" : "none";
   if (mode === "custom") loadScannedText();
+}
+
+// --- The Custom Text box keeps what is in it ---
+// The popup is destroyed the moment it loses focus, and the box went with it,
+// so switching tabs to copy one more paragraph lost everything typed so far.
+// The draft is kept in session storage, which lasts as long as the browser
+// is open and is never written to disk, and is put back when the popup opens.
+const DRAFT_KEY      = "kamCustomDraft";
+const SCAN_TAKEN_KEY = "kamScanTaken";
+// The scanned text this box was filled from, if it was, so I know which one
+// to clear out of storage once it has been dealt with.
+let _scanTaken = "";
+
+function _sessionStore() {
+  try { return (chrome.storage && chrome.storage.session) || null; }
+  catch (e) { return null; }
+}
+const _quiet = () => { void chrome.runtime.lastError; };
+
+function saveCustomDraft(value) {
+  const store = _sessionStore();
+  if (!store) return;
+  try {
+    if (value) store.set({ [DRAFT_KEY]: value }, _quiet);
+    else       store.remove(DRAFT_KEY, _quiet);
+  } catch (e) { /* over quota or unavailable, so the draft is just not kept */ }
+}
+
+function initCustomDraft() {
+  const box = document.getElementById("custom-input");
+  if (!box) return;
+  const store = _sessionStore();
+  if (store) {
+    try {
+      store.get([DRAFT_KEY, SCAN_TAKEN_KEY], d => {
+        if (chrome.runtime.lastError || !d) return;
+        // Only into an empty box, in case something was typed before this came back.
+        if (d[DRAFT_KEY] && !box.value) box.value = d[DRAFT_KEY];
+        _scanTaken = d[SCAN_TAKEN_KEY] || "";
+      });
+    } catch (e) { /* no session storage, so there is no draft to restore */ }
+  }
+  box.addEventListener("input", () => {
+    saveCustomDraft(box.value);
+    // Emptying the box is the user saying they are done with what was in it.
+    if (!box.value.trim()) releaseScannedText();
+  });
 }
 
 // Text read off a photo in the dashboard's Scan panel is handed over through
@@ -679,8 +877,10 @@ function setMode(mode) {
 // edited before it is played, the same as anything typed in.
 //
 // It only fills an empty box, since quietly overwriting something half-typed
-// would be worse than making you press the tab again, and it is cleared once
-// taken so the same page does not reappear on the next visit.
+// would be worse than making you press the tab again. It used to be removed
+// from storage the moment it was loaded, so closing the popup before pressing
+// Speak lost the scan for good. It stays now until it has been spoken or the
+// box has been cleared, which is releaseScannedText below.
 function loadScannedText() {
   const box = document.getElementById("custom-input");
   if (!box || box.value.trim()) return;
@@ -688,13 +888,33 @@ function loadScannedText() {
     chrome.storage.local.get("kamScanText", d => {
       if (chrome.runtime.lastError) return;
       const text = d && d.kamScanText;
-      if (!text) return;
-      box.value = text;
-      chrome.storage.local.remove("kamScanText");
+      if (!text || box.value.trim()) return;
+      box.value  = text;
+      _scanTaken = text;
+      saveCustomDraft(text);
+      const store = _sessionStore();
+      if (store) { try { store.set({ [SCAN_TAKEN_KEY]: text }, _quiet); } catch (e) {} }
       const info = document.getElementById("status-step");
       if (info) { info.style.display = "block"; info.textContent = "Scanned text loaded"; }
     });
   } catch (e) { /* storage unavailable — the box just stays empty */ }
+}
+
+// The scan has been spoken, or the box it was in has been cleared, so it can
+// leave storage. Only the scan this box took is removed: a newer one that
+// arrived since is left for the next visit.
+function releaseScannedText() {
+  if (!_scanTaken) return;
+  const taken = _scanTaken;
+  _scanTaken = "";
+  const store = _sessionStore();
+  if (store) { try { store.remove(SCAN_TAKEN_KEY, _quiet); } catch (e) {} }
+  try {
+    chrome.storage.local.get("kamScanText", d => {
+      if (chrome.runtime.lastError) return;
+      if (d && d.kamScanText === taken) chrome.storage.local.remove("kamScanText");
+    });
+  } catch (e) { /* storage unavailable, so there is nothing to clear */ }
 }
 
 function updateSpeed(val, skipPost) {
@@ -743,12 +963,18 @@ function updateTemperature(val, skipPost) {
 }
 
 function stopAudio() {
-  chrome.runtime.sendMessage({ action: "stop" }).catch(() => {});
+  // The worker keeps the place of a read stopped part-way, so once it has
+  // stopped I ask whether there is one to offer back.
+  chrome.runtime.sendMessage({ action: "stop" }, () => {
+    void chrome.runtime.lastError;
+    checkResume();
+  });
   showPlayer(false);
   document.getElementById("speak-btn").disabled = false;
   document.getElementById("text-view").style.display = "none";
   allChunks = [];
 }
+
 
 async function speak() {
   hideError();
@@ -759,53 +985,51 @@ async function speak() {
   // Without visible progress that delay reads as a broken model.
   showInfo("⏳ Preparing…");
   if (currentMode === "custom") {
-    text = document.getElementById("custom-input").value.trim();
-    if (!text) { showError("Please type some text first."); return; }
+    const typed = document.getElementById("custom-input").value;
+    if (!typed.trim()) { showError("Please type some text first."); return; }
+    // Line breaks become |BREAK| here. The chunker collapses all whitespace, so
+    // without this a heading ran into its paragraph and verse into one line.
+    text = customTextToMarked(typed);
   } else if (currentMode === "page") {
     showInfo("⏳ Reading the page…");
     text = await _withExtractionTimeout(getPageText());
-    if (text === "__KAM_NO_PAGE__") {
-      showError("Switch to a web page tab first — KAM can't read its own dashboard or chrome:// pages.");
-      return;
-    }
-    if (text === "__KAM_TIMEOUT__") {
-      showError("The page did not respond in time. Reload the tab and try again — "
-              + "some pages block extensions until they finish loading.");
-      return;
-    }
-
+    const problem = extractionProblem(text);
+    if (problem) { showError(problem); return; }
     if (!text) { showError("Could not extract text from page."); return; }
   } else {
     showInfo("⏳ Reading your selection…");
     text = await _withExtractionTimeout(getSelectedText());
-    if (text === "__KAM_NO_PAGE__") {
-      showError("Switch to a web page tab first — KAM can't read its own dashboard or chrome:// pages.");
-      return;
-    }
-    if (text === "__KAM_TIMEOUT__") {
-      showError("The page did not respond in time. Reload the tab and try again — "
-              + "some pages block extensions until they finish loading.");
-      return;
-    }
-
+    const problem = extractionProblem(text);
+    if (problem) { showError(problem); return; }
     if (!text) { showError("No text selected. Highlight text on the page first."); return; }
+  }
+
+  // The voice is English, and everything outside ASCII is stripped before it
+  // is spoken. Text in another script would come out as nothing at all, and
+  // the read would start, show its chunks and play silence, so I stop here
+  // and say why. The markers go first, since their letters are Latin.
+  if (typeof kamMostlyNonLatin === "function" &&
+      kamMostlyNonLatin(text.replace(/\|\/?[A-Z0-9]+\|/g, " "))) {
+    showError("KAM TTS reads English only for now. This text looks like another language.");
+    return;
   }
 
   showInfo("⏳ Splitting into chunks…");
   allChunks = splitIntoChunks(text);
   allChunks = await applyBoundaryCorrections(allChunks);
 
-  // Always show diagnostic so problems are visible
+  // The count is what the reader needs. The rest is diagnosis, so it lives in
+  // the line's tooltip, where it is still there for whoever is looking for it.
   const _breaks = (text.match(/\|BREAK\|/g) || []).length;
+  const _detail = text.length + " characters · " + _breaks + " breaks";
   if (allChunks.length === 0) {
-    showError("No content found — " + text.length + "c, " + _breaks + " breaks");
+    showError("Nothing readable was found in that text.", _detail);
     return;
   }
   // Debug logging for chunk diagnosis used to live here and has been removed
   const _orphans = allChunks.filter(c => /^(and|but|or|so|yet|nor|for)\b/i.test(c) && c.length <= 50);
-  showInfo(allChunks.length + " chunk" + (allChunks.length === 1 ? "" : "s") +
-    " · " + text.length + "c · " + _breaks + " breaks" +
-    (_orphans.length > 0 ? " · ⚠ " + _orphans.length + " orphan(s)" : " · ✓ clean"));
+  showInfo(allChunks.length + " chunk" + (allChunks.length === 1 ? "" : "s"),
+    _detail + (_orphans.length > 0 ? " · " + _orphans.length + " orphan(s)" : " · clean"));
 
   currentChunkIndex = 0;
   _chunkIds = {};   // a new read, so the old read's ids name other chunks now
@@ -821,7 +1045,8 @@ async function speak() {
     if (!tabs || !tabs[0]) {
       showError("No active tab found — cannot start playback."); return;
     }
-    const tabId = tabs[0].id;
+    const tab   = tabs[0];
+    const tabId = tab.id;
     // Unique nonce prevents background.js processing the same session twice
     // even if Chrome delivers the message more than once during SW wake-up.
     const nonce = Date.now() + '-' + Math.random().toString(36).slice(2);
@@ -829,369 +1054,42 @@ async function speak() {
     // real reading content, so Read Page and Selected Text. Custom Text is
     // one-off typed input and shouldn't shape the per-sentence-type learning.
     const digestible = (currentMode === "page" || currentMode === "selection");
-    chrome.runtime.sendMessage(
-      { action: "startSpeaking", chunks: allChunks, startIndex: 0, speed, tabId, nonce, digestible },
-      (response) => {
-        if (chrome.runtime.lastError || !response) {
-          showError("Background worker unreachable — reload the extension.");
-          showPlayer(false);
-          document.getElementById("speak-btn").disabled = false;
-        }
+    const fromPage   = currentMode !== "custom";
+    // The title and address let the worker label the read it saves for
+    // "resume where you left off". Typed text did not come from the tab, so it
+    // is not labelled with whatever page happens to be open behind the popup.
+    const message = {
+      action: "startSpeaking", chunks: allChunks, startIndex: 0, speed, tabId, nonce, digestible,
+      title: fromPage ? (tab.title || "") : "Custom text",
+      url:   fromPage ? (tab.url   || "") : "",
+    };
+    // Private when the toggle is on, and always from an incognito window,
+    // since nobody browsing privately expects the text kept in a history.
+    const privateBox = document.getElementById("private-read");
+    const isPrivate  = !!(privateBox && privateBox.checked) || !!tab.incognito;
+    if (isPrivate) message.private = true;
+    showPrivateLock(isPrivate);
+    paintResume(null);   // a new read replaces whatever was on offer
+    const wasCustom = !fromPage;
+    chrome.runtime.sendMessage(message, (response) => {
+      if (chrome.runtime.lastError || !response) {
+        showError("Background worker unreachable — reload the extension.");
+        showPlayer(false);
+        document.getElementById("speak-btn").disabled = false;
+        return;
       }
-    );
+      // The scanned page has now been spoken, so it can leave storage.
+      if (wasCustom) releaseScannedText();
+    });
   });
 }
 
 // =============================================================================
-// ADAPTIVE CHUNKING
-//
-// Every chunk should be a natural spoken unit: consistent in length, coherent,
-// and never cut mid-phrase. Two things do that work.
-//
-//   1. One sentence per chunk. Text is split on block boundaries, then into
-//      sentences, and each sentence is its own chunk, so N sentences always give
-//      N chunks and nothing is ever packed across a sentence end.
-//
-//   2. The safety net. A sentence over the cap is split on clause boundaries,
-//      and anything still too long is hard-split at a word. Undersized pieces are
-//      glued to a neighbour rather than dropped or spoken alone.
-//
-// An earlier design had two more layers in front of these, a segment classifier
-// and a content-aware target length, and this comment described all four. They
-// were never called, so they and the regexes only they read are gone; the
-// comment now describes the code that runs.
+// READING
 // =============================================================================
-
-const TARGET_CHARS = 90;    // target chunk length — keeps XTTS inference fast
-const MAX_CHARS    = 150;   // hard cap — one sentence max, never cut mid-phrase
-const MIN_CHARS    = 6;     // discard anything shorter
-
-// ---------------------------------------------------------------------------
-// Pre-compiled patterns, built once at module load and never rebuilt
-// ---------------------------------------------------------------------------
-
-const _RX_QUESTION    = /[?]/;
-const _RX_EMPHASIS    = /[|](BOLD|ITALIC)[|]/;
-const _RX_EXCLAIM_END = /[!]$/;
-const _RX_WHITESPACE  = /\s+/;
-
-
-
-
-// ---------------------------------------------------------------------------
-// The minimum readable length, which is a context-aware floor
-// ---------------------------------------------------------------------------
-
-function minFor(text) {
-  if (_RX_EMPHASIS.test(text)) return 20;
-  if (_RX_QUESTION.test(text) || _RX_EXCLAIM_END.test(text)) return 15;
-  return MIN_CHARS;
-}
-
-
-// ---------------------------------------------------------------------------
-// Emphasis boundary guard
-// ---------------------------------------------------------------------------
-
-// Apply learned chunk-boundary corrections. The user reports (via the Report
-// page) any fragment that was wrongly split off from its sentence; the server
-// stores it. Here we fetch those fragments and re-merge: any chunk that begins
-// with a known fragment is joined back onto the previous chunk, fixing the
-// mis-split on every future read. It's guarded, so a failed fetch just leaves
-// the chunks as they are.
-async function applyBoundaryCorrections(chunks) {
-  if (!Array.isArray(chunks) || chunks.length < 2) return chunks;
-  let fragments = [];
-  try {
-    const res = await kamFetch(`${SERVER}/rules/boundary`, {});
-    if (res.ok) {
-      const data = await res.json();
-      fragments = (data.fragments || []).map(f => String(f).trim()).filter(Boolean);
-    }
-  } catch (e) {
-    return chunks;   // server offline or error: chunk as normal
-  }
-  if (!fragments.length) return chunks;
-
-  const norm = s => s.replace(/\s+/g, " ").trim().toLowerCase();
-  const fragNorms = fragments.map(norm);
-
-  const merged = [];
-  for (const chunk of chunks) {
-    const c = norm(chunk);
-    // Does this chunk START with a reported fragment? If so, it was wrongly
-    // split, so glue it back onto the previous chunk.
-    const hit = fragNorms.some(f => f && c.startsWith(f));
-    if (hit && merged.length > 0) {
-      merged[merged.length - 1] = (merged[merged.length - 1] + " " + chunk).replace(/\s+/g, " ").trim();
-    } else {
-      merged.push(chunk);
-    }
-  }
-  return merged;
-}
-
-// ---------------------------------------------------------------------------
-// Main chunker
-// ---------------------------------------------------------------------------
-
-function splitIntoChunks(text) {
-  const chunks = [];
-
-  // Step 1: Split on |BREAK| markers, then heal conjunction-starting segments
-  // back to their predecessor. A line starting with "or stored data." was
-  // a new line in the source but belongs to the previous sentence.
-  const _HEAL_CONJ = /^\s*(and|but|or|so|yet|nor|for)\b/i;
-  const rawSegments = text.split('|BREAK|');
-  const segments = [];
-  for (const seg of rawSegments) {
-    const s = seg.replace(/\s+/g, ' ').trim();
-    if (!s) continue;
-    if (segments.length > 0 && _HEAL_CONJ.test(s) && s.length <= 60) {
-      // Attach to the previous segment, since it's the same sentence just
-      // broken across lines
-      segments[segments.length - 1] = segments[segments.length - 1].replace(/[.!?]\s*$/, '') + ' ' + s;
-    } else {
-      segments.push(s);
-    }
-  }
-
-  for (const seg of segments) {
-    if (!seg || (seg.match(/[a-zA-Z]/g) || []).length < 2) continue;
-
-    // Step 2: Split each segment into individual sentences
-    const sentences = splitSentences(seg);
-
-    if (sentences.length === 0) continue;
-
-    // Step 3: Each sentence becomes its own chunk.
-    // If a sentence is too long, split it on clauses.
-    // Never pack two sentences into one chunk, which guarantees that N
-    // sentences always gives N chunks.
-    for (const raw of sentences) {
-      const s = raw.trim();
-      if (!s || (s.match(/[a-zA-Z]/g) || []).length < 2) continue;
-
-      if (s.length <= MAX_CHARS) {
-        // It fits, so emit it as its own chunk
-        if (s.length >= minFor(s)) chunks.push(s);
-      } else {
-        // Too long, so split on clauses and hard-split any clause still over
-        // the cap. Undersized pieces get glued to a neighbour, never dropped
-        // (the old code silently discarded short clauses, losing words) and
-        // never emitted alone (a fragment like "correct." spoken as its own
-        // chunk sounds unnatural).
-        const rawPieces = [];
-        splitOnClauses(s).forEach(c => {
-          const cl = c.trim();
-          if (!cl || (cl.match(/[a-zA-Z]/g) || []).length < 2) return;
-          if (cl.length <= MAX_CHARS) rawPieces.push(cl);
-          else hardSplitAtWord(cl, MAX_CHARS).forEach(p => { const pt = p.trim(); if (pt) rawPieces.push(pt); });
-        });
-        for (let i = 0; i < rawPieces.length; i++) {
-          const piece = rawPieces[i];
-          if (piece.length >= minFor(piece)) { chunks.push(piece); continue; }
-          if (i + 1 < rawPieces.length) {
-            // Prefer gluing forward: the fragment leads into the next clause.
-            rawPieces[i + 1] = piece + ' ' + rawPieces[i + 1];
-          } else if (chunks.length > 0 && (chunks[chunks.length - 1].length + piece.length + 1) <= MAX_CHARS + 20) {
-            // Tail fragment: glue onto the previous chunk (slight cap overshoot
-            // is fine; far better than a detached "correct." chunk).
-            chunks[chunks.length - 1] = chunks[chunks.length - 1] + ' ' + piece;
-          } else {
-            chunks.push(piece);   // last resort: keep it. Words are never lost.
-          }
-        }
-      }
-    }
-
-    // If segment had no sentence-terminal punctuation (e.g. a heading or label),
-    // splitSentences returns the whole segment as one item, which is correct.
-  }
-
-  // Merge any chunk that starts with a bare conjunction into its predecessor.
-  // These are always orphan fragments left by clause splitting. They sound
-  // detached and get "swallowed" because they're too short
-  // to register as a complete thought.
-  const _CONJ_START = /^(and|but|or|so|yet|nor|for|however|therefore|because)\b/i;
-  const merged = [];
-  for (const chunk of chunks) {
-    if (merged.length > 0 && _CONJ_START.test(chunk) && chunk.length <= 50) {
-      merged[merged.length - 1] = merged[merged.length - 1].replace(/[.!?]$/, '') + ' ' + chunk;
-    } else {
-      merged.push(chunk);
-    }
-  }
-
-  return merged.length > 0 ? merged : [text.replace(/\|[A-Z/]+\|/g, '').trim().substring(0, MAX_CHARS)];
-}
-
-
-// ---------------------------------------------------------------------------
-// Continuation sentence detection
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Sentence splitter
-// Built once per call, and ABBREVS is module-level so the Set isn't rebuilt
-// ---------------------------------------------------------------------------
-
-const _ABBREVS = new Set([
-  'mr','mrs','ms','dr','prof','sr','jr','vs','etc','i.e','e.g','fig',
-  'dept','approx','est','inc','ltd','corp','co','no','vol','rev',
-  'gen','col','sgt','jan','feb','mar','apr','jun','jul','aug','sep',
-  'oct','nov','dec','mon','tue','wed','thu','fri','sat','sun',
-  'st','ave','blvd','rd','pt','mt','ft','op','ed','pp','ph',
-]);
-
-function splitSentences(text) {
-  const results = [];
-  let   current = "";
-
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    current += ch;
-
-    if (ch !== '.' && ch !== '!' && ch !== '?') continue;
-
-    // Consume full ellipsis as one token
-    if (ch === '.' && text[i+1] === '.' && text[i+2] === '.') {
-      current += '..';
-      i += 2;
-      continue;
-    }
-
-    // Look ahead past whitespace
-    let j = i + 1;
-    while (j < text.length && text[j] === ' ') j++;
-    const nextChar = text[j] || '';
-    const prevWord = current.trim().split(_RX_WHITESPACE).pop().replace(/[.!?]+$/, '').toLowerCase();
-
-    const isDecimal    = ch === '.' && /\d/.test(text[i-1] || '') && /\d/.test(nextChar);
-    const isAbbrev     = ch === '.' && (_ABBREVS.has(prevWord) || prevWord.length <= 2);
-    const isInitial    = ch === '.' && prevWord.length === 1 && /[a-z]/i.test(prevWord);
-    const noCapNext    = nextChar && !/[A-Z"'\u201C\u2018(]/.test(nextChar);
-    const isEOT        = j >= text.length;
-    // Dotted identifier: "Local.Input", "Upper(Local.Input", "System.User"
-    // Extract the last identifier token (after any paren/bracket) and check if
-    // it's PascalCase followed by a letter, so property access not a sentence end.
-    const _lastIdent = (prevWord.match(/[A-Za-z_][A-Za-z0-9_]*$/) || [''])[0];
-    const isDottedPath = ch === '.' && /^[A-Z][a-zA-Z]+$/.test(_lastIdent) && /[a-zA-Z_]/.test(nextChar);
-
-    if (isDecimal || isAbbrev || isInitial || isDottedPath || (noCapNext && !isEOT)) continue;
-
-    const trimmed = current.trim();
-    if (isReadable(trimmed)) results.push(trimmed);
-    current = "";
-  }
-
-  const last = current.trim();
-  if (isReadable(last)) results.push(last);
-  return results;
-}
-
-
-// ---------------------------------------------------------------------------
-// Clause splitter
-// ---------------------------------------------------------------------------
-
-function splitOnClauses(text) {
-  let parts;
-
-  if (text.includes(';')) {
-    parts = text.split(';').map(s => s.trim()).filter(isReadable);
-  } else {
-    const conjComma = text.split(/,\s*(?=(?:and|but|or|so|yet|although|because|however|therefore|whereas)\b)/i);
-    if (conjComma.length > 1) {
-      parts = conjComma.map(s => s.trim()).filter(isReadable);
-    } else if (text.includes(',')) {
-      parts = splitOnCommas(text);
-    } else {
-      const conjSplit = text.split(/\s+(?=\b(?:and|but|or|so)\b\s+)/i);
-      parts = conjSplit.length > 1 ? conjSplit.map(s => s.trim()).filter(isReadable) : [text];
-    }
-  }
-
-  // Merge orphan conjunction fragments back to their predecessor.
-  // e.g. ["agent outputs", "or stored data."] -> ["agent outputs or stored data."]
-  // A fragment is an orphan if it starts with a conjunction and is short, so 40
-  // characters or fewer.
-  const _CONJ = /^(and|but|or|so|yet|nor|for)\b/i;
-  const merged = [];
-  for (const part of parts) {
-    if (merged.length > 0 && _CONJ.test(part) && part.length <= 40) {
-      merged[merged.length - 1] = merged[merged.length - 1] + ' ' + part;
-    } else {
-      merged.push(part);
-    }
-  }
-  return merged.filter(isReadable);
-}
-
-function splitOnCommas(text) {
-  const parts   = text.split(',');
-  const results = [];
-  let   current = "";
-
-  for (const part of parts) {
-    const candidate = current ? current + ", " + part : part;
-    if (candidate.length > TARGET_CHARS && current) {
-      results.push(current.trim());
-      current = part;
-    } else {
-      current = candidate;
-    }
-  }
-  if (current.trim()) results.push(current.trim());
-  return results;
-}
-
-
-// ---------------------------------------------------------------------------
-// Hard word-boundary split (last resort)
-// ---------------------------------------------------------------------------
-
-function hardSplitAtWord(text, maxLen) {
-  // A tail shorter than this sounds like a detached fragment when spoken alone,
-  // so a split that would create one is rebalanced toward the midpoint instead.
-  const MIN_TAIL = 30;
-  const parts = [];
-  let   rem   = text;
-
-  while (rem.length > maxLen) {
-    const win        = rem.substring(0, maxLen);
-    const punctMatch = win.match(/^[\s\S]*[.!?,]/);
-    let   splitAt    = punctMatch && punctMatch[0].length > MIN_CHARS
-                       ? punctMatch[0].length
-                       : Math.max(win.lastIndexOf(' '), MIN_CHARS);
-    // Tail guard: greedy splitting can leave a tiny orphan ("correct.") as the
-    // final piece. When the remainder would be under MIN_TAIL, move the split
-    // to a word boundary near the midpoint so both halves are natural phrases.
-    const tail = rem.length - splitAt;
-    if (tail > 0 && tail < MIN_TAIL) {
-      const mid  = Math.floor(rem.length / 2);
-      const back = rem.lastIndexOf(' ', mid);
-      const fwd  = rem.indexOf(' ', mid);
-      const cand = (back >= MIN_CHARS) ? back : (fwd > 0 && fwd <= maxLen ? fwd : splitAt);
-      if (cand >= MIN_CHARS && cand <= maxLen) splitAt = cand;
-    }
-    parts.push(rem.substring(0, splitAt).trim());
-    rem = rem.substring(splitAt).trim();
-  }
-  if (rem) parts.push(rem);
-  return parts;
-}
-
-
-// ---------------------------------------------------------------------------
-// Readability gate
-// ---------------------------------------------------------------------------
-
-function isReadable(s) {
-  if (!s || s.length < MIN_CHARS) return false;
-  return (s.match(/[a-zA-Z]/g) || []).length >= 2;
-}
-
+// The chunker and the page and selection extractors are in reader-core.js,
+// which popup.html loads before this file. They moved there so the worker
+// can run them too, for the right-click menu.
 
 // =============================================================================
 // UI HELPERS
@@ -1209,14 +1107,25 @@ function renderTextView(chunks, activeIndex) {
     div.style.paddingRight = "20px";
     const text = stripMarkersForDisplay(chunk);
     div.textContent = text;
-    div.addEventListener("click", () => {
+    const jump = () => {
       chrome.runtime.sendMessage({ action: "jumpTo", index: i }).catch(() => {});
+    };
+    div.addEventListener("click", jump);
+    // A row is a div that jumps the read to its chunk, so it could only be
+    // used with a mouse. It takes focus now and answers Enter and Space. The
+    // target check keeps a key pressed on the flag inside it from jumping too.
+    div.setAttribute("role", "button");
+    div.setAttribute("tabindex", "0");
+    div.addEventListener("keydown", (e) => {
+      if (e.target !== div) return;
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); jump(); }
     });
 
     // The flag button, appended to chunk-item so the class styles still apply
     const flagBtn = document.createElement("button");
     flagBtn.textContent = "⚑";
     flagBtn.title = "Report this chunk";
+    flagBtn.setAttribute("aria-label", "Report this chunk");
     flagBtn.style.cssText = "position:absolute;top:4px;right:6px;background:transparent;border:none;color:#555;cursor:pointer;font-size:10px;padding:0;line-height:1;transition:color 0.15s;z-index:1";
     flagBtn.addEventListener("mouseenter", () => flagBtn.style.color = "#ef4444");
     flagBtn.addEventListener("mouseleave", () => flagBtn.style.color = "#555");
@@ -1282,479 +1191,23 @@ function updateProgressFill(current, total) {
   document.getElementById("progress-fill").style.width = pct + "%";
 }
 
-// =============================================================================
-// TEXT EXTRACTION
-// =============================================================================
-//
-// Semantic markers injected into the text stream so server.py can apply
-// the correct prosodic treatment to each content type:
-//
-//   |H1| ... |/H1|            a top-level heading, longest pause either side
-//   |H2| ... |/H2|            a section heading
-//   |H3| ... |/H3|            a sub-section heading
-//   |BOLD| ... |/BOLD|        bold or strong emphasis
-//   |ITALIC| ... |/ITALIC|    italic or soft emphasis
-//   |CODE| ... |/CODE|        an inline code term
-//   |CALLOUT| ... |/CALLOUT|  a note, warning, tip or blockquote
-//   |CAPTION| ... |/CAPTION|  a figure or table caption
-//   |LIST| ... |/LIST|        one item of a bulleted or numbered list
-//   |BREAK|                   a paragraph or block boundary
-//
-// The server strips the markers once it has used them, so they never reach XTTS.
-//
-// |LIST| is the one marker I close tight against its text, with no space in
-// front of the closing tag. That keeps the tag and the last word as a single
-// token, so none of the length-based splitters below can cut between them and
-// leave "|/LIST|" as a chunk with nothing to say. It also makes the emitted
-// shape canonical, which is what the server's decoder and the tests read.
-// =============================================================================
-
-// Wrap a text-extraction promise so it can never hang the UI. If the page does
-// not respond in time (navigating, heavy iframes, a frame that never returns),
-// resolve with a sentinel the caller turns into a clear message instead of
-// leaving the popup stuck on a progress line forever.
-function _withExtractionTimeout(promise, ms = 8000) {
-  return Promise.race([
-    promise,
-    new Promise(res => setTimeout(() => res("__KAM_TIMEOUT__"), ms)),
-  ]);
-}
-
-function getSelectedText() {
-  return new Promise((resolve) => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      // Guard: extension pages (the KAM dashboard), chrome:// and the Web Store
-      // can't be scripted. Without this the call fails with an opaque
-      // "Cannot access contents of url" and the button appears to do nothing.
-      const _u = (tabs && tabs[0] && tabs[0].url) || "";
-      if (!tabs || !tabs[0] || /^(chrome|edge|about|chrome-extension|devtools):/.test(_u)
-          || _u.includes("chromewebstore.google.com")) {
-        resolve("__KAM_NO_PAGE__");
-        return;
-      }
-      chrome.scripting.executeScript(
-        {
-          target: { tabId: tabs[0].id, allFrames: true },
-          func: () => {
-            // Only true kix-canvas Google Docs genuinely can't be selected.
-            if (document.querySelector('.kix-canvas-tile-content')) {
-              return '__KAM_CANVAS_DOC__';
-            }
-
-            const sel = window.getSelection();
-            if (!sel || sel.rangeCount === 0) return '';
-
-            const range = sel.getRangeAt(0);
-
-            // Walk every node in the selection using TreeWalker.
-            // Inject |BREAK| whenever we cross a block-level element boundary.
-            // This works on any site whatever its DOM structure.
-            const BLOCK_TAGS = new Set(['p','li','dt','dd','div','section','article',
-              'blockquote','h1','h2','h3','h4','h5','h6','td','th','tr',
-              'header','footer','main','aside','pre','ul','ol','dl']);
-            const INLINE_TAGS = {
-              'b': ['|BOLD|','|/BOLD|'], 'strong': ['|BOLD|','|/BOLD|'],
-              'i': ['|ITALIC|','|/ITALIC|'], 'em': ['|ITALIC|','|/ITALIC|'],
-              'code': ['|CODE|','|/CODE|'], 'kbd': ['|CODE|','|/CODE|'],
-              'mark': ['|BOLD|','|/BOLD|']
-            };
-
-            const parts = [];
-            let   lastWasBlock = false;
-
-            // True if the running output ends with whitespace or an open
-            // bracket, meaning a separator is already there and I mustn't add one.
-            function _endsClean() {
-              for (let k = parts.length - 1; k >= 0; k--) {
-                const p = parts[k];
-                if (!p) continue;
-                const last = p[p.length - 1];
-                return /\s/.test(last) || last === '(' || last === '[' || last === undefined;
-              }
-              return true;   // nothing yet
-            }
-            // True if a string starts with whitespace or closing punctuation,
-            // meaning a separator already exists on that side.
-            function _startsClean(s) {
-              if (!s) return true;
-              return /^[\s.,;:!?)\]}'"]/.test(s);
-            }
-
-            // Push a text fragment, preserving its exact content. Inserts a
-            // single space only when neither the running output nor the new text
-            // already provides a separator, so existing punctuation and
-            // spacing (". ", ")", "training. However") is never lost or merged.
-            function _pushText(t) {
-              if (!t) return;
-              if (parts.length && !_endsClean() && !_startsClean(t)) {
-                parts.push(' ');
-              }
-              parts.push(t);
-              lastWasBlock = false;
-            }
-
-            // Simpler approach: clone the fragment and walk it
-            const frag = range.cloneContents();
-
-            function walk(node) {
-              if (node.nodeType === Node.TEXT_NODE) {
-                // Preserve the node's text verbatim (including any leading/
-                // trailing whitespace the page author put there); only collapse
-                // runs of whitespace, never strip edge characters.
-                const t = node.textContent.replace(/[ \t\r\n]+/g, ' ');
-                _pushText(t);
-                return;
-              }
-              const tag = node.nodeName.toLowerCase();
-
-              // --- Equations ---
-              // MathML / MathJax / KaTeX render equations as nested glyph
-              // elements (MathJax often into <svg>), so naively walking them
-              // gives garbled text, and the hidden source copy then gets read a
-              // second time. So I intercept the container and emit clean source
-              // just once.
-              const isMathRoot = (
-                tag === 'math' || tag === 'mjx-container' ||
-                (node.classList && (node.classList.contains('katex') ||
-                                    node.classList.contains('MathJax')))
-              );
-              if (isMathRoot) {
-                let eq = '';
-                try {
-                  // 1. The LaTeX source, which is the most faithful, and both
-                  //    MathJax and KaTeX embed it.
-                  const ann = node.querySelector &&
-                    node.querySelector('annotation[encoding="application/x-tex"]');
-                  if (ann && ann.textContent.trim()) eq = ann.textContent.trim();
-                  // 2. Accessibility text set by the renderer.
-                  if (!eq && node.getAttribute) {
-                    eq = (node.getAttribute('alttext') ||
-                          node.getAttribute('aria-label') || '').trim();
-                  }
-                  // 3. Fall back to visible text, minus the hidden source copy.
-                  if (!eq && node.cloneNode) {
-                    const c = node.cloneNode(true);
-                    c.querySelectorAll(
-                      'annotation, annotation-xml, mjx-assistive-mml, .katex-mathml'
-                    ).forEach(n => n.remove());
-                    eq = (c.textContent || '').replace(/\s+/g, ' ').trim();
-                  }
-                } catch (e) { /* fall through to empty */ }
-                if (eq) _pushText(' ' + eq + ' ');
-                return;   // never walk into the equation's internals
-              }
-              // Skip hidden equation-source duplicates encountered on their own.
-              if (['annotation', 'annotation-xml'].includes(tag)) return;
-              if (node.classList && (node.classList.contains('katex-mathml') ||
-                  tag === 'mjx-assistive-mml')) return;
-
-              // Heading → inject level marker + breaks
-              if (['h1','h2','h3','h4','h5','h6'].includes(tag)) {
-                if (!lastWasBlock) parts.push(' |BREAK| ');
-                const level = tag === 'h1' ? 'H1' : tag === 'h2' ? 'H2' : 'H3';
-                parts.push('|' + level + '|');
-                Array.from(node.childNodes).forEach(walk);
-                parts.push('|/' + level + '| |BREAK| ');
-                lastWasBlock = true;
-                return;
-              }
-
-              // Inline semantic markers
-              if (INLINE_TAGS[tag]) {
-                parts.push(' ' + INLINE_TAGS[tag][0]);
-                Array.from(node.childNodes).forEach(walk);
-                parts.push(INLINE_TAGS[tag][1] + ' ');
-                return;
-              }
-
-              // A list item, wrapped so the server knows the chunk was a bullet
-              // and can give it the gap between items rather than the gap
-              // between sentences. Nothing else carries that fact: once the
-              // marker is stripped, "Boil the water." from a bullet and the
-              // same words from a paragraph are the same string.
-              //
-              // I only wrap an item that has words in it, since |LIST| brings
-              // four letters of its own and the chunker keeps any segment with
-              // two letters or more, so an empty bullet would otherwise arrive
-              // as a chunk with nothing to say.
-              if (tag === 'li') {
-                if (parts.length > 0 && !lastWasBlock) parts.push(' |BREAK| ');
-                const _at = parts.length;
-                Array.from(node.childNodes).forEach(walk);
-                const _inner = parts.slice(_at).join('').replace(/\|\/?[A-Z0-9]+\|/g, '');
-                if ((_inner.match(/[a-zA-Z]/g) || []).length >= 2) {
-                  parts.splice(_at, 0, '|LIST| ');
-                  parts.push('|/LIST|');
-                }
-                parts.push(' |BREAK| ');
-                lastWasBlock = true;
-                return;
-              }
-
-              // Block elements → inject |BREAK| before and after
-              if (BLOCK_TAGS.has(tag)) {
-                if (parts.length > 0 && !lastWasBlock) parts.push(' |BREAK| ');
-                Array.from(node.childNodes).forEach(walk);
-                parts.push(' |BREAK| ');
-                lastWasBlock = true;
-                return;
-              }
-
-              // Everything else, so span, a and the rest, gets recursed into.
-              // Punctuation sitting outside the element, like "(<a>2024</a>)" or
-              // "<a>x</a>. Next", is
-              // in sibling text nodes and is preserved by _pushText's boundary
-              // logic, so citations and sentence-final stops survive intact.
-              Array.from(node.childNodes).forEach(walk);
-            }
-
-            Array.from(frag.childNodes).forEach(walk);
-
-            let text = parts.join('')
-              .replace(/(\|BREAK\|\s*){2,}/g, ' |BREAK| ')
-              // Pull the closing list marker tight against its item, so the tag
-              // and the last word stay one token and no length-based split can
-              // strand the tag in a chunk of its own.
-              .replace(/\s+\|\/LIST\|/g, '|/LIST|')
-              // Collapse only spaces and tabs, not punctuation, so ". However"
-              // survives.
-              .replace(/[ \t]{2,}/g, ' ')
-              .replace(/\s+/g, ' ')
-              .trim();
-
-            // If we got nothing useful from DOM walk (e.g. plain text selection),
-            // fall back to raw selection string and split on newlines
-            if (!text || text.replace(/\|BREAK\|/g, '').trim().length < 5) {
-              text = sel.toString()
-                .replace(/\r\n|\n/g, ' |BREAK| ')
-                .replace(/(\|BREAK\|\s*){2,}/g, ' |BREAK| ')
-                .replace(/\s+/g, ' ')
-                .trim();
-            }
-
-            return text;
-          }
-        },
-        (results) => {
-          if (chrome.runtime.lastError) {
-            showError("Can't read this page: " + chrome.runtime.lastError.message
-                      + " — try reloading the page, or use Custom Text.");
-            resolve("");
-            return;
-          }
-          const vals = (results || []).map(r => r && r.result);
-          if (vals.includes('__KAM_CANVAS_DOC__') && !vals.some(v => typeof v === 'string' && v && v !== '__KAM_CANVAS_DOC__')) {
-            showError("This looks like a Google Doc — its text is drawn on a canvas and can't be selected directly. Copy the text (Ctrl+C), switch to the Custom Text tab, and paste it there to read it.");
-            resolve("");
-            return;
-          }
-          // The frame with the selection is the one returning non-empty text.
-          const r = vals.filter(v => typeof v === 'string' && v && v !== '__KAM_CANVAS_DOC__')
-                        .sort((a, b) => b.length - a.length)[0] || "";
-          if (!r) showError("Select some text on the page first, then press Speak.");
-          resolve(r);
-        }
-      );
-    });
-  });
-}
-
-function getPageText() {
-  return new Promise((resolve) => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      // Guard: extension pages (the KAM dashboard), chrome:// and the Web Store
-      // can't be scripted. Without this the call fails with an opaque
-      // "Cannot access contents of url" and the button appears to do nothing.
-      const _u = (tabs && tabs[0] && tabs[0].url) || "";
-      if (!tabs || !tabs[0] || /^(chrome|edge|about|chrome-extension|devtools):/.test(_u)
-          || _u.includes("chromewebstore.google.com")) {
-        resolve("__KAM_NO_PAGE__");
-        return;
-      }
-      chrome.scripting.executeScript(
-        {
-          target: { tabId: tabs[0].id, allFrames: true },
-          func: () => {
-            // Only true canvas-rendered Google Docs (kix) genuinely can't be
-            // read; signal that. Plain skills.google / iframe content is read
-            // normally below. I no longer block by hostname, since a lot of
-            // those pages keep the real text in an iframe that allFrames reaches.
-            if (document.querySelector('.kix-canvas-tile-content')) {
-              return '__KAM_CANVAS_DOC__';
-            }
-            // Block tags that create chunk boundaries
-            const BLOCK = new Set(['p','li','dt','dd','blockquote','pre',
-              'h1','h2','h3','h4','h5','h6','td','th','tr','section',
-              'article','aside','div','main','header','footer']);
-            const SKIP  = new Set(['script','style','noscript','nav','footer',
-              'header','aside','iframe','svg','img','button','input','select',
-              'textarea','form','[aria-hidden]']);
-            const INLINE_MAP = {
-              'b':'BOLD','strong':'BOLD','em':'ITALIC','i':'ITALIC',
-              'code':'CODE','kbd':'CODE','mark':'BOLD','samp':'CODE'
-            };
-
-            // Find best content root
-            const root =
-              document.querySelector('article') ||
-              document.querySelector('main')    ||
-              document.querySelector("[role='main']") ||
-              document.querySelector('.content') ||
-              document.querySelector('#content') ||
-              document.body;
-
-            const parts = [];
-            let lastWasBlock = false;
-
-            function shouldSkip(el) {
-              if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
-              const tag = el.tagName.toLowerCase();
-              if (SKIP.has(tag)) return true;
-              const style = window.getComputedStyle(el);
-              if (style.display === 'none' || style.visibility === 'hidden') return true;
-              if (el.getAttribute('aria-hidden') === 'true') return true;
-              if (el.getAttribute('hidden') !== null) return true;
-              // Skip nav/menu by class
-              const cls = (el.className || '').toString();
-              if (/\b(nav|navbar|menu|sidebar|footer|header|ad|cookie|popup|modal|sr-only|visually-hidden)\b/i.test(cls)) return true;
-              return false;
-            }
-
-            function walk(node) {
-              if (node.nodeType === Node.TEXT_NODE) {
-                const t = (node.textContent || '').replace(/\s+/g, ' ');
-                if (t.trim()) { parts.push(t); lastWasBlock = false; }
-                return;
-              }
-              if (node.nodeType !== Node.ELEMENT_NODE) return;
-              if (shouldSkip(node)) return;
-
-              const tag = node.tagName.toLowerCase();
-
-              // Headings
-              if (['h1','h2','h3','h4','h5','h6'].includes(tag)) {
-                const t = (node.textContent || '').trim();
-                if (!t) return;
-                if (!lastWasBlock) parts.push(' |BREAK| ');
-                const level = tag === 'h1' ? 'H1' : tag === 'h2' ? 'H2' : 'H3';
-                parts.push('|' + level + '|' + t + '.|/' + level + '| |BREAK| ');
-                lastWasBlock = true;
-                return;
-              }
-
-              // Inline semantic markers
-              if (INLINE_MAP[tag]) {
-                const t = (node.textContent || '').trim();
-                if (t) parts.push(' |' + INLINE_MAP[tag] + '|' + t + '|/' + INLINE_MAP[tag] + '| ');
-                return;
-              }
-
-              // Code blocks get skipped, since they're too noisy for TTS
-              if (tag === 'pre') return;
-
-              // A list item, wrapped so the server can pace it as a bullet.
-              // See the note on the selection walker above: an item with no
-              // words in it is left unwrapped, because the marker's own letters
-              // would carry an empty bullet past the chunker's length gate.
-              if (tag === 'li') {
-                if (!lastWasBlock && parts.length > 0) parts.push(' |BREAK| ');
-                const _at = parts.length;
-                Array.from(node.childNodes).forEach(walk);
-                const _inner = parts.slice(_at).join('').replace(/\|\/?[A-Z0-9]+\|/g, '');
-                if ((_inner.match(/[a-zA-Z]/g) || []).length < 2) return;
-                parts.splice(_at, 0, '|LIST| ');
-                parts.push('|/LIST| |BREAK| ');
-                lastWasBlock = true;
-                return;
-              }
-
-              // Block elements, where I inject the break boundaries
-              if (BLOCK.has(tag)) {
-                const hadContent = parts.length;
-                if (!lastWasBlock && parts.length > 0) parts.push(' |BREAK| ');
-                Array.from(node.childNodes).forEach(walk);
-                if (parts.length > hadContent) {
-                  parts.push(' |BREAK| ');
-                  lastWasBlock = true;
-                }
-                return;
-              }
-
-              // Everything else gets recursed into
-              Array.from(node.childNodes).forEach(walk);
-            }
-
-            Array.from(root.childNodes).forEach(walk);
-
-            let text = parts.join('')
-              // Clean nav noise
-              .replace(/[Ll]inks?\s+to\s+(an?\s+)?(external\s+site|pdf|document|page)/g, '')
-              .replace(/opens?\s+in\s+(a\s+)?new\s+(tab|window)/gi, '')
-              .replace(/external\s+link/gi, '')
-              .replace(/\bPrevious\b|\bNext\b/g, '')
-              .replace(/\bback\s+to\s+top\b/gi, '')
-              .replace(/\bread\s+more\b|\blearn\s+more\b|\bsee\s+more\b/gi, '')
-              .replace(/https?:\/\/\S+/g, '')
-              .replace(/\[\d+\]/g, '')
-              // Symbol conversion
-              .replace(/!=/g,' not equals ')
-              .replace(/>=/g,' greater than or equal to ')
-              .replace(/<=/g,' less than or equal to ')
-              .replace(/->/g,' arrow ')
-              .replace(/=>/g,' arrow ')
-              .replace(/&&/g,' and ')
-              // Collapse
-              .replace(/(\|BREAK\|\s*){2,}/g, ' |BREAK| ')
-              // Keep the closing list marker tight against its item, so the tag
-              // and the last word stay one token and no length-based split can
-              // strand the tag in a chunk of its own.
-              .replace(/\s+\|\/LIST\|/g, '|/LIST|')
-              .replace(/\s+/g, ' ')
-              .trim();
-
-            return text;
-          }
-        },
-        (results) => {
-          // A genuine injection failure must not look like "no text found".
-          if (chrome.runtime.lastError) {
-            showError("Can't read this page: " + chrome.runtime.lastError.message
-                      + " — try reloading the page, or use Custom Text.");
-            resolve("");
-            return;
-          }
-          // allFrames returns one result per frame, so I pick the richest text,
-          // which is the content iframe rather than the top-page header.
-          const texts = (results || [])
-            .map(r => r && r.result)
-            .filter(t => typeof t === 'string' && t !== '__KAM_CANVAS_DOC__');
-          const best = texts.sort((a, b) => b.length - a.length)[0] || "";
-          const onlyCanvas = !best && (results || []).some(r => r && r.result === '__KAM_CANVAS_DOC__');
-          if (onlyCanvas) {
-            showError("This looks like a Google Doc — its text is drawn on a canvas and can't be read directly. Copy the text (Ctrl+C), switch to the Custom Text tab, and paste it there.");
-            resolve("");
-            return;
-          }
-          if (!best) showError("Page text extraction failed — try again.");
-          resolve(best);
-        }
-      );
-    });
-  });
-}
-
-function showError(msg) {
+// Both lines take an optional detail, which goes in the tooltip. The line
+// itself says the one thing worth reading, and it is announced, since the
+// element is aria-live.
+function showError(msg, detail) {
   const el = document.getElementById("error-msg");
   el.textContent   = "⚠ " + msg;
+  el.title         = detail || "";
   el.style.background = "#1a0a0a";
   el.style.borderColor = "#3a1a1a";
   el.style.color   = "#f87171";
   el.style.display = "block";
 }
 
-function showInfo(msg) {
+function showInfo(msg, detail) {
   const el = document.getElementById("error-msg");
   el.textContent   = "ℹ " + msg;
+  el.title         = detail || "";
   el.style.background = "#0a1a1a";
   el.style.borderColor = "#1a3a3a";
   el.style.color   = "#67e8f9";

@@ -15,7 +15,8 @@ const EXT = process.env.KAM_EXT_DIR || path.join(HERE, '..', '..', 'extension');
 const read = f => fs.readFileSync(path.join(EXT, f), 'utf8');
 const bg = read('background.js');
 const dash = read('dashboard.js');
-const popup = read('popup.js');
+// The reading code moved to reader-core.js; an older copy has it all in popup.js.
+const popup = (fs.existsSync(path.join(EXT, 'reader-core.js')) ? read('reader-core.js') + '\n' : '') + read('popup.js');
 
 let PASS=0, FAIL=0;
 const check=(l,g,w)=>{ const ok=JSON.stringify(g)===JSON.stringify(w);
@@ -317,9 +318,20 @@ await section('starting a new read digests the old one first', async () => {
     let KAM_TOKEN = "t";
     let readId = "", _speakEpoch = 0;
     const _speakAborts = new Set();
+    // State and helpers the start of a read gained with resume, private reads
+    // and the speed gate. Saving is not what this part checks, so it is a stub.
+    let readHalted = false, lastPlaybackError = null, sessionPrivate = false;
+    let sessionTitle = "", sessionUrl = "", _savedReadId = "", _speedKnown = false;
+    let _speedPush = Promise.resolve(), _respeed = null;
+    const _refreshHwHints = () => {}, _saveRead = () => {}, _savePos = () => {};
+    ${grab(bg, '_pushSpeed')}
+    ${grab(bg, '_tabInfo')}
+    ${grab(bg, '_beginRead')}
+    ${grab(bg, '_announcePreparing')}
     ${grab(bg, 'toReadingTab')}
     ${grab(bg, 'teardownPlayback')}
     ${grab(bg, 'digestPlayedChunks')}
+    ${(() => { try { return grab(bg, 'startRead'); } catch (e) { return ''; } })()}
     ${grabListener(bg, 'chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {')}
     return { set played(v) { playedChunks = v; }, set playing(v) { isPlaying = v; } };`)(
     chrome, kamFetch, () => {}, () => {}, t => t, 'http://s');

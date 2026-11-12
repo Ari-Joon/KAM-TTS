@@ -15,7 +15,8 @@ const EXT = process.env.KAM_EXT_DIR || path.join(HERE, '..', '..', 'extension');
 const read = f => fs.readFileSync(path.join(EXT, f), 'utf8');
 const bg = read('background.js');
 const dash = read('dashboard.js');
-const popup = read('popup.js');
+// The reading code moved to reader-core.js; an older copy has it all in popup.js.
+const popup = (fs.existsSync(path.join(EXT, 'reader-core.js')) ? read('reader-core.js') + '\n' : '') + read('popup.js');
 
 let PASS=0, FAIL=0;
 const check=(l,g,w)=>{ const ok=JSON.stringify(g)===JSON.stringify(w);
@@ -100,6 +101,10 @@ await section('chunkReady is sent as each chunk starts to play', async () => {
     let _hwPrefetchTarget = 3, KAM_TOKEN = 't', readingTabId = null, currentFetchAbort = null;
     const _speakAborts = new Set();
     let readId = 'r1', sessionStartTs = 100, _speakEpoch = 0;
+    // What the loop gained with resume, private reads and speed changes; none
+    // of it is what this part checks.
+    let sessionPrivate = false, _speedPush = Promise.resolve(), _respeed = null, _savedReadId = '';
+    const _savePos = () => {}, forgetResume = () => {}, haltRead = async () => {};
     ${opt(bg, '_nextEpoch')}
     ${grab(bg, 'fetchAudioBase64')}
     ${opt(bg, 'announceChunk')}

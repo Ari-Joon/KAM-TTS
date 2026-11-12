@@ -11,7 +11,8 @@ import fs from 'node:fs';
 
 const read = f => fs.readFileSync(new URL('../../extension/' + f, import.meta.url), 'utf8');
 const markersSrc   = read('markers.js');
-const popupSrc     = read('popup.js');
+// The walkers and the chunker moved to reader-core.js; read both.
+const popupSrc     = read('reader-core.js') + '\n' + read('popup.js');
 const backgroundSrc= read('background.js');
 const contentSrc   = read('content.js');
 
@@ -156,7 +157,11 @@ console.log('\n=== the chunker keeps the closing tag with the last chunk ===');
 // Lift the whole chunking section, which is self-contained: everything from the
 // size constants down to isReadable.
 const chunkerStart = popupSrc.indexOf('const TARGET_CHARS');
-const chunkerEnd   = popupSrc.indexOf('function renderTextView(');
+// The section ends at the first UI helper in a copy from before the reading
+// code moved, and at the TEXT EXTRACTION banner in reader-core.js since.
+const chunkerEnds  = ['function renderTextView(', '// TEXT EXTRACTION']
+  .map(t => popupSrc.indexOf(t, chunkerStart)).filter(b => b >= 0);
+const chunkerEnd   = chunkerEnds.length ? Math.min(...chunkerEnds) : -1;
 if (chunkerStart < 0 || chunkerEnd < 0) throw new Error('could not find the chunking section');
 const splitIntoChunks = new Function(
   popupSrc.slice(chunkerStart, chunkerEnd) + '; return splitIntoChunks;')();
